@@ -25,6 +25,20 @@ test('CMAC of a 40-byte message matches RFC 4493', () => {
     .toBe('dfa66747de9ae63030ca32611497c827');
 });
 
+// RFC 4493 Example 4 (len = 64): the only vector combining the
+// complete-block branch (message length is an exact multiple of 16) with
+// multi-block chaining (more than one preceding block to fold in).
+test('CMAC of a 64-byte message matches RFC 4493', () => {
+  const message = hex(
+    '6bc1bee22e409f96e93d7e117393172a'
+    + 'ae2d8a571e03ac9c9eb76fac45af8e51'
+    + '30c81c46a35ce411e5fbc1191a0a52ef'
+    + 'f69f2445df4f9b17ad2b417be66c3710',
+  );
+  expect(aesCmac(RFC_KEY, message).toString('hex'))
+    .toBe('51f0bebf7e3b9d92fc49741779363cfe');
+});
+
 test('s1 matches the mesh sample data', () => {
   expect(s1(S1_TEST.input).toString('hex')).toBe(S1_TEST.expected);
 });

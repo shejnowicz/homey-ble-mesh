@@ -11,6 +11,9 @@ export function k1(n: Buffer, salt: Buffer, p: Buffer): Buffer {
  * key that obfuscates the header.
  */
 export function k2(n: Buffer, p: Buffer): { nid: number; encryptionKey: Buffer; privacyKey: Buffer } {
+  if (n.length !== 16) {
+    throw new Error(`k2: N must be 16 bytes (128-bit NetKey), got ${n.length}`);
+  }
   const salt = s1(Buffer.from('smk2', 'ascii'));
   const t = aesCmac(salt, n);
   const t1 = aesCmac(t, Buffer.concat([p, Buffer.from([0x01])]));
@@ -25,6 +28,9 @@ export function k2(n: Buffer, p: Buffer): { nid: number; encryptionKey: Buffer; 
 
 /** k3 produces the eight-byte network identifier used in beacons. */
 export function k3(n: Buffer): Buffer {
+  if (n.length !== 16) {
+    throw new Error(`k3: N must be 16 bytes (128-bit NetKey), got ${n.length}`);
+  }
   const salt = s1(Buffer.from('smk3', 'ascii'));
   const t = aesCmac(salt, n);
   const result = aesCmac(t, Buffer.concat([Buffer.from('id64', 'ascii'), Buffer.from([0x01])]));
@@ -33,6 +39,9 @@ export function k3(n: Buffer): Buffer {
 
 /** k4 produces the six-bit application key identifier. */
 export function k4(n: Buffer): number {
+  if (n.length !== 16) {
+    throw new Error(`k4: N must be 16 bytes (128-bit AppKey), got ${n.length}`);
+  }
   const salt = s1(Buffer.from('smk4', 'ascii'));
   const t = aesCmac(salt, n);
   const result = aesCmac(t, Buffer.concat([Buffer.from('id6', 'ascii'), Buffer.from([0x01])]));

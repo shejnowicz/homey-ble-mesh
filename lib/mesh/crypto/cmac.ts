@@ -4,7 +4,12 @@ const BLOCK = 16;
 /** The constant RFC 4493 folds in when a left shift overflows. */
 const RB = 0x87;
 
-function aesEcbBlock(key: Buffer, block: Buffer): Buffer {
+/**
+ * The single AES-128 ECB block cipher primitive, exported as `e` (RFC 4493's
+ * own name for it) because the provisioning plan's header obfuscation needs
+ * exactly this primitive, not a re-derivation of it.
+ */
+export function e(key: Buffer, block: Buffer): Buffer {
   const cipher = createCipheriv('aes-128-ecb', key, null);
   cipher.setAutoPadding(false);
   return Buffer.concat([cipher.update(block), cipher.final()]);
@@ -21,13 +26,15 @@ function shiftLeft(input: Buffer): Buffer {
   return out;
 }
 
-function subkeys(key: Buffer): { k1: Buffer; k2: Buffer } {
-  const l = aesEcbBlock(key, Buffer.alloc(BLOCK));
-  const k1 = shiftLeft(l);
-  if ((l[0] as number) & 0x80) k1[BLOCK - 1] = ((k1[BLOCK - 1] as number) ^ RB) as number;
-  const k2 = shiftLeft(k1);
-  if ((k1[0] as number) & 0x80) k2[BLOCK - 1] = ((k2[BLOCK - 1] as number) ^ RB) as number;
-  return { k1, k2 };
+// RFC 4493's own subkeys, named subkey1/subkey2 here to avoid colliding with
+// the unrelated exported k1/k2 key-derivation functions in derive.ts.
+function subkeys(key: Buffer): { subkey1: Buffer; subkey2: Buffer } {
+  const l = e(key, Buffer.alloc(BLOCK));
+  const subkey1 = shiftLeft(l);
+  if ((l[0] as number) & 0x80) subkey1[BLOCK - 1] = ((subkey1[BLOCK - 1] as number) ^ RB) as number;
+  const subkey2 = shiftLeft(subkey1);
+  if ((subkey1[0] as number) & 0x80) subkey2[BLOCK - 1] = ((subkey2[BLOCK - 1] as number) ^ RB) as number;
+  return { subkey1, subkey2 };
 }
 
 function xor(a: Buffer, b: Buffer): Buffer {
@@ -38,26 +45,26 @@ function xor(a: Buffer, b: Buffer): Buffer {
 
 /** AES-CMAC as defined by RFC 4493, with a 128-bit key. Returns 16 bytes. */
 export function aesCmac(key: Buffer, message: Buffer): Buffer {
-  const { k1, k2 } = subkeys(key);
+  const { subkey1, subkey2 } = subkeys(key);
   const complete = message.length > 0 && message.length % BLOCK === 0;
   const blockCount = complete ? message.length / BLOCK : Math.floor(message.length / BLOCK) + 1;
 
   let last: Buffer;
   if (complete) {
-    last = xor(message.subarray((blockCount - 1) * BLOCK), k1);
+    last = xor(message.subarray((blockCount - 1) * BLOCK), subkey1);
   } else {
     const tail = message.subarray((blockCount - 1) * BLOCK);
     const padded = Buffer.alloc(BLOCK);
     tail.copy(padded);
     padded[tail.length] = 0x80;
-    last = xor(padded, k2);
+    last = xor(padded, subkey2);
   }
 
   let x: Buffer = Buffer.alloc(BLOCK);
   for (let i = 0; i < blockCount - 1; i += 1) {
-    x = aesEcbBlock(key, xor(x, message.subarray(i * BLOCK, (i + 1) * BLOCK))) as Buffer;
+    x = e(key, xor(x, message.subarray(i * BLOCK, (i + 1) * BLOCK))) as Buffer;
   }
-  return aesEcbBlock(key, xor(x, last));
+  return e(key, xor(x, last));
 }
 
 /** s1(M) = AES-CMAC with an all-zero key. The mesh salt function. */
