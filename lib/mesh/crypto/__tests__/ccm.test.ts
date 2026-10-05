@@ -27,3 +27,12 @@ test('additional authenticated data is covered by the tag', () => {
   expect(ccmDecrypt(KEY, NONCE, ciphertext, tag, aad)?.toString('ascii')).toBe('abc');
   expect(ccmDecrypt(KEY, NONCE, ciphertext, tag, Buffer.from([0x09, 0x09]))).toBeNull();
 });
+
+test('a wrong key length throws rather than returning null', () => {
+  const wrongKey = Buffer.alloc(32, 0xff);
+  const plaintext = Buffer.from('abc', 'ascii');
+  const { ciphertext, tag } = ccmEncrypt(KEY, NONCE, plaintext, 4);
+  expect(() => {
+    ccmDecrypt(wrongKey, NONCE, ciphertext, tag);
+  }).toThrow();
+});
