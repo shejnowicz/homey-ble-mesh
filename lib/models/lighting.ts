@@ -161,6 +161,24 @@ function assertIntInRange(field: string, value: number, min: number, max: number
   }
 }
 
+/**
+ * Every multi-octet field this module encodes/decodes (Lightness, CTL
+ * Lightness/Temperature/Delta UV, HSL Lightness/Hue/Saturation) is
+ * little-endian - Section 1.5 "Endianness and field ordering", quoted in
+ * full: "All multiple-octet numeric values shall be little-endian." This
+ * is the Mesh MODEL document's own convention section, stated directly in
+ * its own opening chapter - NOT inherited from the Mesh Protocol
+ * document's own Section 3.1.1/3.7.1 (a separate publication; nothing
+ * there binds this one). See this file's own Section 1.5 worked example
+ * for an independent, byte-exact confirmation of this rule
+ * (`__tests__/vectors.ts`'s `SECTION_1_5_WORKED_EXAMPLE`).
+ *
+ * Every caller now names its own field before calling this (review
+ * finding: Lightness/Hue/Saturation used to skip that and fall through to
+ * this function's own generic "u16" guard below) - so the `assertLightingField`
+ * call here is BELT AND BRACES, not the only check, same status
+ * `i16le`'s own internal guard already had for `deltaUv`.
+ */
 function u16le(value: number): Buffer {
   assertLightingField('u16', value, MAX_UINT16);
   const buffer = Buffer.alloc(2);
@@ -168,6 +186,7 @@ function u16le(value: number): Buffer {
   return buffer;
 }
 
+/** Same Section 1.5 little-endian rule as `u16le`, for CTL Delta UV's signed 16-bit domain. */
 function i16le(value: number): Buffer {
   assertIntInRange('i16', value, MIN_INT16, MAX_INT16);
   const buffer = Buffer.alloc(2);
@@ -191,17 +210,31 @@ function i16le(value: number): Buffer {
 //
 // Table 3.33 "Generic Transition Time format": a 1-octet value, "Transition
 // Number of Steps" (6 bits) and "Transition Step Resolution" (2 bits). BIT
-// ORDER WITHIN THE OCTET: Table 3.33's own field table lists the rows in
-// this order but does not itself state which end of the octet each
-// occupies in text - that comes from Figure 3.4 "Generic Transition Time
-// format" (fetched separately as a PNG, 529x366,
-// image/167196bb5548e0.png under the same document root, since this
-// figure is a diagram, not extractable table text) which draws bit 0 on
-// the LEFT of "octet 0" under "Transition Number of Steps" and bit 7 on the
-// right under "Transition Step Resolution", with the boundary at bit 5/6 -
-// i.e. bits 0-5 (the low 6 bits) are Transition Number of Steps, bits 6-7
-// (the high 2 bits) are Transition Step Resolution. Table 3.34/3.35 give
-// each sub-field's own value table (transcribed above as
+// ORDER WITHIN THE OCTET - TWO INDEPENDENT CONFIRMATIONS, both cited
+// because a load-bearing layout fact deserves more than one leg to stand
+// on: Table 3.33's own field table lists the rows in this order but does
+// not itself state which end of the octet each occupies - that visual
+// confirmation comes from Figure 3.4 "Generic Transition Time format"
+// (fetched separately as a PNG, 529x366, image/167196bb5548e0.png under
+// the same document root, since this figure is a diagram, not extractable
+// table text) which draws bit 0 on the LEFT of "octet 0" under "Transition
+// Number of Steps" and bit 7 on the right under "Transition Step
+// Resolution", with the boundary at bit 5/6. It is ALSO independently
+// derivable from the document's own general TEXT, not only the figure:
+// Section 1.5 "Endianness and field ordering" states the generic rule
+// every bit-packed table in this document follows, quoted: "The least
+// significant bits (LSbs) of the number are set to the value of Field 0
+// (first row of the table), then the number's unassigned LSbs are set to
+// the value of Field 1." Table 3.33 lists Transition Number of Steps FIRST
+// and Transition Step Resolution SECOND, so Section 1.5's own rule alone
+// already places Number of Steps in the LSBs - independently agreeing
+// with Figure 3.4, not merely repeating it. `__tests__/vectors.ts`'s
+// `SECTION_1_5_WORKED_EXAMPLE` carries the document's own byte-exact
+// published worked example of this general procedure (plus the
+// little-endian transmission rule `u16le`/`i16le` depend on), and
+// `lighting.test.ts` cross-checks it directly against this module's own
+// `encodeGenericOnOffSet` output for this exact two-field layout. Table
+// 3.34/3.35 give each sub-field's own value table (transcribed above as
 // `MAX_TRANSITION_STEP_RESOLUTION`/`MAX_TRANSITION_NUMBER_OF_STEPS`).
 // ===========================================================================
 
@@ -305,12 +338,20 @@ export interface GenericOnOffSetParams {
  * when all three match a message received in the last 6 seconds; a new
  * TID, a different SRC/DST, or the same TID arriving 6+ seconds later is a
  * genuinely new command and IS applied. This exact SRC/DST/TID/6-second
- * rule is restated, word for word except for the model's own name, at
- * Section 6.4.1.2.2 (Light Lightness), Section 6.4.3.2.2 (Light CTL) and
- * this document's equivalent section for Light HSL - confirmed by reading
- * all three independently rather than assuming symmetry, which is also why
- * this module's own per-model `encode*Set` functions below do not repeat
- * the full rule a second time, only point back here.
+ * rule is restated IDENTICAL IN SUBSTANCE - not word for word, checked
+ * directly rather than assumed - at Section 6.4.1.2.2 (Light Lightness),
+ * Section 6.4.3.2.2 (Light CTL) and Section 6.4.6.2.2 (Light HSL). Each of
+ * those three differs from the quote above in two words beyond the
+ * model's own name: "same value" here becomes "same values" (plural), and
+ * "the past 6 seconds" becomes "the last 6 seconds". Each also adds one
+ * whole sentence this quote does not have: "If the target state is equal
+ * to the current state, the transition shall not be started and is
+ * considered complete." (a rule about what a server does with its own
+ * state, not something this stateless encoder/decoder module needs to
+ * act on). Confirmed by reading all four sections independently rather
+ * than assuming symmetry, which is also why this module's own per-model
+ * `encode*Set` functions do not repeat the full rule a second time, only
+ * point back here.
  *
  * This module itself has no transport/retry state to apply the rule
  * against (that belongs to whatever Homey-side layer calls this encoder
@@ -384,7 +425,7 @@ export function decodeGenericOnOffStatus(pdu: Buffer): GenericOnOffStatus | null
 export interface LightLightnessSetParams {
   /** Table 6.2 "Light Lightness Actual states": full 16-bit domain, no Prohibited values (0x0000 "not emitted" through 0xFFFF "highest"). */
   lightness: number;
-  /** Transaction Identifier - same rule as `GenericOnOffSetParams.tid`; this message's own field table points to Section 6.6.1.2.2, word-for-word identical to Section 3.4.1.2.2 (see `encodeGenericOnOffSet`'s own JSDoc for the full transcription). */
+  /** Transaction Identifier - same rule as `GenericOnOffSetParams.tid`; this message's own field table points to Section 6.6.1.2.2, identical IN SUBSTANCE to Section 3.4.1.2.2 (not word for word - checked directly: e.g. this section's first sentence says "the least recently used value" where 3.4.1.2.2 says "the least recently used transaction identifier" - see `encodeGenericOnOffSet`'s own JSDoc for the full transcription and the same caveat on the receiving side). */
   tid: number;
   /** Table 6.51's own C.1 footnote, identical wording to Table 3.37's. */
   transition?: SetTransition;
@@ -392,6 +433,11 @@ export interface LightLightnessSetParams {
 
 /** Table 6.51 "Light Lightness Set message structure": Opcode (2) || Lightness (2, M) || TID (1, M) || [Transition Time (1, O) || Delay (1, C.1)]. */
 export function encodeLightLightnessSet(params: LightLightnessSetParams): Buffer {
+  // Named explicitly (review finding: this used to fall through to `u16le`'s
+  // own generic internal guard, reporting as "u16" rather than
+  // "lightness" - the same standard `encodeLightCtlSet` already applies to
+  // `temperature`/`deltaUv`, extended here).
+  assertLightingField('lightness', params.lightness, MAX_UINT16);
   assertLightingField('tid', params.tid, MAX_OCTET);
   const parameters = Buffer.concat([u16le(params.lightness), Buffer.from([params.tid]), encodeSetTransition(params.transition)]);
   return encodeAccessMessage({ opcode: OPCODE_LIGHT_LIGHTNESS_SET, parameters });
@@ -447,7 +493,7 @@ export interface LightCtlSetParams {
   temperature: number;
   /** Table 6.9 "Light CTL Delta UV states": signed 16-bit, full domain, 0x0000 = Delta UV of 0. Kept as the raw signed wire integer, not the document's separately-defined "Represented Delta UV" display ratio (`raw / 32768`), which is a UI concern this module does not perform. */
   deltaUv: number;
-  /** Transaction Identifier - same rule as `GenericOnOffSetParams.tid`; this message's own field table points to Section 6.6.2.2.2, word-for-word identical to Section 3.4.1.2.2. */
+  /** Transaction Identifier - same rule as `GenericOnOffSetParams.tid`; this message's own field table points to Section 6.6.2.2.2, identical IN SUBSTANCE (not word for word - see `LightLightnessSetParams.tid`'s own doc comment for the specific difference, which is the same here) to Section 3.4.1.2.2. */
   tid: number;
   /** Table 6.69's own C.1 footnote, identical wording to Table 3.37's. */
   transition?: SetTransition;
@@ -459,6 +505,7 @@ export interface LightCtlSetParams {
  * [Transition Time (1, O) || Delay (1, C.1)].
  */
 export function encodeLightCtlSet(params: LightCtlSetParams): Buffer {
+  assertLightingField('lightness', params.lightness, MAX_UINT16);
   assertIntInRange('temperature', params.temperature, MIN_CTL_TEMPERATURE, MAX_CTL_TEMPERATURE);
   // Named explicitly here (rather than relying only on `i16le`'s own
   // generic internal guard below) so an out-of-range value reports as
@@ -541,7 +588,7 @@ export interface LightHslSetParams {
   hue: number;
   /** Table 6.15 "Light HSL Saturation states": full 16-bit domain, no Prohibited values. */
   saturation: number;
-  /** Transaction Identifier - same rule as `GenericOnOffSetParams.tid`; this message's own field table points to Section 6.6.3.2.2, word-for-word identical to Section 3.4.1.2.2. */
+  /** Transaction Identifier - same rule as `GenericOnOffSetParams.tid`; this message's own field table points to Section 6.6.3.2.2, identical IN SUBSTANCE (not word for word - see `LightLightnessSetParams.tid`'s own doc comment for the specific difference, which is the same here) to Section 3.4.1.2.2. */
   tid: number;
   /** Table 6.85's own C.1 footnote, identical wording to Table 3.37's. */
   transition?: SetTransition;
@@ -553,6 +600,9 @@ export interface LightHslSetParams {
  * [Transition Time (1, O) || Delay (1, C.1)].
  */
 export function encodeLightHslSet(params: LightHslSetParams): Buffer {
+  assertLightingField('lightness', params.lightness, MAX_UINT16);
+  assertLightingField('hue', params.hue, MAX_UINT16);
+  assertLightingField('saturation', params.saturation, MAX_UINT16);
   assertLightingField('tid', params.tid, MAX_OCTET);
   const parameters = Buffer.concat([
     u16le(params.lightness),
@@ -574,7 +624,7 @@ export function encodeLightHslGet(): Buffer {
  * HSL Hue (2, M) || HSL Saturation (2, M) || Remaining Time (1, O).
  * STRUCTURALLY DIFFERENT from the other three models' Status messages:
  * there is no "Target" field at all here (a separate message, Light HSL
- * Target Status - Section 6.3.3.6, Table 6.90 - carries that, and is
+ * Target Status - Section 6.3.3.6, Table 6.89 - carries that, and is
  * outside this task's four models), so Remaining Time is a single,
  * independently optional field ("O", not "C.1" paired with anything) -
  * confirmed by this table publishing no C.1 footnote at all, unlike Table

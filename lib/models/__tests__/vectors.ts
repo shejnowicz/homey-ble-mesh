@@ -14,8 +14,11 @@
  * here). Every fixture below is therefore CONSTRUCTED BY HAND from
  * `lighting.ts`'s own transcribed field layout (Tables 3.36/3.37/3.39,
  * 6.50/6.51/6.53, 6.68/6.69/6.71, 6.84/6.85/6.87) and from this document's
- * own Table 3.34/3.35 (Transition Step Resolution/Number of Steps values)
- * and Figure 3.4 (Generic Transition Time bit layout) - NEVER derived by
+ * own Table 3.34/3.35 (Transition Step Resolution/Number of Steps values),
+ * Figure 3.4 (Generic Transition Time bit layout) and Section 1.5
+ * (Endianness and field ordering, with its own byte-exact worked example -
+ * see `SECTION_1_5_WORKED_EXAMPLE` below, the one genuinely PUBLISHED
+ * fixture in this file) - NEVER derived by
  * running `lighting.ts`'s own encoder and copying its output, which would
  * make every round-trip test here prove nothing beyond "the encoder and
  * decoder agree with themselves." The arithmetic was independently computed
@@ -35,9 +38,10 @@
  * `packet/access.ts`'s own module header warns about does not apply to the
  * 2-octet SIG form at all).
  *
- * TRANSITION TIME OCTET (Table 3.33/3.34/3.35, Figure 3.4 - see
- * `lighting.ts`'s own header note for the bit-order derivation from the
- * figure): `octet = (numberOfSteps & 0x3F) | ((stepResolution & 0x3) << 6)`.
+ * TRANSITION TIME OCTET (Table 3.33/3.34/3.35, Figure 3.4, Section 1.5 -
+ * see `lighting.ts`'s own header note for the bit-order derivation from
+ * both the figure and Section 1.5's own general text, independently
+ * agreeing): `octet = (numberOfSteps & 0x3F) | ((stepResolution & 0x3) << 6)`.
  * Worked example used repeatedly below: stepResolution=1 (Table 3.34's own
  * row for value 0b01: "The Transition Step Resolution is 1 second"),
  * numberOfSteps=0x0A -> octet = 0x0A | (0b01 << 6) = 0x0A | 0x40 = 0x4A.
@@ -258,20 +262,92 @@ export const LIGHT_HSL_SET_MINIMAL = {
   message: '827600000000000000',
 };
 
-/** Table 6.87, without Remaining Time. CONSTRUCTED. Three distinct values (0x1111/0x2222/0x3333) so a Lightness/Hue/Saturation field swap is detectable. */
+/**
+ * Table 6.87, without Remaining Time. CONSTRUCTED.
+ *
+ * REVIEW FINDING, FIXED: the original version of this fixture used
+ * 0x1111/0x2222/0x3333 - three DISTINCT values, enough to catch a field
+ * swap, but each one is byte-palindromic (its high and low octet are
+ * identical), so `readUInt16LE` and `readUInt16BE` produce the exact same
+ * NUMBER for every one of them. A reviewer flipped all three reads in
+ * `decodeLightHslStatus` to big-endian and the whole suite still passed -
+ * for this one message, where there is no published sample to fall back
+ * on, the hand-built fixture was the entire safety net, and it was blind
+ * to the one failure mode (wrong byte order) that matters most for a hue
+ * value: swap the octets and Homey paints the wrong colour. Replaced with
+ * 0x1234/0x5678/0x9abc - still three distinct values (swap-detectable),
+ * and now each one's own two octets differ from each other too
+ * (endianness-detectable): 0x1234 LE is `34 12`, BE would read back as
+ * 0x3412 (13330), not 0x1234 (4660).
+ */
 export const LIGHT_HSL_STATUS_MINIMAL = {
-  lightness: 0x1111,
-  hue: 0x2222,
-  saturation: 0x3333,
-  message: '8278111122223333',
+  lightness: 0x1234,
+  hue: 0x5678,
+  saturation: 0x9abc,
+  message: '827834127856bc9a',
 };
 
-/** Table 6.87, with Remaining Time. CONSTRUCTED. Same three state values as the minimal fixture, plus remainingTime={stepResolution:2 (10 s), numberOfSteps:0x10}. Remaining Time octet = 0x10 | (2<<6) = 0x90. */
+/** Table 6.87, with Remaining Time. CONSTRUCTED. Same three (now endianness-sensitive - see `LIGHT_HSL_STATUS_MINIMAL`'s own note) state values as the minimal fixture, plus remainingTime={stepResolution:2 (10 s), numberOfSteps:0x10}. Remaining Time octet = 0x10 | (2<<6) = 0x90. */
 export const LIGHT_HSL_STATUS_WITH_REMAINING = {
-  lightness: 0x1111,
-  hue: 0x2222,
-  saturation: 0x3333,
+  lightness: 0x1234,
+  hue: 0x5678,
+  saturation: 0x9abc,
   stepResolution: 2,
   numberOfSteps: 0x10,
-  message: '827811112222333390',
+  message: '827834127856bc9a90',
+};
+
+// ===========================================================================
+// Section 1.5 "Endianness and field ordering" - the document's own general
+// bit-packing/endianness rule (quoted in full in `lighting.ts`'s own
+// module header), WITH a byte-exact worked example. Not a message sample
+// (so the NO PUBLISHED MESSAGE SAMPLES note above still stands - nothing
+// here is specific to any of the twelve messages this file otherwise
+// fixtures), but a genuine published anchor for the exact two rules every
+// other fixture in this file depends on: (1) a table's FIRST row occupies
+// the LEAST significant bits of a packed multi-field value, and (2) the
+// assembled value is transmitted little-endian (least significant octet
+// first). `lighting.test.ts` uses this to KAT-test a small helper that
+// implements Section 1.5's general procedure from scratch, independently
+// of this module's own `encodeTransitionTimeOctet`, and then cross-checks
+// that helper against `encodeGenericOnOffSet`'s actual output for the
+// Transition Time octet's own two-field layout (Table 3.33: Number of
+// Steps first/LSBs, Step Resolution second/MSBs) - so this one published
+// example ends up anchoring the implementation too, not just an isolated
+// utility.
+//
+// Quoted in full: "In order to convert the data structure defined in a
+// table into a series of octets the following procedure is used. The
+// binary number with N unassigned bits is created. The number of bits N
+// in the number is equal to the sum of the number of bits of every field
+// in the table. The least significant bits (LSbs) of the number are set to
+// the value of Field 0 (first row of the table), then the number's
+// unassigned LSbs are set to the value of Field 1. This procedure is
+// continued for consecutive fields of the table and ends when the most
+// significant bits (MSbs) of the number are set to the value of last field
+// of the table. As a final step the number is transmitted in little-endian
+// format (i.e., least significant octet first)." Then its own worked
+// example, quoted in full: "For example, the field 0 is 4 bits wide and
+// has a value of 0x6, field 1 is 12 bits wide and has a value of 0x987,
+// and field 2 is 16 bits wide and has a value of 0x1234. The value of the
+// binary number is 0x12349876 and shall be transmitted as 0x76, 0x98,
+// 0x34, 0x12."
+//
+// Hand-verified independently of the document's own stated result: field0
+// (4 bits, 0x6) in bits 0-3, field1 (12 bits, 0x987) in bits 4-15, field2
+// (16 bits, 0x1234) in bits 16-31 -> (0x1234 << 16) | (0x987 << 4) | 0x6 =
+// 0x12340000 | 0x9870 | 0x6 = 0x12349876, matching the document's own
+// stated binary number exactly. Little-endian octets of 0x12349876:
+// 0x76, 0x98, 0x34, 0x12 - matching the document's own stated transmission
+// exactly.
+// ===========================================================================
+
+export const SECTION_1_5_WORKED_EXAMPLE = {
+  fields: [
+    { widthBits: 4, value: 0x6 },
+    { widthBits: 12, value: 0x987 },
+    { widthBits: 16, value: 0x1234 },
+  ],
+  assembledNumber: 0x12349876,
+  message: '76983412',
 };

@@ -37,7 +37,83 @@ import {
   LIGHT_HSL_SET_MINIMAL,
   LIGHT_HSL_STATUS_MINIMAL,
   LIGHT_HSL_STATUS_WITH_REMAINING,
+  SECTION_1_5_WORKED_EXAMPLE,
 } from './vectors';
+
+/**
+ * Section 1.5 "Endianness and field ordering"'s own generic bit-packing
+ * procedure (quoted in full in `vectors.ts`'s own header, and in
+ * `lighting.ts`'s module header), implemented HERE, independently of
+ * `lighting.ts`'s own `encodeTransitionTimeOctet`/`decodeTransitionTimeOctet`,
+ * so it can serve as an external check against them rather than being
+ * read back from the thing it is meant to verify. `fields` is table row
+ * order (first row = LSBs, per Section 1.5's own words: "The least
+ * significant bits (LSbs) of the number are set to the value of Field 0
+ * (first row of the table)"); the assembled number is then transmitted
+ * "in little-endian format (i.e., least significant octet first)" - also
+ * Section 1.5's own words. Uses `BigInt` throughout so it is not itself
+ * limited to 32 bits the way JS's native bitwise operators are - this is a
+ * general-purpose check, not tied to this module's own field widths.
+ */
+function packFieldsLsbFirst(fields: ReadonlyArray<{ widthBits: number; value: number }>): Buffer {
+  let acc = 0n;
+  let shift = 0n;
+  let totalBits = 0;
+  for (const field of fields) {
+    acc |= BigInt(field.value) << shift;
+    shift += BigInt(field.widthBits);
+    totalBits += field.widthBits;
+  }
+  const totalBytes = Math.ceil(totalBits / 8);
+  const buffer = Buffer.alloc(totalBytes);
+  for (let i = 0; i < totalBytes; i++) {
+    buffer[i] = Number((acc >> BigInt(i * 8)) & 0xffn);
+  }
+  return buffer;
+}
+
+describe('Section 1.5 "Endianness and field ordering" - the one published anchor this task has', () => {
+  test('the document\'s own worked example: field ordering + little-endian transmission (PUBLISHED)', () => {
+    const packed = packFieldsLsbFirst(SECTION_1_5_WORKED_EXAMPLE.fields);
+    expect(packed).toEqual(hex(SECTION_1_5_WORKED_EXAMPLE.message));
+    // Cross-check the fixture's own two independent representations of the
+    // published value agree with each other, not just with the helper:
+    // `message`'s bytes, read back as a 32-bit little-endian unsigned
+    // integer, must be the same `0x12349876` the document states directly.
+    expect(hex(SECTION_1_5_WORKED_EXAMPLE.message).readUInt32LE(0)).toBe(SECTION_1_5_WORKED_EXAMPLE.assembledNumber);
+  });
+
+  test('this generic, independently-implemented procedure agrees with encodeGenericOnOffSet\'s actual Transition Time octet, for every stepResolution/numberOfSteps combination the boundary tests below exercise', () => {
+    // Table 3.33 lists Transition Number of Steps FIRST, Transition Step
+    // Resolution SECOND - so per Section 1.5's own general rule, Number of
+    // Steps occupies the low (LSB) bits. This is the SAME claim
+    // `lighting.ts`'s own module header derives from Figure 3.4 (a
+    // diagram); this test derives it from Section 1.5's TEXT instead, via
+    // a helper that has never seen `encodeTransitionTimeOctet`'s own code,
+    // and checks the two independent derivations agree on actual module
+    // output, not just on a value computed by hand twice.
+    const cases: ReadonlyArray<{ stepResolution: number; numberOfSteps: number }> = [
+      { stepResolution: 0, numberOfSteps: 0x00 },
+      { stepResolution: 3, numberOfSteps: 0x3f },
+      { stepResolution: 1, numberOfSteps: 0x0a },
+      { stepResolution: 2, numberOfSteps: 0x15 },
+    ];
+    for (const { stepResolution, numberOfSteps } of cases) {
+      const encoded = encodeGenericOnOffSet({
+        onOff: 0x01,
+        tid: 0x00,
+        transition: { time: { stepResolution, numberOfSteps }, delay: 0x00 },
+      });
+      // Opcode(2) || OnOff(1) || TID(1) || TransitionTimeOctet(1) || Delay(1).
+      const actualOctet = encoded[4] as number;
+      const viaSection15 = packFieldsLsbFirst([
+        { widthBits: 6, value: numberOfSteps },
+        { widthBits: 2, value: stepResolution },
+      ]);
+      expect(Buffer.from([actualOctet])).toEqual(viaSection15);
+    }
+  });
+});
 
 // ===========================================================================
 // Generic OnOff
@@ -170,8 +246,9 @@ describe('Light Lightness', () => {
     ).toEqual(hex(LIGHT_LIGHTNESS_SET_MINIMAL.message));
   });
 
-  test('Set: lightness outside the 16-bit domain throws', () => {
-    expect(() => encodeLightLightnessSet({ lightness: 0x10000, tid: 0 })).toThrow();
+  test('Set: lightness outside the 16-bit domain throws, named by field (review finding: used to report as the generic "u16")', () => {
+    expect(() => encodeLightLightnessSet({ lightness: 0x10000, tid: 0 })).toThrow(/lightness/);
+    expect(() => encodeLightLightnessSet({ lightness: -1, tid: 0 })).toThrow(/lightness/);
   });
 
   test('Status: Table 6.53, Present-only, at the domain\'s own top value 0xFFFF (CONSTRUCTED)', () => {
@@ -262,6 +339,10 @@ describe('Light CTL', () => {
     ).toEqual(hex(LIGHT_CTL_SET_DELTA_UV_MAX.message));
   });
 
+  test('Set: lightness outside the 16-bit domain throws, named by field (review finding)', () => {
+    expect(() => encodeLightCtlSet({ lightness: 0x10000, temperature: 0x0320, deltaUv: 0, tid: 0 })).toThrow(/lightness/);
+  });
+
   test('Set: Table 6.6 - temperature outside [0x0320, 0x4E20] throws (Prohibited)', () => {
     expect(() => encodeLightCtlSet({ lightness: 0, temperature: 0x031f, deltaUv: 0, tid: 0 })).toThrow(/temperature/);
     expect(() => encodeLightCtlSet({ lightness: 0, temperature: 0x4e21, deltaUv: 0, tid: 0 })).toThrow(/temperature/);
@@ -337,6 +418,12 @@ describe('Light HSL', () => {
     ).toEqual(hex(LIGHT_HSL_SET_MINIMAL.message));
   });
 
+  test('Set: lightness, hue and saturation each outside the 16-bit domain throw, named by their own field (review finding: hue/saturation had no range test at all)', () => {
+    expect(() => encodeLightHslSet({ lightness: 0x10000, hue: 0, saturation: 0, tid: 0 })).toThrow(/lightness/);
+    expect(() => encodeLightHslSet({ lightness: 0, hue: 0x10000, saturation: 0, tid: 0 })).toThrow(/hue/);
+    expect(() => encodeLightHslSet({ lightness: 0, hue: 0, saturation: 0x10000, tid: 0 })).toThrow(/saturation/);
+  });
+
   test('Status: Table 6.87, without Remaining Time (CONSTRUCTED) - note this model has NO Target field at all, unlike the other three', () => {
     expect(decodeLightHslStatus(hex(LIGHT_HSL_STATUS_MINIMAL.message))).toEqual({
       lightness: LIGHT_HSL_STATUS_MINIMAL.lightness,
@@ -406,14 +493,36 @@ describe('Generic Transition Time octet, via Generic OnOff Status (shared format
 });
 
 /**
- * MODULE API NOTE on "both directions": this module follows
- * `mesh/config/client.ts`'s own established, asymmetric design (its DESIGN
- * note: "one encode function per OUTGOING message... ONE decode function...
- * for every INCOMING status message") - a Set/Get message has only an
+ * MODULE API NOTE on "both directions": a Set/Get message has only an
  * ENCODER here (nothing in this project decodes a Set it never sent), and a
  * Status message has only a DECODER (nothing in this project's lighting
- * client ever builds a Status it never received as a server would). So
- * "both directions against published bytes" for a Set/Get fixture is
+ * client ever builds a Status it never received as a server would) - one
+ * encoder per outgoing message, one decoder per incoming status, per this
+ * TASK'S OWN BRIEF, which asks for exactly these three functions per model
+ * (twelve total), not a single dispatcher across all four.
+ *
+ * CORRECTION (review finding): an earlier version of this note cited
+ * `mesh/config/client.ts`'s own DESIGN rationale as the precedent for that
+ * split. That was the wrong citation - that rationale argues for the
+ * OPPOSITE of what this module ships: `config/client.ts` has ONE decoder,
+ * `decodeConfigStatus`, dispatching on the recovered opcode across ALL of
+ * its incoming messages and returning a tagged union, specifically because
+ * "the caller does NOT know ahead of time which status arrived over the
+ * wire." This module ships FOUR separate, non-dispatching decoders
+ * instead - correct for THIS task (the brief asks for one per model by
+ * name), but not an instance of `config/client.ts`'s pattern, and the
+ * numbers are not comparable (four decoders are the deliverable, not a
+ * trade-off against one). The actual gap `config/client.ts`'s reasoning
+ * DOES predict: nothing in this project yet dispatches across these four
+ * opcodes for an UNSOLICITED Status (a node publishing a state change
+ * without being polled) - whatever Homey-side adapter receives those will
+ * need exactly the single-dispatcher shape `config/client.ts` already has,
+ * built over `decodeGenericOnOffStatus`/`decodeLightLightnessStatus`/
+ * `decodeLightCtlStatus`/`decodeLightHslStatus`, trying each (or switching
+ * on the opcode directly) rather than guessing which model answered. That
+ * dispatcher does not exist yet and is out of this task's scope.
+ *
+ * So "both directions against published bytes" for a Set/Get fixture is
  * checked as: this module's own encoder output against the fixture bytes,
  * AND (where done above, e.g. the Generic OnOff Set/Status tests) the
  * generic `packet/access.ts` encoder/decoder - NOT this module's own
