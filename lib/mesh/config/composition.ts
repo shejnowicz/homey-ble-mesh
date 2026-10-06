@@ -72,28 +72,73 @@
  * opposite reading would give 0x0080, which is not in the document's own
  * published model list).
  *
- * ERRATA: Section 8.10.1's own prose describing its sample misstates what
- * its Features value means - "Features is 0x0003 - Relay and Friend
- * features" - but Table 4.3 assigns bit 0 to Relay and bit 1 to Proxy (bit
- * 2 is Friend), so 0x0003 (bits 0 and 1 set) decodes to Relay AND PROXY,
- * not Relay and Friend. The NUMBER 0x0003 itself is not in question (the
- * sample's raw wire octets `0300` agree with the sample's own "Features is
- * 0x0003" line); only the one mis-typed English gloss is wrong. This module
- * decodes strictly per Table 4.3's bit positions, matching the actual value
- * rather than the prose describing it - see `__tests__/vectors.ts` for the
- * full accounting.
+ * ERRATA (Table 4.3 itself is not a typo - independently confirmed by TWO
+ * more tables elsewhere in this same document assigning the identical bit
+ * layout: Table 3.49 "Features field format", Section 3.6.5.10 "Heartbeat",
+ * and Table 4.39 "Heartbeat Publication Feature values", Section 4.2.18.5
+ * "Heartbeat Publication Features" - both bit 0 Relay, bit 1 Proxy, bit 2
+ * Friend, bit 3 Low Power, same as Table 4.3): Section 8.10.1's own prose
+ * describing its sample misstates what its Features value means -
+ * "Features is 0x0003 – Relay and Friend features." - but Table 4.3 assigns
+ * bit 0 to Relay and bit 1 to Proxy (bit 2 is Friend), so 0x0003 (bits 0
+ * and 1 set) decodes to Relay AND PROXY, not Relay and Friend. The NUMBER
+ * 0x0003 itself is not in question (the sample's raw wire octets `0300`
+ * agree with the sample's own "Features is 0x0003" line); only the one
+ * mis-typed English gloss is wrong. This module decodes strictly per Table
+ * 4.3's bit positions, matching the actual value rather than the prose
+ * describing it - see `__tests__/vectors.ts` for the full accounting.
  *
- * MINIMUM ONE ELEMENT. Section 2.3.4 "Elements": "An element is an
- * addressable entity on a node. Each node has at least one element, the
- * primary element, and may have up to 254 additional secondary elements."
- * A buffer that parses as a syntactically well-formed 10-octet header
- * followed by zero element records is therefore not a valid Composition
- * Data Page 0 - no real node can report zero elements - so
- * `parseCompositionData` returns `null` for it rather than reporting an
+ * ELEMENT COUNT BOUNDS. The lower bound is normative text about the
+ * Elements field ITSELF, in this same Section 4.2.2.1, immediately after
+ * Table 4.3: "The Elements field contains a sequence of one or more
+ * element descriptions." - zero is therefore not a valid count, and
+ * `parseCompositionData` returns `null` for a syntactically well-formed
+ * 10-octet header followed by no element records, rather than reporting an
  * empty `elements` array. This is also the exact boundary the brief's
  * truncation sweep depends on: without this check, a 10-octet prefix of
  * any longer sample would be silently accepted as a "valid" zero-element
- * page instead of rejected as the truncated data it actually is.
+ * page instead of rejected as the truncated data it actually is. The upper
+ * bound comes from the architectural Section 2.3.4 "Elements": "Each node
+ * has at least one element, the primary element, and may have up to 254
+ * additional secondary elements." - the same sentence that corroborates the
+ * lower bound also fixes the upper one (1 primary + 254 secondary = 255
+ * total), and this module enforces both halves of it rather than only the
+ * half the published sample happens to exercise.
+ *
+ * TRAILING BYTES ARE REJECTED, NOT IGNORED - AND THIS IS THE CONFORMANT
+ * READING, NOT MERELY THE CAUTIOUS ONE. Section 3.7.3.4 "Message error
+ * procedure" states: "When receiving a message that is not understood by
+ * an element, it shall ignore the message." - and then lists what counts as
+ * "not understood," one bullet of which is exactly this shape: "The Access
+ * message size for the identified opcode is incorrect." A Config
+ * Composition Data Status message (Section 4.3.2.5) whose Parameters field
+ * - this buffer - does not decode as a complete, exactly-consumed sequence
+ * of element records (whether truncated mid-element or carrying bytes past
+ * the last complete one) is a message whose size is wrong for what it
+ * claims to carry, i.e. a message that is "not understood" by this rule;
+ * per Section 3.7.3.4 the correct behaviour is to ignore THE MESSAGE, not
+ * to salvage the part that happened to parse. This module's single `null`
+ * return for the whole buffer is that same discipline applied one layer up
+ * from `access.ts`'s own PDU framing. The structural argument reinforces
+ * this independently: Composition Data Page 0 carries no element-count
+ * field (see LAYOUT above), so surplus trailing bytes are indistinguishable
+ * from the start of a truncated next element - silently dropping them would
+ * silently drop an element the node actually declared.
+ *
+ * RESERVED BITS: MASK, NEVER REJECT. Section 1.3.2 "Reserved for Future
+ * Use": "When a field value is a bit field, unassigned bits can be marked
+ * as Reserved for Future Use and shall be set to 0. Implementations that
+ * receive a message that contains a Reserved for Future Use bit that is
+ * set to 1 shall process the message as if that bit was set to 0, except
+ * where specified otherwise in this specification." This is why Features
+ * bits 4-15 are masked off below rather than surfaced as a fifth flag
+ * (`rawFeatures & FEATURE_BIT_*` only ever reads the four assigned bits) -
+ * and, just as importantly, why a set RFU bit must never cause a reject:
+ * the rule's own prescribed handling is "process ... as if that bit was
+ * set to 0," not "treat the message as malformed." This module's code
+ * already matches that - there is no RFU check that returns `null` - which
+ * this note makes a deliberate reading of Section 1.3.2 rather than an
+ * accidental omission.
  *
  * `null` VS THROW. This module has exactly one exported function and no
  * encoder (the brief's own interface: `parseCompositionData(buffer)`, no
@@ -123,6 +168,14 @@ const HEADER_LENGTH = 10; // Table 4.2: CID+PID+VID+CRPL+Features, 2 octets each
 const ELEMENT_HEADER_LENGTH = 4; // Table 4.5: Loc (2) + NumS (1) + NumV (1).
 const SIG_MODEL_ID_LENGTH = 2; // Section 3.8.2: a SIG Model ID is 16 bits.
 const VENDOR_MODEL_ID_LENGTH = 4; // Table 3.64: 16-bit Company Identifier + 16-bit Vendor Model Identifier.
+
+// Section 4.2.2.1: "The Elements field contains a sequence of one or more
+// element descriptions." Section 2.3.4: "Each node has at least one
+// element, the primary element, and may have up to 254 additional
+// secondary elements" (1 + 254 = 255 total) - both halves of that sentence
+// enforced, not only the lower one the published sample exercises.
+const MIN_ELEMENTS = 1;
+const MAX_ELEMENTS = 255;
 
 // Table 4.3 "Features field format".
 const FEATURE_BIT_RELAY = 0x0001;
@@ -166,11 +219,13 @@ export interface CompositionData {
  * anything this function cannot decode as a complete, well-formed page -
  * too short for the fixed header, a header whose Elements sequence is
  * truncated partway through an element's fixed fields or either model
- * list, or a syntactically complete header followed by zero elements
- * (Section 2.3.4: impossible for a real node - see the module header's
- * MINIMUM ONE ELEMENT note). Trailing bytes that do not form another
- * complete element record are likewise truncation, not a second page
- * appended; this function never throws.
+ * list, an element count outside [1, 255] (Section 4.2.2.1/2.3.4 - see the
+ * module header's ELEMENT COUNT BOUNDS note), or trailing bytes left over
+ * that do not form another complete element record. Every one of these is
+ * the same case under Section 3.7.3.4 "Message error procedure": a message
+ * whose size does not fit what it claims to carry is "not understood," and
+ * the whole message is ignored, not partially salvaged (see the module
+ * header's TRAILING BYTES note) - this function never throws.
  */
 export function parseCompositionData(buffer: Buffer): CompositionData | null {
   if (buffer.length < HEADER_LENGTH) {
@@ -224,8 +279,11 @@ export function parseCompositionData(buffer: Buffer): CompositionData | null {
     elements.push({ loc, sigModels, vendorModels });
   }
 
-  if (elements.length === 0) {
-    return null; // Section 2.3.4: every node has at least one (primary) element.
+  if (elements.length < MIN_ELEMENTS) {
+    return null; // Section 4.2.2.1: the Elements field is "a sequence of one or more element descriptions."
+  }
+  if (elements.length > MAX_ELEMENTS) {
+    return null; // Section 2.3.4: at most 1 primary + 254 secondary elements.
   }
 
   return { cid, pid, vid, crpl, features, elements };

@@ -59,7 +59,7 @@
  *   - `0800` -> CRPL 0x0008 (published: "CRPL is 0x0008").
  *   - `0300` -> Features 0x0003 (published: "Features is 0x0003") - see the
  *     ERRATA NOTE below for what this decodes to.
- *   - `0001` -> Loc 0x0100 (published: "Loc is “front” - 0x0100").
+ *   - `0001` -> Loc 0x0100 (published: "Loc is “front” – 0x0100").
  *   - `05` -> NumS 5 (published: "NumS is 5").
  *   - `01` -> NumV 1 (published: "NumV is 1").
  *   - `0000 0080 0100 0010 0310` -> SIG Models 0x0000, 0x8000, 0x0001,
@@ -86,7 +86,14 @@
  * - which is itself independently confirmed by the published wire bytes
  * (`0300` little-endian) agreeing with the published "Features is 0x0003"
  * line, so there is no ambiguity about the NUMBER, only about the one
- * mis-typed English description of what it means.
+ * mis-typed English description of what it means. Review round: confirmed
+ * independently against TWO more tables elsewhere in this same document
+ * that assign these identical four bits (bit 0 Relay, bit 1 Proxy, bit 2
+ * Friend, bit 3 Low Power) the same way - Table 3.49 "Features field
+ * format" (Section 3.6.5.10 "Heartbeat") and Table 4.39 "Heartbeat
+ * Publication Feature values" (Section 4.2.18.5 "Heartbeat Publication
+ * Features") - so Table 4.3's own bit assignment is not itself a
+ * transcription error; the sample's prose is the sole error here.
  *
  * ELEMENT-COUNT NOTE: this is a ONE-element sample (the document gives no
  * second Loc/NumS/NumV/model-list group), so it alone cannot pin the

@@ -95,6 +95,28 @@ describe('parseCompositionData', () => {
     });
   });
 
+  describe('element count bounds (Section 4.2.2.1 lower bound, Section 2.3.4 upper bound)', () => {
+    // Each synthetic element is the minimal 4-octet form (Loc=0x0000,
+    // NumS=0, NumV=0) used above for the zero-models case - these tests
+    // are purely about COUNTING elements, not about any one element's own
+    // contents, so the cheapest valid element shape is used, repeated.
+    const header = COMPOSITION_DATA_PAGE0_SAMPLE.message.slice(0, 20);
+    const minimalElement = Buffer.from([0x00, 0x00, 0x00, 0x00]);
+
+    function bufferWithElementCount(count: number): Buffer {
+      return Buffer.concat([hex(header), Buffer.concat(Array(count).fill(minimalElement))]);
+    }
+
+    test('255 elements (1 primary + 254 secondary, Section 2.3.4) is accepted', () => {
+      const result = parseCompositionData(bufferWithElementCount(255));
+      expect(result?.elements).toHaveLength(255);
+    });
+
+    test('256 elements is rejected - past the Section 2.3.4 upper bound', () => {
+      expect(parseCompositionData(bufferWithElementCount(256))).toBeNull();
+    });
+  });
+
   describe('two elements back to back (the published sample has only one)', () => {
     test('parses both elements, in order, from genuine published element bytes repeated twice', () => {
       const header = COMPOSITION_DATA_PAGE0_SAMPLE.message.slice(0, 20); // CID..Features, 10 octets = 20 hex chars
