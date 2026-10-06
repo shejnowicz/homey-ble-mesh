@@ -8,10 +8,39 @@
  * The layouts (Table 3.66 Network nonce format, Table 3.67 CTL and TTL field
  * format, Table 3.68 Application nonce format, Table 3.69 ASZMIC and Pad
  * field format, Table 3.70 Device nonce format, all in Section 3.9.5; Table
- * 3.25 Upper Transport Access PDU fields and Figure 3.17 in Section 3.6.2)
- * and the worked examples below (Section 8.3 "Mesh message sample data",
- * messages #1, #2, #6, #16, #18, #20, #22, #23, #24) came from this same
- * v1.1 document.
+ * 3.25 Upper Transport Access PDU fields and Figure 3.17 in Section 3.6.2;
+ * Table 3.15 Lower Transport PDU format, Table 3.17 Unsegmented Access
+ * message format and Table 3.19 Unsegmented Control message format, all in
+ * Section 3.5.2) and the worked examples below (Section 8.3 "Mesh message
+ * sample data", messages #1, #2, #6, #16, #18, #20, #22, #23, #24) came from
+ * this same v1.1 document.
+ *
+ * LOWER TRANSPORT ADDITION (same task that added `lowerTransport.ts`): no new
+ * message numbers were needed - every message this task's tests use was
+ * already listed above for its nonce or upper-transport row. What is new is
+ * reading each message's own "LowerTransportUnsegmentedAccessPDU" or
+ * "LowerTransportUnsegmentedControlPDU" block (Section 8.3), which Messages
+ * #18, #20, #22 and #23 publish AKF/AID/Header directly, and Messages #1/#2
+ * publish Opcode/Header directly, independent of the `transportPdu` hex
+ * blobs already transcribed below - this is the "fixture data nobody read"
+ * the task-3 brief warned about, now actually exercised. Fetched the same
+ * 9,945,160-byte document independently for this task on 2026-10-06 and
+ * confirmed, per message: Message #1 Opcode=03, Header=03; Message #2
+ * Opcode=04, Header=04; Message #18 AKF=01/AID=26/Header=66; Message #20
+ * AKF=01/AID=26/Header=66; Message #22 AKF=01/AID=26/Header=66,
+ * LowerTransportPDU=663871b904d431526316ca48a0 (the CORRECT leading octet -
+ * see the errata note above, which this same fetch re-confirmed by
+ * comparing every "LowerTransportPDU" row in Section 8.3 against its
+ * sibling rows); Message #23 AKF=01/AID=26/Header=66,
+ * LowerTransportPDU=662456db5e3100eef65daa7a38 (same errata, same
+ * resolution). Message #24's own block (SEG=01, AKF=01, AID=26, SZMIC=01,
+ * SeqZero=80d, SegO=00, SegN=01, Header=e6a03401,
+ * LowerTransportPDU=e6a03401c3c51d8e476b28e3aa5001f3) is a SEGMENTED
+ * message (SEG=1) - transcribed anyway, as `LOWER_TRANSPORT_SAMPLE_SEGMENTED`
+ * below, specifically because it is genuine specification data with the SEG
+ * bit set: `lowerTransport.ts`'s decoders must return null for exactly this
+ * bit, and testing that against a fabricated byte would be the same kind of
+ * unfalsifiable fixture this note exists to avoid.
  *
  * UPPER TRANSPORT ADDITION (same task that added `upperTransport.ts`): no
  * new message numbers were needed for the first three upper-transport
@@ -248,6 +277,12 @@ export const DEVICE_NONCE_SAMPLE_2 = {
  * 64 bits per Table 3.11). NetKey, IV Index, DST and the cleartext
  * LowerTransportPDU come from the message's own "NetworkPDU" block; the
  * expected value is that block's final "NetworkPDU" row.
+ *
+ * `opcode` is this same message's own "LowerTransportUnsegmentedControlPDU"
+ * block, read independently for the lower transport task (Section 8.3.1:
+ * SEG=00, Opcode=03, Header=03) - `transportPdu` above is Header||Parameters
+ * (03 || 4b50057e400000010000), so `opcode` plus `transportPdu.slice(2)` is
+ * exactly `lowerTransport.ts`'s `parameters`.
  */
 export const NETWORK_PDU_SAMPLE_1 = {
   networkKey: '7dd7364cd842ad18c17c2b820c84c3d6',
@@ -258,6 +293,7 @@ export const NETWORK_PDU_SAMPLE_1 = {
   src: 0x1201,
   dst: 0xfffd,
   transportPdu: '034b50057e400000010000',
+  opcode: 0x03,
   expected: '68eca487516765b5e5bfdacbaf6cb7fb6bff871f035444ce83a670df',
 };
 
@@ -266,6 +302,12 @@ export const NETWORK_PDU_SAMPLE_1 = {
  * NETWORK_NONCE_SAMPLE_2, a second CTL=1 sample with a different SEQ, SRC
  * and DST and a shorter (7-octet) TransportPDU — catches a length-dependent
  * bug the first sample's 11-octet TransportPDU wouldn't.
+ *
+ * `opcode` from this message's own "LowerTransportUnsegmentedControlPDU"
+ * block (Section 8.3.2: SEG=00, Opcode=04, Header=04), read independently
+ * for the lower transport task - a second, different opcode than Message
+ * #1's, so a decoder that only happened to work for opcode 0x03 cannot pass
+ * both.
  */
 export const NETWORK_PDU_SAMPLE_2 = {
   networkKey: '7dd7364cd842ad18c17c2b820c84c3d6',
@@ -276,6 +318,7 @@ export const NETWORK_PDU_SAMPLE_2 = {
   src: 0x2345,
   dst: 0x1201,
   transportPdu: '04320308ba072f',
+  opcode: 0x04,
   expected: '68d4c826296d7979d7dbc0c9b4d43eebec129d20a620d01e',
 };
 
@@ -284,6 +327,13 @@ export const NETWORK_PDU_SAMPLE_2 = {
  * (CTL=0, so NetMIC is 32 bits per Table 3.11) — the sample that pins down
  * the shorter MIC length and the lower, non-zero TTL (0x03) the two CTL=1
  * samples above don't exercise.
+ *
+ * `akf`/`aid` from this message's own "LowerTransportUnsegmentedAccessPDU"
+ * block (Section 8.3.18: SEG=00, AKF=01, AID=26, Header=66), read
+ * independently for the lower transport task; `transportPdu` above is
+ * Header||UpperTransportPDU (66 || 5a8bde6d9106ea078a), and that
+ * UpperTransportPDU is the same value already transcribed as
+ * `UPPER_TRANSPORT_SAMPLE_APPLICATION_KEY.expected` below.
  */
 export const NETWORK_PDU_SAMPLE_3 = {
   networkKey: '7dd7364cd842ad18c17c2b820c84c3d6',
@@ -294,6 +344,8 @@ export const NETWORK_PDU_SAMPLE_3 = {
   src: 0x1201,
   dst: 0xffff,
   transportPdu: '665a8bde6d9106ea078a',
+  akf: true,
+  aid: 0x26,
   expected: '6848cba437860e5673728a627fb938535508e21a6baf57',
 };
 
@@ -350,6 +402,13 @@ export const NETWORK_PDU_SAMPLE_ODD_IV = {
   src: 0x1234,
   dst: 0xffff,
   transportPdu: '669c9803e110fea929e9542d',
+  // `akf`/`aid` from this message's own "LowerTransportUnsegmentedAccessPDU"
+  // block (Section 8.3.20: SEG=00, AKF=01, AID=26, Header=66), read
+  // independently for the lower transport task - the same AID as Message
+  // #18 (both use the same AppKey), but a different IV Index/SEQ/TTL
+  // (this is the "odd IV Index" sample, see the module note above it).
+  akf: true,
+  aid: 0x26,
   expected: 'e85cca51e2e8998c3dc87344a16c787f6b08cc897c941a5368',
 };
 
@@ -516,3 +575,128 @@ export const UPPER_TRANSPORT_SAMPLE_SZMIC = {
   accessPayload: 'ea0a00576f726c64',
   expected: 'c3c51d8e476b28e3aa5001f31c01cea6',
 };
+
+/**
+ * Lower Transport PDU sample data (Section 3.5.2; Table 3.15 "Lower
+ * Transport PDU Format", Table 3.17 "Unsegmented Access message format",
+ * Table 3.19 "Unsegmented Control message format"). Every sample below
+ * reuses a message already transcribed above for its nonce and/or
+ * upper-transport row; what is new here is each message's own
+ * "LowerTransportUnsegmentedAccessPDU"/"LowerTransportUnsegmentedControlPDU"
+ * block, read independently for this task (see the module header's "LOWER
+ * TRANSPORT ADDITION" note) - the AID/AKF fields the upper-transport task
+ * transcribed as unread fixture data are, for messages #18/#20, this task's
+ * first real consumer.
+ *
+ * `expected` is the complete on-the-wire Lower Transport PDU
+ * (Header||Parameters for control, Header||UpperTransportAccessPDU for
+ * access) - the same bytes `NETWORK_PDU_SAMPLE_*.transportPdu` above already
+ * carries for Messages #1/#2/#18/#20, repeated here so this section is a
+ * self-contained, readable record of exactly what `lowerTransport.ts`
+ * encodes/decodes, without sending a reader back and forth between two
+ * sections for the same four messages.
+ */
+
+/**
+ * Section 8.3.1 "Message #1": the same Friend Request as
+ * NETWORK_PDU_SAMPLE_1 - a Transport Control message (CTL=1), unsegmented
+ * (SEG=0), Opcode 0x03 (Friend Request), Parameters the Friend Request's own
+ * 10-octet body. `expected` is NETWORK_PDU_SAMPLE_1.transportPdu, Header
+ * (03) || Parameters.
+ */
+export const LOWER_TRANSPORT_SAMPLE_CONTROL_1 = {
+  opcode: 0x03,
+  parameters: '4b50057e400000010000',
+  expected: '034b50057e400000010000',
+};
+
+/**
+ * Section 8.3.2 "Message #2": the same Friend Offer as NETWORK_PDU_SAMPLE_2
+ * - Transport Control (CTL=1), unsegmented, Opcode 0x04 (Friend Offer) - a
+ * different opcode and a shorter Parameters field than Message #1's, so a
+ * decoder/encoder that only works for one opcode or one length cannot pass
+ * both. `expected` is NETWORK_PDU_SAMPLE_2.transportPdu.
+ */
+export const LOWER_TRANSPORT_SAMPLE_CONTROL_2 = {
+  opcode: 0x04,
+  parameters: '320308ba072f',
+  expected: '04320308ba072f',
+};
+
+/**
+ * Section 8.3.18 "Message #18": the same Health Current Status Access
+ * message as NETWORK_PDU_SAMPLE_3/UPPER_TRANSPORT_SAMPLE_APPLICATION_KEY -
+ * Access message (CTL=0), unsegmented, AKF=1, AID=0x26, a non-virtual
+ * destination (0xffff). `expected` is NETWORK_PDU_SAMPLE_3.transportPdu,
+ * Header (66) || UpperTransportAccessPDU.
+ */
+export const LOWER_TRANSPORT_SAMPLE_ACCESS_1 = {
+  akf: true,
+  aid: 0x26,
+  upperTransportPdu: '5a8bde6d9106ea078a',
+  expected: '665a8bde6d9106ea078a',
+};
+
+/**
+ * Section 8.3.20 "Message #20": the same odd-IV-Index Health Current Status
+ * message as NETWORK_PDU_SAMPLE_ODD_IV - same AKF/AID as Message #18 (same
+ * AppKey) but a different, longer UpperTransportAccessPDU, catching a
+ * length-dependent bug Message #18's shorter one wouldn't. `expected` is
+ * NETWORK_PDU_SAMPLE_ODD_IV.transportPdu.
+ */
+export const LOWER_TRANSPORT_SAMPLE_ACCESS_2 = {
+  akf: true,
+  aid: 0x26,
+  upperTransportPdu: '9c9803e110fea929e9542d',
+  expected: '669c9803e110fea929e9542d',
+};
+
+/**
+ * Section 8.3.22 "Message #22": the same virtual-address vendor command as
+ * UPPER_TRANSPORT_SAMPLE_VIRTUAL_SHORT_MIC - unsegmented, AKF=1, AID=0x26.
+ * Not one of the NETWORK_PDU_SAMPLE_* above (those don't cover this
+ * message), so `expected` is transcribed fresh here: this message's own
+ * "LowerTransportUnsegmentedAccessPDU" block publishes
+ * LowerTransportPDU=663871b904d431526316ca48a0 - the CORRECT leading octet
+ * (0x66 = SEG 0 | AKF 1 | AID 0x26); the module header's errata note is
+ * about a DIFFERENT row (inside this same message's "NetworkPDU" block,
+ * which repeats the LowerTransportPDU with a corrupted leading 0x34) and
+ * does not apply to the value transcribed here.
+ */
+export const LOWER_TRANSPORT_SAMPLE_ACCESS_VIRTUAL_1 = {
+  akf: true,
+  aid: 0x26,
+  upperTransportPdu: '3871b904d431526316ca48a0',
+  expected: '663871b904d431526316ca48a0',
+};
+
+/**
+ * Section 8.3.23 "Message #23": the same virtual-address vendor command as
+ * UPPER_TRANSPORT_SAMPLE_VIRTUAL_SHORT_MIC_SHARED_LABEL - unsegmented,
+ * AKF=1, AID=0x26, same errata caveat as Message #22 above (this message's
+ * own LowerTransport block's 0x66 leading octet is the correct, authenticated
+ * value; a different row inside its NetworkPDU block is the corrupted one).
+ */
+export const LOWER_TRANSPORT_SAMPLE_ACCESS_VIRTUAL_2 = {
+  akf: true,
+  aid: 0x26,
+  upperTransportPdu: '2456db5e3100eef65daa7a38',
+  expected: '662456db5e3100eef65daa7a38',
+};
+
+/**
+ * Section 8.3.24 "Message #24": the same vendor command as
+ * UPPER_TRANSPORT_SAMPLE_SZMIC, but SEGMENTED (SEG=1) - this message's own
+ * "LowerTransportSegmentedAccessPDU" block publishes SEG=01, AKF=01, AID=26,
+ * SZMIC=01, SeqZero=80d, SegO=00, SegN=01, Header=e6a03401 (4 octets, not 1
+ * - a Segmented Access message's header carries more than SEG||AKF||AID,
+ * which segmentation is a LATER task's job to decode), and
+ * LowerTransportPDU=e6a03401c3c51d8e476b28e3aa5001f3.
+ *
+ * Not decoded for its content by this task - segmentation is explicitly out
+ * of scope. Transcribed solely so `decodeUnsegmentedAccess`'s "SEG=1 returns
+ * null" path is tested against genuine specification bytes with the bit
+ * actually set, rather than an arbitrary fabricated byte nothing published
+ * ever confirms is realistic.
+ */
+export const LOWER_TRANSPORT_SAMPLE_SEGMENTED = 'e6a03401c3c51d8e476b28e3aa5001f3';
