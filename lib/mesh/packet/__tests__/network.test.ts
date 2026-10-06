@@ -1,5 +1,11 @@
-import { encodeNetworkPdu } from '../network';
-import { hex, NETWORK_PDU_SAMPLE_1, NETWORK_PDU_SAMPLE_2, NETWORK_PDU_SAMPLE_3 } from './vectors';
+import { encodeNetworkPdu, decodeNetworkPdu } from '../network';
+import {
+  hex,
+  NETWORK_PDU_SAMPLE_1,
+  NETWORK_PDU_SAMPLE_2,
+  NETWORK_PDU_SAMPLE_3,
+  FOREIGN_NETWORK_KEY_SAME_NID,
+} from './vectors';
 
 // 8.3.1 "Message #1": a Friend Request (Transport Control message, CTL=1,
 // so a 64-bit NetMIC). The first sample that exercises obfuscation end to
@@ -159,4 +165,86 @@ describe('transportPdu length validation', () => {
       }),
     ).toThrow(/transportPdu/);
   });
+});
+
+// Known-answer tests in reverse: feed decodeNetworkPdu the SAME transcribed,
+// published wire PDU the encoding tests above produce, and recover the exact
+// published header fields and TransportPDU that produced it. Never a round
+// trip through our own encoder — that would pass even if encoding and
+// decoding shared the same mistake, the single most likely way this layer
+// goes wrong.
+test('decoding a published PDU recovers its published header and transport PDU', () => {
+  // 8.3.1 "Message #1" (CTL=1, so a 64-bit NetMIC).
+  const decoded1 = decodeNetworkPdu({
+    networkKey: hex(NETWORK_PDU_SAMPLE_1.networkKey),
+    ivIndex: NETWORK_PDU_SAMPLE_1.ivIndex,
+    pdu: hex(NETWORK_PDU_SAMPLE_1.expected),
+  });
+  expect(decoded1).not.toBeNull();
+  expect(decoded1?.ctl).toBe(NETWORK_PDU_SAMPLE_1.ctl);
+  expect(decoded1?.ttl).toBe(NETWORK_PDU_SAMPLE_1.ttl);
+  expect(decoded1?.seq).toBe(NETWORK_PDU_SAMPLE_1.seq);
+  expect(decoded1?.src).toBe(NETWORK_PDU_SAMPLE_1.src);
+  expect(decoded1?.dst).toBe(NETWORK_PDU_SAMPLE_1.dst);
+  expect(decoded1?.transportPdu).toEqual(hex(NETWORK_PDU_SAMPLE_1.transportPdu));
+
+  // 8.3.18 "Message #18" (CTL=0, so a 32-bit NetMIC, and a non-zero TTL) —
+  // pins down the shorter-MIC-length branch the sample above doesn't reach.
+  const decoded3 = decodeNetworkPdu({
+    networkKey: hex(NETWORK_PDU_SAMPLE_3.networkKey),
+    ivIndex: NETWORK_PDU_SAMPLE_3.ivIndex,
+    pdu: hex(NETWORK_PDU_SAMPLE_3.expected),
+  });
+  expect(decoded3).not.toBeNull();
+  expect(decoded3?.ctl).toBe(NETWORK_PDU_SAMPLE_3.ctl);
+  expect(decoded3?.ttl).toBe(NETWORK_PDU_SAMPLE_3.ttl);
+  expect(decoded3?.seq).toBe(NETWORK_PDU_SAMPLE_3.seq);
+  expect(decoded3?.src).toBe(NETWORK_PDU_SAMPLE_3.src);
+  expect(decoded3?.dst).toBe(NETWORK_PDU_SAMPLE_3.dst);
+  expect(decoded3?.transportPdu).toEqual(hex(NETWORK_PDU_SAMPLE_3.transportPdu));
+});
+
+// The design's own stated rule: "Messages we cannot decrypt are ignored,
+// since they belong to other networks." FOREIGN_NETWORK_KEY_SAME_NID was
+// picked (see vectors.ts) to derive the SAME NID as Message #1's real
+// NetKey, so this exercises AES-CCM authentication rejection itself, not the
+// cheap NID short-circuit the next test covers — a foreign key picked at
+// random would, 127 times out of 128, already be rejected by NID alone.
+test('a PDU encrypted under another network key is rejected', () => {
+  const decoded = decodeNetworkPdu({
+    networkKey: hex(FOREIGN_NETWORK_KEY_SAME_NID),
+    ivIndex: NETWORK_PDU_SAMPLE_1.ivIndex,
+    pdu: hex(NETWORK_PDU_SAMPLE_1.expected),
+  });
+  expect(decoded).toBeNull();
+});
+
+// A mesh radio hears truncated/corrupted captures constantly; this must be
+// rejected quietly, not thrown on. Far below the minimum length a header
+// plus the smallest legal payload could occupy.
+test('a truncated PDU is rejected rather than throwing', () => {
+  const truncated = hex(NETWORK_PDU_SAMPLE_1.expected).subarray(0, 8);
+  const decode = (): unknown =>
+    decodeNetworkPdu({
+      networkKey: hex(NETWORK_PDU_SAMPLE_1.networkKey),
+      ivIndex: NETWORK_PDU_SAMPLE_1.ivIndex,
+      pdu: truncated,
+    });
+  expect(decode).not.toThrow();
+  expect(decode()).toBeNull();
+});
+
+// Table 3.10: the leading octet's low 7 bits carry NID. Flipping the
+// identifier's low nibble (leaving bit 7's IVI alone) on an otherwise
+// untouched, correctly-keyed PDU isolates the cheap NID short-circuit from
+// the authentication path the previous test covers.
+test('a PDU whose network identifier does not match ours is rejected cheaply', () => {
+  const pdu = hex(NETWORK_PDU_SAMPLE_1.expected);
+  pdu[0] = (pdu[0] as number) ^ 0x0f;
+  const decoded = decodeNetworkPdu({
+    networkKey: hex(NETWORK_PDU_SAMPLE_1.networkKey),
+    ivIndex: NETWORK_PDU_SAMPLE_1.ivIndex,
+    pdu,
+  });
+  expect(decoded).toBeNull();
 });

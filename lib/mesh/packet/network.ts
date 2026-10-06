@@ -1,5 +1,5 @@
 import { e } from '../crypto/cmac';
-import { ccmEncrypt } from '../crypto/ccm';
+import { ccmEncrypt, ccmDecrypt } from '../crypto/ccm';
 import { k2 } from '../crypto/derive';
 import { networkNonce } from './nonce';
 
@@ -121,6 +121,17 @@ const MIN_TRANSPORT_PDU_LENGTH = 1;
 const MAX_TRANSPORT_PDU_LENGTH_ACCESS = 16; // 128 bits (Section 3.4.4.8, CTL=0).
 const MAX_TRANSPORT_PDU_LENGTH_CONTROL = 12; // 96 bits (Section 3.4.4.8, CTL=1).
 
+const DST_LENGTH = 2;
+const HEADER_LENGTH = 7; // 1 (IVI|NID) + 6 (obfuscated CTL/TTL/SEQ/SRC), Section 3.4.4.
+
+// The shortest legal encrypted part is EncDST (2) + a 1-octet EncTransportPDU
+// + the shorter 4-octet NetMIC (Table 3.11, Access/CTL=0) - which happens to
+// be exactly the 7 octets the Privacy Random is read from (step 4 of
+// `encodeNetworkPdu`'s own comment above), so this bound also guarantees
+// enough bytes exist to deobfuscate the header before CTL is even known.
+const MIN_ENCRYPTED_LENGTH = DST_LENGTH + MIN_TRANSPORT_PDU_LENGTH + NET_MIC_LENGTH_ACCESS;
+const MIN_PDU_LENGTH = HEADER_LENGTH + MIN_ENCRYPTED_LENGTH;
+
 function assertRange(field: string, value: number, max: number): void {
   if (!Number.isInteger(value) || value < 0 || value > max) {
     throw new Error(`network PDU field "${field}" must be an integer in [0, ${max}], got ${value}`);
@@ -191,4 +202,135 @@ export function encodeNetworkPdu(input: NetworkPduInput): Buffer {
   // Step 6: assemble IVI||NID, ObfuscatedData, EncDST||EncTransportPDU, NetMIC.
   const ivNid = ((input.ivIndex & 0x01) << 7) | nid;
   return Buffer.concat([Buffer.from([ivNid]), obfuscatedData, encDstAndTransportPdu, netMic]);
+}
+
+export interface DecodeNetworkPduInput {
+  /** 128-bit network key to try this received packet against. */
+  networkKey: Buffer;
+  /**
+   * 32-bit IV Index currently in effect on this subnet - folded into both
+   * the network nonce and the obfuscation's Privacy Plaintext, so it must
+   * match what the sender used or deobfuscation and authentication both
+   * fail.
+   */
+  ivIndex: number;
+  /** The received, on-the-wire Network PDU. */
+  pdu: Buffer;
+}
+
+/** A successfully decoded, authenticated Network PDU - `NetworkPduInput` minus the NetKey/IV Index used to decode it. */
+export interface DecodedNetworkPdu {
+  ctl: boolean;
+  ttl: number;
+  seq: number;
+  src: number;
+  dst: number;
+  transportPdu: Buffer;
+}
+
+/**
+ * Inverts `encodeNetworkPdu`: recovers a received Network PDU's header and
+ * TransportPDU, or returns null when the packet is not this subnet's. This
+ * is not error handling bolted on afterwards - it is the design's own stated
+ * rule for traffic from other networks ("Messages we cannot decrypt are
+ * ignored, since they belong to other networks"). A mesh radio hears
+ * neighbouring networks' traffic constantly; a decoder that threw on it
+ * would turn that ordinary background noise into a flood of failures in
+ * whatever calls this.
+ *
+ * Checks run cheapest first, so foreign traffic - the common case - is
+ * dropped before any AES-CCM work:
+ *
+ * 1. Derive NID/EncryptionKey/PrivacyKey from the candidate NetKey (the same
+ *    k2(NetKey, 0x00) the encoder uses) and compare NID against the low 7
+ *    bits of the PDU's leading octet. A mismatch returns null immediately.
+ *    NID is only 7 bits and merely narrows which NetKey to try at all
+ *    (Section 3.9.6.3.1: up to 2^121 keys can share one NID) - it is a cheap
+ *    filter, not authentication, so a NID match alone proves nothing yet.
+ * 2. Reject anything too short to possibly hold the header plus the
+ *    smallest legal payload (`MIN_PDU_LENGTH`) - below this there also
+ *    aren't the 7 octets of encrypted payload the Privacy Random is read
+ *    from next, so deobfuscation itself would be reading past the buffer.
+ * 3. Deobfuscate the header - PECB from the Privacy Plaintext (IV Index +
+ *    Privacy Random), XORed against the six obfuscated octets - to recover
+ *    CTL/TTL/SEQ/SRC. CTL fixes the expected NetMIC length (Table 3.11) and,
+ *    with it, the TransportPDU's legal length range (Section 3.4.4.8); a
+ *    recovered length outside that range returns null rather than slicing a
+ *    bogus ciphertext/tag split.
+ * 4. Rebuild the network nonce from the recovered CTL/TTL/SEQ/SRC and the
+ *    caller's IV Index, then run AES-CCM decryption/authentication
+ *    (`ccmDecrypt`) over EncDST||EncTransportPDU against NetMIC. Null here
+ *    means the tag did not verify - someone else's traffic under a
+ *    different EncryptionKey, however coincidentally its NID matched - and
+ *    is returned as-is.
+ *
+ * A caller's own mistake is not swallowed the same way: a `networkKey` of
+ * the wrong length throws (checked explicitly below, matching
+ * `encodeNetworkPdu`), exactly as `ccmDecrypt` already distinguishes a
+ * genuine programming error from ordinary foreign traffic.
+ */
+export function decodeNetworkPdu(input: DecodeNetworkPduInput): DecodedNetworkPdu | null {
+  if (input.networkKey.length !== 16) {
+    throw new Error(`network PDU field "networkKey" must be 16 bytes, got ${input.networkKey.length}`);
+  }
+  assertRange('ivIndex', input.ivIndex, MAX_IV_INDEX);
+
+  // Step 1: derive NID/EncryptionKey/PrivacyKey and check NID first - cheap,
+  // and lets us drop traffic for other networks before any AES-CCM work.
+  const { nid, encryptionKey, privacyKey } = k2(input.networkKey, MANAGED_FLOODING_P);
+  if (input.pdu.length < 1 || ((input.pdu[0] as number) & 0x7f) !== nid) {
+    return null;
+  }
+
+  // Step 2: the PDU must be long enough to hold the header plus the
+  // smallest legal payload.
+  if (input.pdu.length < MIN_PDU_LENGTH) {
+    return null;
+  }
+
+  // Step 3: deobfuscate the header the same way `encodeNetworkPdu` obfuscated
+  // it - PECB from the Privacy Plaintext, XORed against the six obfuscated
+  // octets - then use the recovered CTL to fix the NetMIC length and the
+  // TransportPDU's legal range.
+  const encryptedPart = input.pdu.subarray(HEADER_LENGTH);
+  const privacyRandom = encryptedPart.subarray(0, 7);
+  const privacyPlaintext = Buffer.alloc(16);
+  privacyPlaintext.writeUInt32BE(input.ivIndex, 5);
+  privacyRandom.copy(privacyPlaintext, 9);
+  const pecb = e(privacyKey, privacyPlaintext);
+
+  const obfuscatedData = input.pdu.subarray(1, HEADER_LENGTH);
+  const clearHeader = Buffer.alloc(6);
+  for (let i = 0; i < 6; i += 1) {
+    clearHeader[i] = (obfuscatedData[i] as number) ^ (pecb[i] as number);
+  }
+  const ctl = ((clearHeader[0] as number) & 0x80) !== 0;
+  const ttl = (clearHeader[0] as number) & 0x7f;
+  const seq = clearHeader.readUIntBE(1, 3);
+  const src = clearHeader.readUInt16BE(4);
+
+  const micLength = ctl ? NET_MIC_LENGTH_CONTROL : NET_MIC_LENGTH_ACCESS;
+  const maxTransportPduLength = ctl ? MAX_TRANSPORT_PDU_LENGTH_CONTROL : MAX_TRANSPORT_PDU_LENGTH_ACCESS;
+  const transportPduLength = encryptedPart.length - DST_LENGTH - micLength;
+  if (transportPduLength < MIN_TRANSPORT_PDU_LENGTH || transportPduLength > maxTransportPduLength) {
+    return null;
+  }
+
+  // Step 4: rebuild the nonce from the recovered fields, then decrypt and authenticate.
+  const nonce = networkNonce({ ctl, ttl, seq, src, ivIndex: input.ivIndex });
+  const encDstAndTransportPdu = encryptedPart.subarray(0, DST_LENGTH + transportPduLength);
+  const netMic = encryptedPart.subarray(DST_LENGTH + transportPduLength);
+  const decrypted = ccmDecrypt(encryptionKey, nonce, encDstAndTransportPdu, netMic);
+  if (decrypted === null) {
+    return null;
+  }
+
+  return {
+    ctl,
+    ttl,
+    seq,
+    src,
+    dst: decrypted.readUInt16BE(0),
+    transportPdu: decrypted.subarray(DST_LENGTH),
+  };
 }

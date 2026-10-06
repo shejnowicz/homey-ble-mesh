@@ -208,3 +208,21 @@ export const NETWORK_PDU_SAMPLE_3 = {
   transportPdu: '665a8bde6d9106ea078a',
   expected: '6848cba437860e5673728a627fb938535508e21a6baf57',
 };
+
+/**
+ * Not a specification sample: a NetKey constructed for the decoder's test
+ * suite, chosen (by a one-off brute-force search over `k2`, outside the
+ * code under test) because it derives the SAME NID (0x68) as the NetKey
+ * above, while obviously deriving a different EncryptionKey/PrivacyKey.
+ *
+ * This matters because NID is only 7 bits (Section 3.9.6.3.1 notes up to
+ * 2^121 possible keys share any given NID), so a real receiver cannot reject
+ * foreign traffic by NID alone - it has to try decryption and let
+ * authentication fail. A foreign key picked at random would, 127 times out
+ * of 128, already differ in its derived NID, and a decode test built on it
+ * would then pass for the wrong reason: rejected by the cheap NID
+ * short-circuit before AES-CCM authentication ever runs. This key is picked
+ * so the "foreign key" decode test actually exercises - and can actually
+ * catch a regression in - the authentication check itself.
+ */
+export const FOREIGN_NETWORK_KEY_SAME_NID = '00000000000000000000000000000033';
