@@ -8,11 +8,15 @@ import {
 } from '../machine';
 import {
   encodeProvisioningPdu,
+  decodeProvisioningPdu,
   ProvisioningCapabilities,
   ProvisioningPublicKey,
   ProvisioningConfirmation,
+  ProvisioningRandom,
+  ProvisioningData,
   ProvisioningFailed,
 } from '../pdu';
+import { ccmDecrypt } from '../../crypto/ccm';
 import {
   hex,
   PDU_TYPE_SAMPLE_INVITE,
@@ -188,6 +192,85 @@ describe('a PDU arriving out of order', () => {
     const resumed = step(failedResult.state, hex(PDU_TYPE_SAMPLE_CAPABILITIES.message));
     expect(resumed).toEqual({ state: failedResult.state, send: [] });
   });
+
+  // The three tests above only ever misorder a PDU at the FIRST phase
+  // (awaitingCapabilities). A review found this leaves every later phase's
+  // own type check untested: weakening just ONE of them (e.g. letting a
+  // Confirmation PDU fall through at the Random step) still passed the
+  // full suite, because nothing exercised that phase with a wrong type.
+  // One case per remaining phase closes that, each asserting the whole
+  // resulting `'failed'` state, not only that something failed.
+
+  test('at awaitingPublicKeyDevice: a Confirmation PDU instead of Public Key is rejected', () => {
+    let result = begin();
+    result = step(result.state, hex(PDU_TYPE_SAMPLE_CAPABILITIES.message));
+    expect(result.state.phase).toBe('awaitingPublicKeyDevice');
+
+    result = step(result.state, hex(PDU_TYPE_SAMPLE_CONFIRMATION_PROVISIONER.message));
+    expect(result.send).toEqual([]);
+    expect(result.state).toEqual({
+      phase: 'failed',
+      errorCode: 0x03,
+      errorName: 'Unexpected PDU',
+      reason: 'expected a Public Key PDU but received a confirmation PDU',
+    });
+  });
+
+  test('at awaitingConfirmationDevice: a Random PDU instead of Confirmation is rejected', () => {
+    let result = begin();
+    result = step(result.state, hex(PDU_TYPE_SAMPLE_CAPABILITIES.message));
+    result = step(result.state, hex(PDU_TYPE_SAMPLE_PUBLIC_KEY_DEVICE.message));
+    expect(result.state.phase).toBe('awaitingConfirmationDevice');
+
+    result = step(result.state, hex(PDU_TYPE_SAMPLE_RANDOM_DEVICE.message));
+    expect(result.send).toEqual([]);
+    expect(result.state).toEqual({
+      phase: 'failed',
+      errorCode: 0x03,
+      errorName: 'Unexpected PDU',
+      reason: 'expected a Confirmation PDU but received a random PDU',
+    });
+  });
+
+  // This is the exact scenario a review's mutation targeted: weakening
+  // the type check at the Random step so a Confirmation PDU fell through
+  // and was treated as Random, reaching `awaitingComplete` with a zero
+  // device key. With the type check intact, this must fail cleanly here
+  // instead.
+  test('at awaitingRandomDevice: a Confirmation PDU instead of Random is rejected, not silently advanced', () => {
+    let result = begin();
+    result = step(result.state, hex(PDU_TYPE_SAMPLE_CAPABILITIES.message));
+    result = step(result.state, hex(PDU_TYPE_SAMPLE_PUBLIC_KEY_DEVICE.message));
+    result = step(result.state, hex(PDU_TYPE_SAMPLE_CONFIRMATION_DEVICE.message));
+    expect(result.state.phase).toBe('awaitingRandomDevice');
+
+    result = step(result.state, hex(PDU_TYPE_SAMPLE_CONFIRMATION_DEVICE.message));
+    expect(result.send).toEqual([]);
+    expect(result.state).toEqual({
+      phase: 'failed',
+      errorCode: 0x03,
+      errorName: 'Unexpected PDU',
+      reason: 'expected a Random PDU but received a confirmation PDU',
+    });
+  });
+
+  test('at awaitingComplete: a Random PDU instead of Complete is rejected', () => {
+    let result = begin();
+    result = step(result.state, hex(PDU_TYPE_SAMPLE_CAPABILITIES.message));
+    result = step(result.state, hex(PDU_TYPE_SAMPLE_PUBLIC_KEY_DEVICE.message));
+    result = step(result.state, hex(PDU_TYPE_SAMPLE_CONFIRMATION_DEVICE.message));
+    result = step(result.state, hex(PDU_TYPE_SAMPLE_RANDOM_DEVICE.message));
+    expect(result.state.phase).toBe('awaitingComplete');
+
+    result = step(result.state, hex(PDU_TYPE_SAMPLE_RANDOM_DEVICE.message));
+    expect(result.send).toEqual([]);
+    expect(result.state).toEqual({
+      phase: 'failed',
+      errorCode: 0x03,
+      errorName: 'Unexpected PDU',
+      reason: 'expected a Complete PDU but received a random PDU',
+    });
+  });
 });
 
 // ===========================================================================
@@ -226,6 +309,80 @@ describe('a confirmation value that does not match', () => {
     const result = step(atRandomDevice.state, hex(PDU_TYPE_SAMPLE_RANDOM_DEVICE.message));
     expect(result.state.phase).toBe('awaitingComplete');
     expect(result.send).toEqual([hex(PDU_TYPE_SAMPLE_DATA.message)]);
+  });
+
+  // A review found that the mutation test above does not actually prove
+  // the comparison checks all 16 bytes: it corrupts a byte of RANDOM, not
+  // of the stored confirmation, so the recomputed value differs from the
+  // stored one starting at byte 0 - a comparison truncated to the first 8
+  // bytes, or even the first 1 byte, would still catch it. This test
+  // instead corrupts only the LAST byte of the device's confirmation
+  // value (derived by flipping one bit of the published, verified value -
+  // not a value taken on trust), then completes the exchange with the
+  // GENUINE published RandomDevice. The recomputed ConfirmationDevice
+  // therefore matches the published value everywhere EXCEPT that last
+  // byte - the one shape of mismatch a prefix-only comparison would miss.
+  test('a device confirmation differing from the published value ONLY in its last byte still fails (closes a truncated-comparison gap)', () => {
+    const genuineConfirmationDevice = hex(PDU_TYPE_SAMPLE_CONFIRMATION_DEVICE.fields.confirmation);
+    const almostGenuineConfirmationDevice = Buffer.from(genuineConfirmationDevice);
+    const lastIndex = almostGenuineConfirmationDevice.length - 1;
+    almostGenuineConfirmationDevice[lastIndex] = (almostGenuineConfirmationDevice[lastIndex] as number) ^ 0x01;
+    // Sanity check on the fixture itself: everything BUT the last byte is
+    // still identical to the genuine value - otherwise this would not be
+    // testing what it claims to.
+    expect(almostGenuineConfirmationDevice.subarray(0, lastIndex)).toEqual(genuineConfirmationDevice.subarray(0, lastIndex));
+    expect(almostGenuineConfirmationDevice.subarray(lastIndex)).not.toEqual(genuineConfirmationDevice.subarray(lastIndex));
+
+    let result = begin();
+    result = step(result.state, hex(PDU_TYPE_SAMPLE_CAPABILITIES.message));
+    result = step(result.state, hex(PDU_TYPE_SAMPLE_PUBLIC_KEY_DEVICE.message));
+    const almostGenuineConfirmationPdu: ProvisioningConfirmation = {
+      type: 'confirmation',
+      confirmation: almostGenuineConfirmationDevice,
+    };
+    result = step(result.state, encodeProvisioningPdu(almostGenuineConfirmationPdu));
+    expect(result.state.phase).toBe('awaitingRandomDevice');
+
+    // The genuine RandomDevice - recomputing ConfirmationDevice from it
+    // reproduces the GENUINE value, which now disagrees with the altered
+    // one stored above by exactly one byte, at the end.
+    result = step(result.state, hex(PDU_TYPE_SAMPLE_RANDOM_DEVICE.message));
+    expect(result.send).toEqual([]);
+    expect(result.state).toEqual({
+      phase: 'failed',
+      errorCode: 0x04,
+      errorName: 'Confirmation Failed',
+      reason:
+        'ConfirmationDevice recomputed from the received RandomDevice does not match the value received earlier (Section 5.4.2.4.2: the Provisionee is not authenticated)',
+    });
+  });
+
+  test('a 32-byte device Confirmation (wrong algorithm length) is rejected as Invalid Format, not fed into the comparison', () => {
+    let result = begin();
+    result = step(result.state, hex(PDU_TYPE_SAMPLE_CAPABILITIES.message));
+    result = step(result.state, hex(PDU_TYPE_SAMPLE_PUBLIC_KEY_DEVICE.message));
+    const longConfirmationPdu: ProvisioningConfirmation = { type: 'confirmation', confirmation: Buffer.alloc(32, 0x01) };
+    result = step(result.state, encodeProvisioningPdu(longConfirmationPdu));
+    expect(result.send).toEqual([]);
+    expect(result.state).toEqual({
+      phase: 'failed',
+      errorCode: 0x02,
+      errorName: 'Invalid Format',
+      reason: 'device Confirmation is 32 bytes, expected 16 under BTM_ECDH_P256_CMAC_AES128_AES_CCM',
+    });
+  });
+
+  test('a 32-byte device Random (wrong algorithm length) is rejected as Invalid Format', () => {
+    const atRandomDevice = driveToAwaitingRandomDevice();
+    const longRandomPdu: ProvisioningRandom = { type: 'random', random: Buffer.alloc(32, 0x02) };
+    const result = step(atRandomDevice.state, encodeProvisioningPdu(longRandomPdu));
+    expect(result.send).toEqual([]);
+    expect(result.state).toEqual({
+      phase: 'failed',
+      errorCode: 0x02,
+      errorName: 'Invalid Format',
+      reason: 'device Random is 32 bytes, expected 16 under BTM_ECDH_P256_CMAC_AES128_AES_CCM',
+    });
   });
 
   test('a device confirmation identical to our own fails immediately (Section 5.4.2.4.2 sanity check), before any random is sent', () => {
@@ -445,5 +602,107 @@ describe('beginProvisioning input validation', () => {
         provisioningData,
       }),
     ).toThrow('provisioning machine field "attentionDuration" must be an integer in [0, 255], got 256');
+  });
+
+  // Table 3.5: 0x0000 is Unassigned, not unicast; 0x8000-0xffff is
+  // Virtual/Group. Both ends of the narrowed range are exercised.
+  test('rejects a unicast address of 0x0000 (Unassigned Address)', () => {
+    expect(() =>
+      beginProvisioning({
+        attentionDuration: 0,
+        ephemeralKeyPair,
+        randomProvisioner,
+        provisioningData: { ...provisioningData, unicastAddress: 0x0000 },
+      }),
+    ).toThrow(
+      'provisioning machine field "provisioningData.unicastAddress" must be a unicast address, an integer in [1, 32767] (Table 3.5 - 0x0000 is Unassigned, 0x8000-0xffff is Virtual/Group), got 0',
+    );
+  });
+
+  test('rejects a unicast address of 0x8000 (the first Virtual Address)', () => {
+    expect(() =>
+      beginProvisioning({
+        attentionDuration: 0,
+        ephemeralKeyPair,
+        randomProvisioner,
+        provisioningData: { ...provisioningData, unicastAddress: 0x8000 },
+      }),
+    ).toThrow('provisioning machine field "provisioningData.unicastAddress" must be a unicast address, an integer in [1, 32767]');
+  });
+
+  test('accepts the boundary unicast addresses 0x0001 and 0x7fff', () => {
+    expect(() =>
+      beginProvisioning({
+        attentionDuration: 0,
+        ephemeralKeyPair,
+        randomProvisioner,
+        provisioningData: { ...provisioningData, unicastAddress: 0x0001 },
+      }),
+    ).not.toThrow();
+    expect(() =>
+      beginProvisioning({
+        attentionDuration: 0,
+        ephemeralKeyPair,
+        randomProvisioner,
+        provisioningData: { ...provisioningData, unicastAddress: 0x7fff },
+      }),
+    ).not.toThrow();
+  });
+});
+
+// ===========================================================================
+// Hardcoded-looking fields the published sample happens to leave at zero
+// (Attention Duration, Flags) - a review found both could be hardcoded to
+// 0x00 inside the implementation and every existing test would still
+// pass, since the sample never exercises a non-zero value for either.
+// ===========================================================================
+
+describe('fields the published sample happens to leave at zero', () => {
+  test('a non-zero attentionDuration reaches the Invite PDU exactly', () => {
+    const result = beginProvisioning({
+      attentionDuration: 0x05,
+      ephemeralKeyPair,
+      randomProvisioner,
+      provisioningData,
+    });
+    // Table 5.17: Type octet (0x00 Invite) || Parameters (Attention
+    // Duration, 1 octet) - independent of any other fixture, built by
+    // hand from Table 5.18's own one-field layout.
+    expect(result.send).toEqual([Buffer.from([0x00, 0x05])]);
+  });
+
+  test('a non-zero Flags byte reaches the encrypted Provisioning Data (Table 5.48: bit 0 Key Refresh Phase 2, bit 1 IV Update in progress)', () => {
+    const nonZeroFlags = 0x03;
+    let result = beginProvisioning({
+      attentionDuration: PDU_TYPE_SAMPLE_INVITE.fields.attentionDuration,
+      ephemeralKeyPair,
+      randomProvisioner,
+      provisioningData: { ...provisioningData, flags: nonZeroFlags },
+    });
+    result = step(result.state, hex(PDU_TYPE_SAMPLE_CAPABILITIES.message));
+    result = step(result.state, hex(PDU_TYPE_SAMPLE_PUBLIC_KEY_DEVICE.message));
+    result = step(result.state, hex(PDU_TYPE_SAMPLE_CONFIRMATION_DEVICE.message));
+    result = step(result.state, hex(PDU_TYPE_SAMPLE_RANDOM_DEVICE.message));
+    expect(result.state.phase).toBe('awaitingComplete');
+
+    // provisioningData never participates in deriving SessionKey/
+    // SessionNonce (Section 5.4.2.5's own formulas take only ECDHSecret
+    // and ProvisioningSalt), so they are unchanged from the published
+    // sample regardless of `flags` - decrypting with those SAME published
+    // values recovers the plaintext this step actually encrypted.
+    const dataBytes = result.send[0] as Buffer;
+    const decodedData = decodeProvisioningPdu(dataBytes);
+    expect(decodedData?.type).toBe('data');
+    const { encryptedProvisioningData, mic } = decodedData as ProvisioningData;
+    const plaintext = ccmDecrypt(hex(PROVISIONING_SAMPLE.sessionKey), hex(PROVISIONING_SAMPLE.sessionNonce), encryptedProvisioningData, mic);
+    expect(plaintext).toEqual(
+      Buffer.concat([
+        provisioningData.netKey,
+        fullPlaintext.subarray(16, 18), // Key Index, unchanged.
+        Buffer.from([nonZeroFlags]),
+        fullPlaintext.subarray(19, 23), // IV Index, unchanged.
+        fullPlaintext.subarray(23, 25), // Unicast Address, unchanged.
+      ]),
+    );
   });
 });
