@@ -248,9 +248,15 @@ export interface DecodedNetworkPdu {
  *    (Section 3.9.6.3.1: up to 2^121 keys can share one NID) - it is a cheap
  *    filter, not authentication, so a NID match alone proves nothing yet.
  * 2. Reject anything too short to possibly hold the header plus the
- *    smallest legal payload (`MIN_PDU_LENGTH`) - below this there also
- *    aren't the 7 octets of encrypted payload the Privacy Random is read
- *    from next, so deobfuscation itself would be reading past the buffer.
+ *    smallest legal payload (`MIN_PDU_LENGTH`, built from the least
+ *    restrictive - 32-bit, Access - NetMIC length). This is a cost-only
+ *    early exit, not a safety net: Node's Buffer operations clamp rather
+ *    than overrun past a buffer's end, and step 3's own bound (built from
+ *    the recovered CTL's actual, possibly longer, NetMIC length) already
+ *    rejects everything this one would - nothing can pass that later bound
+ *    while failing this one, for either CTL value. What this earlier check
+ *    buys is skipping the header deobfuscation below for input too short to
+ *    ever matter.
  * 3. Deobfuscate the header - PECB from the Privacy Plaintext (IV Index +
  *    Privacy Random), XORed against the six obfuscated octets - to recover
  *    CTL/TTL/SEQ/SRC. CTL fixes the expected NetMIC length (Table 3.11) and,
@@ -282,8 +288,18 @@ export function decodeNetworkPdu(input: DecodeNetworkPduInput): DecodedNetworkPd
     return null;
   }
 
-  // Step 2: the PDU must be long enough to hold the header plus the
-  // smallest legal payload.
+  // Step 2: a cheap early exit on cost grounds only, not a safety net. The
+  // later bound in step 3 is built from the recovered CTL's actual NetMIC
+  // length, which is always >= NET_MIC_LENGTH_ACCESS (the least restrictive
+  // case, and what MIN_PDU_LENGTH is built from) - so that later bound is at
+  // least as restrictive as this one for both CTL values, and nothing can
+  // pass it while failing this one. Node's Buffer operations clamp rather
+  // than overrun on an out-of-range offset/length, so skipping this check
+  // could not corrupt memory either; all it buys is skipping the header
+  // deobfuscation below for input too short to ever matter. Verified by
+  // removing this check and re-running the full suite: every test,
+  // including the truncated-PDU one, still passed, rejected by step 3
+  // instead.
   if (input.pdu.length < MIN_PDU_LENGTH) {
     return null;
   }
