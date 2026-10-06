@@ -19,10 +19,16 @@
  *
  * THIS FILE'S INVENTORY:
  * - `PDU_TYPE_SAMPLE_*` (eleven fixtures): one complete, published
- *   Provisioning PDU - Type octet plus Parameters - for each of the ten
- *   wire-confirmed Types this project's `pdu.ts` implements, with both
- *   directions recorded separately for Public Key, Confirmation and
- *   Random (hence eleven fixtures for ten Types). Source: Mesh Protocol
+ *   Provisioning PDU - Type octet plus Parameters - for EIGHT of the ten
+ *   Types this project's `pdu.ts` implements (every Type this document's
+ *   worked exchange actually sends: Invite, Capabilities, Start, Public
+ *   Key, Confirmation, Random, Data, Complete), with both directions
+ *   recorded separately for Public Key, Confirmation and Random (hence
+ *   eleven fixtures for eight Types). The remaining two Types `pdu.ts`
+ *   implements - Input Complete and Failed - have NO fixture here, because
+ *   this document publishes no worked sample for either (see this file's
+ *   own "NO FABRICATED SAMPLES" note below); do not add a fixture for them
+ *   that is not itself a published sample. Source: Mesh Protocol
  *   v1.1 Section 8.7 "PB-ADV provisioning sample data", subsections 8.7.3
  *   through 8.7.13 (8.7.1 PB-ADV Link Open and 8.7.2 PB-ADV Link ACK, and
  *   every "PB-ADV Transaction Ack" subsection, are Generic Provisioning
@@ -67,8 +73,30 @@
  * exactly the "match on position and meaning, not on a caption" rule the
  * brief states.
  *
- * NO FABRICATED SAMPLES: Types 0x0A-0x0D (the out-of-scope provisioning
- * record types, see `pdu.ts`'s SCOPE note) and Input Complete/Failed are
+ * SECOND ERRATA NOTE: Section 8.7.5's own field-by-field breakdown of the
+ * Provisioning Start sample prints its `Public Key` row as `0000` - TWO
+ * octets - while Table 5.28 defines Public Key as a ONE-octet field. The
+ * `PDU_TYPE_SAMPLE_START` fixture below is unaffected (its `publicKey:
+ * 0x00` is read off the `message` bytes directly, one octet at the position
+ * Table 5.28 puts it, not off this mis-printed breakdown row), but the
+ * divergence is silent unless cross-checked, so it is recorded here rather
+ * than left for the next person to rediscover. Two independent
+ * cross-checks resolve it in Table 5.28's favour:
+ * (1) the SAME subsection's own published `TotalLength` is `0x0006` (6
+ * octets: 1 Type octet + 5 Parameter octets) - only consistent with Public
+ * Key being ONE octet (Algorithm 1 + PublicKey 1 + AuthenticationMethod 1 +
+ * AuthenticationAction 1 + AuthenticationSize 1 = 5), not two (which would
+ * make TotalLength 0x0007); and
+ * (2) Sections 8.7.8 and 8.7.9 (the Confirmation samples) each separately
+ * publish `StartPDUValue : 0000000000` - TEN hex characters, i.e. FIVE
+ * octets, exactly the Section 5.4.2.4.1 definition of "the value of the
+ * Provisioning Start PDU fields (excluding the opcode)" - which only adds
+ * up if every one of those five fields, Public Key included, is one octet.
+ * Both cross-checks agree with Table 5.28 and with each other, against the
+ * one mis-printed breakdown row.
+ *
+ * NO FABRICATED SAMPLES: Types 0x0A-0x0D (the out-of-scope certificate-based
+ * provisioning record types, see `pdu.ts`'s SCOPE note) and Input Complete/Failed are
  * NOT given `PDU_TYPE_SAMPLE_*` fixtures here, because this document
  * publishes no worked wire sample for any of them - Input Complete and
  * Complete's EMPTY-parameters shape is tested directly against each Type's

@@ -39,8 +39,12 @@ import { assertRange } from '../packet/ranges';
  * Input Complete, 0x05 Provisioning Confirmation, 0x06 Provisioning Random,
  * 0x07 Provisioning Data, 0x08 Provisioning Complete, 0x09 Provisioning
  * Failed, 0x0A-0x0D four more "Provisioning Record(s)" types for fetching
- * OOB-related provisioning records (added after Mesh Profile 1.0.1, a
- * feature this design does not use - see below). EVERY value 0x00-0x09 this
+ * provisioning records - mostly device certificates and a certificate-based
+ * provisioning URI (Section 5.4.2.6.3 "Provisioning records", Table 5.52:
+ * 0x0000 Certificate-Based Provisioning Base URI, 0x0001 Device Certificate,
+ * 0x0002-0x0010 up to fifteen Intermediate Certificates, plus a Complete
+ * Local Name and an Appearance record) - added after Mesh Profile 1.0.1, a
+ * feature this design does not use - see below. EVERY value 0x00-0x09 this
  * module uses is independently confirmed by this same Mesh Protocol
  * document's own Section 8.7 "PB-ADV provisioning sample data" (fetched the
  * same way, see `__tests__/vectors.ts`): each worked message's own published
@@ -63,14 +67,52 @@ import { assertRange } from '../packet/ranges';
  * in its Capabilities PDU regardless of what WE intend to use, and we must
  * decode what it says rather than assume a shape - "if one demands an
  * out-of-band code, the wizard says so", which requires actually reading
- * that field. Deliberately NOT implemented: Types 0x0A-0x0D (Provisioning
- * Record Request/Response/Records Get/Records List, Section 5.4.1.11-
- * 5.4.1.14) - a separate, optional exchange for fetching OOB-related
- * "provisioning records" that only runs when a Provisioner chooses to send
- * one of those four PDUs first; nothing in this design ever does, so they
- * are out of scope rather than merely untested. `decodeProvisioningPdu`
- * treats 0x0A-0x0D the same as every other value it does not recognise -
- * `null`, not a thrown error - should one ever arrive.
+ * that field.
+ *
+ * Deliberately NOT implemented: Types 0x0A-0x0D, the certificate-based
+ * provisioning record exchange (Section 5.4.2.6 "Provisioning record
+ * retrieval over a provisioning bearer"). Transcribed here in full (so a
+ * later task never has to re-read Section 5.4.1.11-5.4.1.14 to find out what
+ * it chose to skip), even though no codec is implemented for them:
+ *
+ *   - 0x0A Provisioning Record Request (Section 5.4.1.11, Table 5.42):
+ *     Record ID (2 octets) || Fragment Offset (2 octets) || Fragment
+ *     Maximum Size (2 octets) - 6 octets of Parameters.
+ *   - 0x0B Provisioning Record Response (Section 5.4.1.12, Table 5.43):
+ *     Status (1 octet, Table 5.44: 0x00 Success, 0x01 Requested Record Is
+ *     Not Present, 0x02 Requested Offset Is Out Of Bounds, 0x03-0xFF RFU)
+ *     || Record ID (2 octets) || Fragment Offset (2 octets) || Total Length
+ *     (2 octets) || Data (N octets, OPTIONAL - empty unless Status is
+ *     Success) - 7+N octets of Parameters.
+ *   - 0x0C Provisioning Records Get (Section 5.4.1.13): no parameters, same
+ *     empty shape as Input Complete/Complete above.
+ *   - 0x0D Provisioning Records List (Section 5.4.1.14, Table 5.45):
+ *     Provisioning Extensions (2 octets, a bitmask - Table 5.46 currently
+ *     defines every bit 0-15 as Reserved for Future Use) || Records List
+ *     (variable, OPTIONAL - a packed list of 16-bit Record IDs, empty if
+ *     the Provisionee stores none) - 2+N octets of Parameters.
+ *
+ * The LOAD-BEARING reason this design can treat these four as unreachable,
+ * not merely unused, is ordering, not intent: Section 5.4.2.6.1 states
+ * plainly "the Provisioner shall send a Provisioning Records Get PDU before
+ * it sends a Provisioning Invite PDU", and Section 5.4.2.6.2 states the same
+ * for Record Request ("the Provisioner shall send Provisioning Record
+ * Request PDUs before sending a Provisioning Invite PDU") - both Get and
+ * Request are Provisioner-INITIATED, and a Provisionee never sends Response
+ * or List except in reply to one. Table 5.49/5.51 make the enforcement
+ * concrete: a Provisionee that receives a Records Get or Record Request
+ * AFTER it has already received the Invite PDU treats that as "provisioning
+ * failed" ("Unexpected PDU"), not as a normal request - so this exchange, if
+ * it happens at all, is strictly confined to BEFORE Invite starts. A state
+ * machine built around this no-OOB design's fixed order (this module
+ * header's own DIRECTION table below, which begins at Invite) therefore
+ * never has a point in its own run where a 0x0A-0x0D PDU would be a valid
+ * NEXT message to accept, independent of whether this design ever intends
+ * to use certificate-based provisioning - the earlier, intent-only framing
+ * ("nothing in this design ever does [send one]") is also true but is the
+ * weaker of the two reasons. `decodeProvisioningPdu` treats 0x0A-0x0D the
+ * same as every other value it does not recognise - `null`, not a thrown
+ * error - should one ever arrive regardless.
  *
  * DIRECTION (needed by the provisioning state machine, a later task - noted
  * here while reading the section rather than re-reading it later):

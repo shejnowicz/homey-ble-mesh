@@ -57,29 +57,43 @@ describe('Provisioning Capabilities (Section 5.4.1.2, Table 5.19; Section 8.7.4)
     expect(encodeProvisioningPdu(pdu)).toEqual(hex(PDU_TYPE_SAMPLE_CAPABILITIES.message));
   });
 
-  // The two fields this sample happens to leave at 0 - confirms the 16-bit
-  // fields are read/written big-endian (Section 3.1.1), not merely zero
-  // either way. A fresh value with distinct octets, round-tripped through
-  // both functions against each other's output alone would not prove byte
-  // order - this is still a structural (not known-answer) check, kept
-  // separate from the KAT tests above.
-  test('16-bit Capabilities fields round-trip big-endian for non-zero, asymmetric values', () => {
+  // Every single-octet field this sample happens to leave at 0
+  // (numberOfElements aside) - which means a decoder/encoder that swapped
+  // ANY two of those fields' positions (publicKeyType<->oobType,
+  // outputOobSize<->inputOobSize, or either against numberOfElements) would
+  // still reproduce this exact sample, since 0 in field A's slot looks
+  // identical to 0 in field B's slot. Caught live by mutation (see the
+  // commit message / task report): the first version of this test used
+  // publicKeyType=oobType=0x01 and outputOobSize=inputOobSize=0x08 - the
+  // SAME value in each pair - so a field-swapping mutation on either pair
+  // passed it too. Every one of the five single-octet fields below
+  // (numberOfElements, publicKeyType, oobType, outputOobSize, inputOobSize)
+  // now has a DIFFERENT value from every other one of the five, and the
+  // three 16-bit fields are likewise pairwise distinct and internally
+  // asymmetric (high octet != low octet) - so swapping any two field
+  // positions, of any width, changes the encoded bytes. The expected hex
+  // below is computed BY HAND from Table 5.19's own field order and widths,
+  // never by running `encodeProvisioningPdu` and recording its output -
+  // doing that would just reproduce whatever swap this test exists to
+  // catch.
+  test('Capabilities fields all round-trip through their own position (pairwise-distinct octets)', () => {
     const pdu: ProvisioningPdu = {
       type: 'capabilities',
       numberOfElements: 0x03,
       algorithms: 0x1234,
       publicKeyType: 0x01,
-      oobType: 0x01,
+      oobType: 0x02,
       outputOobSize: 0x08,
       outputOobAction: 0x5678,
-      inputOobSize: 0x08,
+      inputOobSize: 0x07,
       inputOobAction: 0x9abc,
     };
     const encoded = encodeProvisioningPdu(pdu);
-    // Table 5.19's byte layout: Type, NumberOfElements, Algorithms(BE),
-    // PublicKeyType, OOBType, OutputOOBSize, OutputOOBAction(BE),
-    // InputOOBSize, InputOOBAction(BE).
-    expect(encoded).toEqual(hex('01' + '03' + '1234' + '01' + '01' + '08' + '5678' + '08' + '9abc'));
+    // Table 5.19's byte layout, by hand: Type(01), NumberOfElements(03),
+    // Algorithms(1234, BE), PublicKeyType(01), OOBType(02),
+    // OutputOOBSize(08), OutputOOBAction(5678, BE), InputOOBSize(07),
+    // InputOOBAction(9abc, BE).
+    expect(encoded).toEqual(hex('01' + '03' + '1234' + '01' + '02' + '08' + '5678' + '07' + '9abc'));
     expect(decodeProvisioningPdu(encoded)).toEqual(pdu);
   });
 });
@@ -99,6 +113,33 @@ describe('Provisioning Start (Section 5.4.1.3, Table 5.28; Section 8.7.5)', () =
       ...PDU_TYPE_SAMPLE_START.fields,
     };
     expect(encodeProvisioningPdu(pdu)).toEqual(hex(PDU_TYPE_SAMPLE_START.message));
+  });
+
+  // The published Start sample (Section 8.7.5) sets ALL FIVE Parameter
+  // octets to 0x00 - so the KAT tests above cannot distinguish a correctly
+  // laid-out encoder/decoder from one that silently permutes any of
+  // algorithm/publicKey/authenticationMethod/authenticationAction/
+  // authenticationSize among themselves; every permutation of five zeros is
+  // the same five zeros. This test gives the five fields five DIFFERENT
+  // values so that no swap of any two field positions can pass unnoticed.
+  // Expected hex computed BY HAND from Table 5.28's own field order and
+  // widths (all five fields are one octet each), never by running the
+  // encoder and recording its output.
+  test('Start fields all round-trip through their own position (five distinct octets)', () => {
+    const pdu: ProvisioningPdu = {
+      type: 'start',
+      algorithm: 0x11,
+      publicKey: 0x22,
+      authenticationMethod: 0x33,
+      authenticationAction: 0x44,
+      authenticationSize: 0x55,
+    };
+    const encoded = encodeProvisioningPdu(pdu);
+    // Table 5.28's byte layout, by hand: Type(02), Algorithm(11),
+    // PublicKey(22), AuthenticationMethod(33), AuthenticationAction(44),
+    // AuthenticationSize(55).
+    expect(encoded).toEqual(hex('02' + '11' + '22' + '33' + '44' + '55'));
+    expect(decodeProvisioningPdu(encoded)).toEqual(pdu);
   });
 });
 
