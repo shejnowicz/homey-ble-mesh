@@ -830,17 +830,20 @@ export const LOWER_TRANSPORT_SAMPLE_SEGMENTED = {
  * DEVICE_NONCE_SAMPLE_1/UPPER_TRANSPORT_SAMPLE_DEVICE_KEY, but read for its
  * OWN two "LowerTransportSegmentedAccessPDU" blocks (Section 8.3.6) - fetched
  * independently for the segmentation task (same URL/HTML/method,
- * 2026-10-06). Unlike LOWER_TRANSPORT_SAMPLE_SEGMENTED (Message #24), whose
- * second segment's own CTL/SEQ/SegO block is published but whose first and
- * second segment headers were cross-derived above, Message #6 publishes BOTH
- * segments' complete blocks independently, each with its own Header and
- * LowerTransportPDU row - chosen deliberately as this task's primary
- * multi-segment sample because of that, and because it is DevKey (AKF=0,
- * AID=0, SZMIC=0), the one combination this file's segmented sample above
- * does not cover (same AKF=0 gap already closed for the unsegmented case by
- * LOWER_TRANSPORT_SAMPLE_ACCESS_DEVICE_KEY, for the same reason: every other
- * segmented sample here has AKF=1/SZMIC=1, so a decoder that silently
- * ignored either bit would still pass without this).
+ * 2026-10-06). Like LOWER_TRANSPORT_SAMPLE_SEGMENTED (Message #24), both of
+ * Message #6's segments publish their own complete
+ * "LowerTransportSegmentedAccessPDU" block independently, each with its own
+ * Header and LowerTransportPDU row (neither message's `header1` is derived
+ * from its `header` by flipping a bit - see that constant's own comment
+ * above). Message #6 is this task's primary multi-segment sample because
+ * it is DevKey (AKF=0, AID=0, SZMIC=0), the one combination this file's
+ * other segmented sample above does not cover (same AKF=0 gap already
+ * closed for the unsegmented case by LOWER_TRANSPORT_SAMPLE_ACCESS_
+ * DEVICE_KEY, for the same reason: every other segmented sample here has
+ * AKF=1/SZMIC=1, so a decoder that silently ignored either bit would still
+ * pass without this - confirmed by mutation: removing this sample and
+ * re-running an AKF-blind and a SZMIC-blind mutation each left the rest of
+ * the suite green, both caught only by this sample).
  *
  * Segment #0's own block: CTL=00, TTL=04, SEQ=3129ab, SRC=0003, DST=1201,
  * SEG=01, AKF=00, AID=00, SZMIC=00, SeqZero=9ab, SegO=00, SegN=01,
@@ -851,14 +854,21 @@ export const LOWER_TRANSPORT_SAMPLE_SEGMENTED = {
  * SEG=01, AKF=00, AID=00, SZMIC=00, SegO=01, SegN=01, Header=8026ac21,
  * Segment#1=cfdc18c52fdef772e0e17308,
  * LowerTransportPDU=8026ac21cfdc18c52fdef772e0e17308. Its own "SeqZero" row
- * reads 3129ab, but that is the block's own SEQ value bleeding into the
- * wrong row - not this task's errata to resolve, but checked directly before
- * transcribing: Header 8026ac21, decoded bit-for-bit per Table 3.18, reads
- * SeqZero 0x9ab (2475) - the SAME value segment 0's row (correctly) reads,
- * exactly as Table 3.18 requires ("Every Segmented Access message for the
- * same Upper Transport Access PDU shall have the same values for ... SeqZero
- * ... fields"). `seqZero` below is that authenticated, bit-decoded value
- * (0x9ab), not the mis-copied row text.
+ * reads 3129ab (24 bits) - too wide to be a 13-bit SeqZero field reading at
+ * all (Table 3.18: SeqZero is 13 bits, max 0x1fff; 0x3129ab does not fit).
+ * It is also NOT this segment's own SEQ (that is 3129ac, one more, per this
+ * same block's own SEQ row above) - it is segment 0's SEQ, i.e. the
+ * message's SeqAuth (the full, untruncated sequence number a segmented
+ * message's SeqZero field is the low 13 bits of). That is not a guess:
+ * 0x3129ab's own low 13 bits are 0x9ab, exactly the value Header 8026ac21
+ * decodes to bit-for-bit per Table 3.18 (and the same value segment 0's own
+ * row (correctly, as 0x9ab) and SeqZero column both read) - so this row
+ * CORROBORATES the header rather than contradicting it, by publishing the
+ * same quantity in its untruncated form instead of truncating it to 13
+ * bits like the other rows do. `seqZero` below is that bit-decoded value
+ * (0x9ab), common to both segments as Table 3.18 requires ("Every
+ * Segmented Access message for the same Upper Transport Access PDU shall
+ * have the same values for ... SeqZero ... fields").
  *
  * `upperTransportPdu` is UPPER_TRANSPORT_SAMPLE_DEVICE_KEY.expected
  * (ee9dddfd2169326d23f3afdfcfdc18c52fdef772e0e17308, already transcribed

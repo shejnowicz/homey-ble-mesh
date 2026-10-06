@@ -446,6 +446,15 @@ export interface SegmentedAccessPdu {
  *   (minimum 8 bits), so no compliant sender produces this.
  * - The recovered segment is longer than Table 3.18's own 12-octet bound:
  *   same reasoning, from the other direction.
+ * - The recovered SegO is greater than the recovered SegN: Table 3.18
+ *   defines SegO as "the segment number (zero-based) of the segment m of
+ *   this Upper Transport PDU" and SegN as "the last segment number
+ *   (zero-based)" of that same PDU - SegO can therefore never legitimately
+ *   exceed SegN, and both fields come from the SAME four header octets of
+ *   this SAME segment, so this is an invariant of one segment read in
+ *   isolation, not a cross-segment consistency check reassembly would have
+ *   to do instead. Left unchecked, a garbled or hostile SegO/SegN pair
+ *   would otherwise flow into reassembly as an unvalidated array index.
  *
  * Returns a COPY of the recovered segment, not a view onto `pdu` - the same
  * reused-receive-buffer hazard `decodeUnsegmentedAccess`'s own JSDoc
@@ -467,14 +476,19 @@ export function decodeSegmentedAccess(pdu: Buffer): SegmentedAccessPdu | null {
   }
 
   const rest = ((pdu[1] as number) << 16) | ((pdu[2] as number) << 8) | (pdu[3] as number);
+  const segO = (rest >>> 5) & MAX_SEG_NUMBER;
+  const segN = rest & MAX_SEG_NUMBER;
+  if (segO > segN) {
+    return null;
+  }
 
   return {
     akf: (firstByte & AKF_BIT) !== 0,
     aid: firstByte & MAX_AID,
     szmic: (rest & SZMIC_BIT) !== 0,
     seqZero: (rest >>> 10) & MAX_SEQ_ZERO,
-    segO: (rest >>> 5) & MAX_SEG_NUMBER,
-    segN: rest & MAX_SEG_NUMBER,
+    segO,
+    segN,
     segment: Buffer.from(pdu.subarray(SEGMENTED_ACCESS_HEADER_LENGTH)),
   };
 }

@@ -612,6 +612,20 @@ describe('Segmented Access message (Section 3.5.2.2, Table 3.18)', () => {
     expect(decodeSegmentedAccess(pdu)).toBeNull();
   });
 
+  // Review finding: SegO and SegN both come from the same 4 header octets
+  // of the SAME segment (Table 3.18), so SegO > SegN is an invariant one
+  // segment can violate entirely on its own - not something only reassembly
+  // (looking across several segments) could catch. Header hand-built from
+  // Table 3.18's own bit widths (SEG=1,AKF=0,AID=0 -> first octet 0x80;
+  // SZMIC=0,SeqZero=0,SegO=2,SegN=1 -> (2<<5)|1 = 0x41 in the low octet of
+  // the remaining 3 -> 0x80000041), not produced by segmentAccessMessage -
+  // no compliant sender would build it (a legitimate 2-segment message's
+  // SegO never exceeds 1), but a received PDU could still contain it.
+  test('decodeSegmentedAccess returns null when the recovered SegO exceeds SegN (segO=2, segN=1)', () => {
+    const pdu = Buffer.concat([hex('80000041'), Buffer.from([0xaa])]);
+    expect(decodeSegmentedAccess(pdu)).toBeNull();
+  });
+
   describe('caller mistakes throw rather than being treated as a verification failure', () => {
     test('segmentAccessMessage rejects an out-of-range aid', () => {
       expect(() =>
@@ -649,6 +663,37 @@ describe('Segmented Access message (Section 3.5.2.2, Table 3.18)', () => {
         segmentAccessMessage({ akf: true, aid: 0, szmic: false, seqZero: 0, upperTransportPdu: Buffer.alloc(384) }),
       ).not.toThrow();
     });
+  });
+
+  // Review finding: the only thing pinning SeqZero's width to 13 bits was
+  // the error-message string above ("must be an integer in [0, 8191]") -
+  // narrowing the mask by one bit (0xfff instead of 0x1fff) still throws a
+  // message matching that same regex's shape for 0x2000, so only that exact
+  // string notices, and no published sample sets the field's own top bit
+  // (0x80d and 0x9ab, the two transcribed SeqZero values in this file, both
+  // fit in 12 bits). Closed with a round trip at the field's maximum value,
+  // 0x1fff = 2^13-1 (Table 3.18's own 13-bit width), where the expected
+  // WIRE BYTES are computed by hand from that same width - not read back
+  // from segmentAccessMessage's own output - so a narrowed mask fails this
+  // test even if some other bug happened to make the round trip itself
+  // still agree with a 12-bit decoder.
+  //
+  // Header hand-built: first octet SEG=1,AKF=1,AID=0x15 -> 0x80|0x40|0x15 =
+  // 0xd5. Remaining 3 octets SZMIC=1,SeqZero=0x1fff,SegO=0,SegN=0 ->
+  // 0x800000 | (0x1fff << 10) | 0 | 0 = 0xfffc00 -> ff fc 00. Full header
+  // d5fffc00.
+  test('seqZero round-trips at its 13-bit maximum (0x1fff), against a hand-computed header', () => {
+    const segments = segmentAccessMessage({
+      akf: true,
+      aid: 0x15,
+      szmic: true,
+      seqZero: 0x1fff,
+      upperTransportPdu: hex('deadbeef'),
+    });
+    expect(segments).toEqual([hex('d5fffc00deadbeef')]);
+
+    const decoded = decodeSegmentedAccess(hex('d5fffc00deadbeef'));
+    expect(decoded?.seqZero).toBe(0x1fff);
   });
 
   // The two boundary cases the brief asks for, derived from the segment
@@ -693,6 +738,64 @@ describe('Segmented Access message (Section 3.5.2.2, Table 3.18)', () => {
       expect(decoded?.segment).toHaveLength(12);
     });
   });
+
+  // Review finding: every sample and boundary case above is a one- or
+  // two-segment message, so nothing in the suite distinguished a correct
+  // multi-segment indexer from one that silently caps SegO/SegN at 1 (the
+  // reviewer demonstrated this live: capping the last-segment index at one
+  // left all 74 segmented tests above passing). This is the regime the
+  // product actually depends on - the composition data response that
+  // motivates segmentation in the first place is far longer than two
+  // segments - and the next task's reassembly builds directly on this
+  // decoder's multi-segment indexing, so an off-by-one or a hidden cap here
+  // would silently truncate every long message reassembly ever sees.
+  //
+  // Both cases below are derived from the transcribed segment size (12
+  // octets, Table 3.18) and the transcribed maximum message size (384
+  // octets, Section 2.3.3) - not from running this module's own code and
+  // recording what it printed.
+  describe('multi-segment indexing beyond two segments (review finding)', () => {
+    // 29 = 12 + 12 + 5: three segments, the third an uneven remainder - the
+    // smallest payload that cannot be explained by an implementation that
+    // only ever produces at most two segments.
+    test('a payload spanning three segments (29 bytes) produces three segments with a shared, correct last-segment index', () => {
+      const segments = segmentAccessMessage({
+        akf: true,
+        aid: 0x01,
+        szmic: false,
+        seqZero: 0,
+        upperTransportPdu: Buffer.alloc(29, 0xaa),
+      });
+      // 4-octet header + 12/12/5-octet segments = 16/16/9.
+      expect(segments.map((segment) => segment.length)).toEqual([16, 16, 9]);
+
+      const decoded = segments.map((segment) => decodeSegmentedAccess(segment as Buffer));
+      expect(decoded.map((d) => d?.segO)).toEqual([0, 1, 2]);
+      expect(decoded.map((d) => d?.segment.length)).toEqual([12, 12, 5]);
+      // Table 3.18: SegN is the SAME on every segment of one message - here,
+      // the zero-based index of the last (third) segment, 2.
+      expect(decoded.map((d) => d?.segN)).toEqual([2, 2, 2]);
+    });
+
+    // 384 = 32 x 12 (Section 2.3.3's own stated ceiling; SegN is 5 bits,
+    // 0-31, consistent with it). The largest Upper Transport Access PDU the
+    // specification allows a SAR to carry at all.
+    test('the largest message the specification allows (384 bytes) produces exactly 32 segments, SegN = 31 on all of them', () => {
+      const segments = segmentAccessMessage({
+        akf: true,
+        aid: 0x01,
+        szmic: false,
+        seqZero: 0,
+        upperTransportPdu: Buffer.alloc(384, 0xaa),
+      });
+      expect(segments).toHaveLength(32);
+      expect(segments.every((segment) => segment.length === 16)).toBe(true); // 4 + 12, every one a full segment.
+
+      const decoded = segments.map((segment) => decodeSegmentedAccess(segment as Buffer));
+      expect(decoded.map((d) => d?.segO)).toEqual(Array.from({ length: 32 }, (_, i) => i));
+      expect(decoded.every((d) => d?.segN === 31)).toBe(true); // ceil(384/12) - 1 = 31, the same on every segment.
+    });
+  });
 });
 
 describe("decode returns a COPY, not a view onto the caller's buffer (Segmented Access)", () => {
@@ -714,6 +817,20 @@ describe("decode returns a COPY, not a view onto the caller's buffer (Segmented 
     expect(decoded).not.toBeNull();
     decoded!.segment.fill(0xff);
     expect(input).toEqual(inputCopy);
+  });
+
+  // Review finding: the decoder has the two tests above, but the encoder
+  // had none - the same gap the existing unsegmented encoders already have
+  // (symmetry, not a regression). `Buffer.concat` always copies into a
+  // freshly allocated buffer, so `segmentAccessMessage`'s output never
+  // shares memory with its `upperTransportPdu` input; this is the one test
+  // pinning that.
+  test("segmentAccessMessage: writing to the input buffer after encoding does not change the produced segments", () => {
+    const input = Buffer.alloc(13, 0xaa);
+    const segments = segmentAccessMessage({ akf: true, aid: 0x01, szmic: false, seqZero: 0, upperTransportPdu: input });
+    const expectedSegments = segments.map((segment) => Buffer.from(segment));
+    input.fill(0xff); // simulate the caller reusing/overwriting its own buffer after the call returns.
+    expect(segments).toEqual(expectedSegments);
   });
 });
 
