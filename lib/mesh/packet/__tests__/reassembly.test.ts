@@ -14,10 +14,19 @@ import {
 // This is the PRIMARY sample for anything order-sensitive below: its two
 // segments differ in length, so concatenating them in the wrong order
 // produces visibly wrong bytes, not just a coincidentally-correct result.
+//
+// Naming note (review round): these hold the COMPLETE on-the-wire Lower
+// Transport PDU (4-octet header + that segment's payload) - the same thing
+// `vectors.ts` itself calls `pdu`/`pdu1`, never `segment0`/`segment1`
+// (which, in that file, names the payload ALONE). `PDU_*`, not `SEGMENT_*`,
+// to match that convention instead of contradicting it.
 const SRC_24 = UPPER_TRANSPORT_SAMPLE_SZMIC.src; // 0x1234
 const SEQ_ZERO_24 = LOWER_TRANSPORT_SAMPLE_SEGMENTED.seqZero; // 0x80d
-const SEGMENT_0_OF_24 = hex(LOWER_TRANSPORT_SAMPLE_SEGMENTED.pdu);
-const SEGMENT_1_OF_24 = hex(LOWER_TRANSPORT_SAMPLE_SEGMENTED.pdu1);
+const AKF_24 = LOWER_TRANSPORT_SAMPLE_SEGMENTED.akf; // true
+const AID_24 = LOWER_TRANSPORT_SAMPLE_SEGMENTED.aid; // 0x26
+const SZMIC_24 = LOWER_TRANSPORT_SAMPLE_SEGMENTED.szmic; // true
+const PDU_0_OF_24 = hex(LOWER_TRANSPORT_SAMPLE_SEGMENTED.pdu);
+const PDU_1_OF_24 = hex(LOWER_TRANSPORT_SAMPLE_SEGMENTED.pdu1);
 const UPPER_TRANSPORT_PDU_24 = hex(UPPER_TRANSPORT_SAMPLE_SZMIC.expected);
 
 // Message #6 (Section 8.3.6, `LOWER_TRANSPORT_SAMPLE_SEGMENTED_DEVICE_KEY`):
@@ -27,17 +36,20 @@ const UPPER_TRANSPORT_PDU_24 = hex(UPPER_TRANSPORT_SAMPLE_SZMIC.expected);
 // reassembler that hardcoded `akf: true`/`szmic: true` on its 'complete'
 // result would still pass every test built from Message #24 alone).
 const SRC_6 = UPPER_TRANSPORT_SAMPLE_DEVICE_KEY.src; // 0x0003
-const SEGMENT_0_OF_6 = hex(LOWER_TRANSPORT_SAMPLE_SEGMENTED_DEVICE_KEY.pdu0);
-const SEGMENT_1_OF_6 = hex(LOWER_TRANSPORT_SAMPLE_SEGMENTED_DEVICE_KEY.pdu1);
+const AKF_6 = LOWER_TRANSPORT_SAMPLE_SEGMENTED_DEVICE_KEY.akf; // false
+const AID_6 = LOWER_TRANSPORT_SAMPLE_SEGMENTED_DEVICE_KEY.aid; // 0x00
+const SZMIC_6 = LOWER_TRANSPORT_SAMPLE_SEGMENTED_DEVICE_KEY.szmic; // false
+const PDU_0_OF_6 = hex(LOWER_TRANSPORT_SAMPLE_SEGMENTED_DEVICE_KEY.pdu0);
+const PDU_1_OF_6 = hex(LOWER_TRANSPORT_SAMPLE_SEGMENTED_DEVICE_KEY.pdu1);
 const UPPER_TRANSPORT_PDU_6 = hex(UPPER_TRANSPORT_SAMPLE_DEVICE_KEY.expected);
 
 // CONSTRUCTED, NOT TRANSCRIBED. No published Section 8.3 sample's Upper
 // Transport Access PDU needs more than 2 segments - the longest one in this
 // file's vectors, UPPER_TRANSPORT_SAMPLE_DEVICE_KEY.expected, is exactly 24
-// octets (SegN = ceil(24/12)-1 = 1, still 2 segments). A previous task's
-// review found that capping the reassembler's handling at "at most 2
-// segments" passed every test built from the two published samples alone,
-// so this fixture exists specifically to close that gap.
+// octets (SegN = ceil(24/12)-1 = 1, still 2 segments). A previous review
+// found that capping the reassembler's handling at "at most 2 segments"
+// passed every test built from the two published samples alone, so this
+// fixture exists specifically to close that gap.
 //
 // Built by appending ONE arbitrary filler octet (0xaa) to that same
 // published 24-octet PDU, reaching 25 octets - just enough to force a 3rd
@@ -54,16 +66,31 @@ const THREE_SEGMENT_UPPER_TRANSPORT_PDU = Buffer.concat([
   Buffer.from([0xaa]),
 ]);
 const threeSegments = segmentAccessMessage({
-  akf: LOWER_TRANSPORT_SAMPLE_SEGMENTED.akf,
-  aid: LOWER_TRANSPORT_SAMPLE_SEGMENTED.aid,
-  szmic: LOWER_TRANSPORT_SAMPLE_SEGMENTED.szmic,
+  akf: AKF_24,
+  aid: AID_24,
+  szmic: SZMIC_24,
   seqZero: SEQ_ZERO_24,
   upperTransportPdu: THREE_SEGMENT_UPPER_TRANSPORT_PDU,
 });
 
+// Table 3.18: SegO/SegN are each 5-bit fields, so the highest segment index
+// the specification allows is 2**5 - 1 = 31, regardless of anything this
+// module's own code happens to do - this is the field-width-derived
+// constant `blockAckFrom`'s own high-bit test below needs, per the review
+// round's instruction not to derive it by running the implementation.
+const MAX_SEG_NUMBER = 0x1f;
+
 describe('fixture sanity', () => {
-  test("Message #24's two segments differ in length (12 vs 4 octets) - required for the out-of-order test below to be meaningful", () => {
-    expect(SEGMENT_0_OF_24.length).not.toBe(SEGMENT_1_OF_24.length);
+  // Corrected (review round): the title used to quote the PAYLOAD lengths
+  // (12 vs 4 octets) while the assertion compared the two full WIRE PDUs
+  // (16 vs 8 octets, 4-octet header included on each). The assertion was
+  // always sound - a 16-vs-8 difference still proves the payloads differ
+  // too, since both share the same fixed 4-octet header overhead - only
+  // the title's numbers were wrong.
+  test("Message #24's two segment PDUs differ in length on the wire (16 vs 8 octets) - required for the out-of-order test below to be meaningful", () => {
+    expect(PDU_0_OF_24).toHaveLength(16);
+    expect(PDU_1_OF_24).toHaveLength(8);
+    expect(PDU_0_OF_24.length).not.toBe(PDU_1_OF_24.length);
   });
 
   test('the constructed 3-segment fixture really has 3 segments', () => {
@@ -73,16 +100,33 @@ describe('fixture sanity', () => {
 
 describe('acceptSegment: completion, both header-bit combinations (Section 3.5.3.2)', () => {
   test('Message #24 (AKF=1, SZMIC=1), in order, reassembles to the published Upper Transport PDU', () => {
-    const first = acceptSegment(null, SRC_24, SEGMENT_0_OF_24);
+    const first = acceptSegment(null, SRC_24, PDU_0_OF_24);
     expect(first).toEqual({
       kind: 'incomplete',
-      state: { src: SRC_24, seqZero: SEQ_ZERO_24, segN: 1, segments: [expect.any(Buffer), undefined] },
+      state: {
+        src: SRC_24,
+        seqZero: SEQ_ZERO_24,
+        segN: 1,
+        akf: AKF_24,
+        aid: AID_24,
+        szmic: SZMIC_24,
+        segments: [expect.any(Buffer), undefined],
+      },
     });
     if (first.kind !== 'incomplete') throw new Error('unreachable');
 
-    const second = acceptSegment(first.state, SRC_24, SEGMENT_1_OF_24);
+    const second = acceptSegment(first.state, SRC_24, PDU_1_OF_24);
     expect(second).toEqual({
       kind: 'complete',
+      state: {
+        src: SRC_24,
+        seqZero: SEQ_ZERO_24,
+        segN: 1,
+        akf: AKF_24,
+        aid: AID_24,
+        szmic: SZMIC_24,
+        segments: [expect.any(Buffer), expect.any(Buffer)],
+      },
       upperTransportPdu: UPPER_TRANSPORT_PDU_24,
       akf: true,
       aid: 0x26,
@@ -91,12 +135,21 @@ describe('acceptSegment: completion, both header-bit combinations (Section 3.5.3
   });
 
   test('Message #6 (AKF=0, SZMIC=0), in order, reassembles to the published Upper Transport PDU', () => {
-    const first = acceptSegment(null, SRC_6, SEGMENT_0_OF_6);
+    const first = acceptSegment(null, SRC_6, PDU_0_OF_6);
     if (first.kind !== 'incomplete') throw new Error('expected incomplete after the first of two segments');
 
-    const second = acceptSegment(first.state, SRC_6, SEGMENT_1_OF_6);
+    const second = acceptSegment(first.state, SRC_6, PDU_1_OF_6);
     expect(second).toEqual({
       kind: 'complete',
+      state: {
+        src: SRC_6,
+        seqZero: LOWER_TRANSPORT_SAMPLE_SEGMENTED_DEVICE_KEY.seqZero,
+        segN: 1,
+        akf: AKF_6,
+        aid: AID_6,
+        szmic: SZMIC_6,
+        segments: [expect.any(Buffer), expect.any(Buffer)],
+      },
       upperTransportPdu: UPPER_TRANSPORT_PDU_6,
       akf: false,
       aid: 0x00,
@@ -107,30 +160,37 @@ describe('acceptSegment: completion, both header-bit combinations (Section 3.5.3
 
 describe('acceptSegment: the same two segments out of order (Message #24 - lengths differ, so order is load-bearing)', () => {
   test('segment 1 before segment 0 still reassembles to the published Upper Transport PDU, in the correct byte order', () => {
-    const first = acceptSegment(null, SRC_24, SEGMENT_1_OF_24);
+    const first = acceptSegment(null, SRC_24, PDU_1_OF_24);
     expect(first).toEqual({
       kind: 'incomplete',
-      state: { src: SRC_24, seqZero: SEQ_ZERO_24, segN: 1, segments: [undefined, expect.any(Buffer)] },
+      state: {
+        src: SRC_24,
+        seqZero: SEQ_ZERO_24,
+        segN: 1,
+        akf: AKF_24,
+        aid: AID_24,
+        szmic: SZMIC_24,
+        segments: [undefined, expect.any(Buffer)],
+      },
     });
     if (first.kind !== 'incomplete') throw new Error('unreachable');
 
-    const second = acceptSegment(first.state, SRC_24, SEGMENT_0_OF_24);
-    expect(second).toEqual({
-      kind: 'complete',
-      upperTransportPdu: UPPER_TRANSPORT_PDU_24,
-      akf: true,
-      aid: 0x26,
-      szmic: true,
-    });
+    const second = acceptSegment(first.state, SRC_24, PDU_0_OF_24);
+    expect(second.kind).toBe('complete');
+    if (second.kind !== 'complete') throw new Error('unreachable');
+    expect(second.upperTransportPdu).toEqual(UPPER_TRANSPORT_PDU_24);
+    expect(second.akf).toBe(true);
+    expect(second.aid).toBe(0x26);
+    expect(second.szmic).toBe(true);
   });
 });
 
 describe('acceptSegment: a duplicate segment is ignored without corrupting the state', () => {
   test('the same segment 0 received twice is ignored the second time, leaving the original state untouched', () => {
-    const first = acceptSegment(null, SRC_24, SEGMENT_0_OF_24);
+    const first = acceptSegment(null, SRC_24, PDU_0_OF_24);
     if (first.kind !== 'incomplete') throw new Error('expected incomplete after only segment 0');
 
-    const second = acceptSegment(first.state, SRC_24, SEGMENT_0_OF_24);
+    const second = acceptSegment(first.state, SRC_24, PDU_0_OF_24);
     expect(second.kind).toBe('ignored');
     if (second.kind !== 'ignored') throw new Error('unreachable');
     expect(second.reason).toMatch(/already received|duplicate/);
@@ -142,20 +202,16 @@ describe('acceptSegment: a duplicate segment is ignored without corrupting the s
     // The reassembly is still completable afterwards, proving the
     // duplicate truly did nothing rather than, say, silently clearing
     // slot 0 back to undefined.
-    const third = acceptSegment(second.state, SRC_24, SEGMENT_1_OF_24);
-    expect(third).toEqual({
-      kind: 'complete',
-      upperTransportPdu: UPPER_TRANSPORT_PDU_24,
-      akf: true,
-      aid: 0x26,
-      szmic: true,
-    });
+    const third = acceptSegment(second.state ?? null, SRC_24, PDU_1_OF_24);
+    expect(third.kind).toBe('complete');
+    if (third.kind !== 'complete') throw new Error('unreachable');
+    expect(third.upperTransportPdu).toEqual(UPPER_TRANSPORT_PDU_24);
   });
 });
 
 describe('acceptSegment: a mismatched seqZero is ignored, in-progress state left intact', () => {
   test('a segment reporting a different seqZero (segO/segN otherwise consistent) is ignored', () => {
-    const inProgress = acceptSegment(null, SRC_24, SEGMENT_0_OF_24);
+    const inProgress = acceptSegment(null, SRC_24, PDU_0_OF_24);
     if (inProgress.kind !== 'incomplete') throw new Error('expected incomplete after only segment 0');
 
     // CONSTRUCTED: a segment 0 of a different (also 2-segment) message,
@@ -185,7 +241,7 @@ describe('acceptSegment: a mismatched seqZero is ignored, in-progress state left
 
 describe('acceptSegment: a mismatched segN is ignored', () => {
   test('a segment reporting a smaller segN (same seqZero) is ignored, established state left intact', () => {
-    const inProgress = acceptSegment(null, SRC_24, SEGMENT_0_OF_24);
+    const inProgress = acceptSegment(null, SRC_24, PDU_0_OF_24);
     if (inProgress.kind !== 'incomplete') throw new Error('expected incomplete after only segment 0');
 
     // CONSTRUCTED: same seqZero as the established reassembly (so this
@@ -211,7 +267,7 @@ describe('acceptSegment: a mismatched segN is ignored', () => {
 
 describe('acceptSegment: a segment index beyond the established segN is ignored rather than growing the array', () => {
   test('segO=2 of a constructed 3-segment message, received after a 2-segment reassembly (segN=1) is in progress, is ignored', () => {
-    const inProgress = acceptSegment(null, SRC_24, SEGMENT_0_OF_24);
+    const inProgress = acceptSegment(null, SRC_24, PDU_0_OF_24);
     if (inProgress.kind !== 'incomplete') throw new Error('expected incomplete after only segment 0');
     expect(inProgress.state.segments).toHaveLength(2);
 
@@ -233,7 +289,7 @@ describe('acceptSegment: a segment index beyond the established segN is ignored 
     // by a bare `segments[2] = ...` assignment - it is still exactly the
     // 2-slot array the first segment established, untouched.
     expect(result.state).toEqual(inProgress.state);
-    expect(result.state.segments).toHaveLength(2);
+    expect(result.state?.segments).toHaveLength(2);
   });
 });
 
@@ -254,26 +310,27 @@ describe('acceptSegment: three or more segments (constructed - no published samp
     expect(afterSeg0.state.segments).toEqual([expect.any(Buffer), undefined, expect.any(Buffer)]);
 
     const afterSeg1 = acceptSegment(afterSeg0.state, src, seg1);
-    expect(afterSeg1).toEqual({
-      kind: 'complete',
-      upperTransportPdu: THREE_SEGMENT_UPPER_TRANSPORT_PDU,
-      akf: LOWER_TRANSPORT_SAMPLE_SEGMENTED.akf,
-      aid: LOWER_TRANSPORT_SAMPLE_SEGMENTED.aid,
-      szmic: LOWER_TRANSPORT_SAMPLE_SEGMENTED.szmic,
-    });
+    expect(afterSeg1.kind).toBe('complete');
+    if (afterSeg1.kind !== 'complete') throw new Error('unreachable');
+    expect(afterSeg1.upperTransportPdu).toEqual(THREE_SEGMENT_UPPER_TRANSPORT_PDU);
+    expect(afterSeg1.akf).toBe(AKF_24);
+    expect(afterSeg1.aid).toBe(AID_24);
+    expect(afterSeg1.szmic).toBe(SZMIC_24);
+    expect(afterSeg1.state.segN).toBe(2);
+    expect(afterSeg1.state.segments).toEqual([expect.any(Buffer), expect.any(Buffer), expect.any(Buffer)]);
   });
 });
 
 describe('acceptSegment: a mismatched source is ignored (bonus coverage - ReassemblyState.src is part of the grouping key too)', () => {
   test('the right seqZero/segO/segN but a different src is ignored, established state left intact', () => {
-    const inProgress = acceptSegment(null, SRC_24, SEGMENT_0_OF_24);
+    const inProgress = acceptSegment(null, SRC_24, PDU_0_OF_24);
     if (inProgress.kind !== 'incomplete') throw new Error('expected incomplete after only segment 0');
 
-    // SEGMENT_1_OF_24 is otherwise exactly the segment this reassembly is
+    // PDU_1_OF_24 is otherwise exactly the segment this reassembly is
     // waiting for - only the `src` argument passed alongside it is wrong,
     // isolating src as the only mismatched field.
     const wrongSrc = 0x9999;
-    const result = acceptSegment(inProgress.state, wrongSrc, SEGMENT_1_OF_24);
+    const result = acceptSegment(inProgress.state, wrongSrc, PDU_1_OF_24);
     expect(result.kind).toBe('ignored');
     if (result.kind !== 'ignored') throw new Error('unreachable');
     expect(result.reason).toMatch(/source/);
@@ -281,32 +338,195 @@ describe('acceptSegment: a mismatched source is ignored (bonus coverage - Reasse
   });
 });
 
-describe('caller mistakes throw rather than being treated as a verification failure', () => {
-  test('acceptSegment rejects a pdu that is not a decodable Segmented Access message', () => {
-    // A genuine, published UNSEGMENTED Access message (SEG=0) - never a
-    // valid input to this function, whose caller must already know it is
-    // routing a segmented PDU here.
-    expect(() => acceptSegment(null, SRC_24, hex(LOWER_TRANSPORT_SAMPLE_ACCESS_1.expected))).toThrow(
-      /does not decode as a Segmented Access message/,
-    );
+describe('acceptSegment: a mismatched AKF/AID/SZMIC is ignored (review round - Finding 1)', () => {
+  // CONSTRUCTED: same src/seqZero/segN/segO as the in-progress reassembly
+  // from Message #24 (segO=1, the still-missing slot), so each of these
+  // three tests isolates exactly ONE of AKF/AID/SZMIC as the differing
+  // field - never segN/seqZero/src, which have their own dedicated tests
+  // above. Built with segmentAccessMessage so every header bit this test
+  // does NOT intend to vary is still genuinely self-consistent.
+  function wrongHeaderSegment(overrides: { akf?: boolean; aid?: number; szmic?: boolean }): Buffer {
+    const segments = segmentAccessMessage({
+      akf: overrides.akf ?? AKF_24,
+      aid: overrides.aid ?? AID_24,
+      szmic: overrides.szmic ?? SZMIC_24,
+      seqZero: SEQ_ZERO_24,
+      // Same 16-octet total as Message #24's real Upper Transport PDU, so
+      // segO=1 lands on a 4-octet final segment exactly like PDU_1_OF_24 -
+      // not load-bearing for this test, just keeps the fixture unsurprising.
+      upperTransportPdu: Buffer.alloc(16, 0xee),
+    });
+    return segments[1] as Buffer;
+  }
+
+  test('a segment reporting a different akf is ignored, established state left intact', () => {
+    const inProgress = acceptSegment(null, SRC_24, PDU_0_OF_24);
+    if (inProgress.kind !== 'incomplete') throw new Error('expected incomplete after only segment 0');
+
+    const result = acceptSegment(inProgress.state, SRC_24, wrongHeaderSegment({ akf: false }));
+    expect(result.kind).toBe('ignored');
+    if (result.kind !== 'ignored') throw new Error('unreachable');
+    expect(result.reason).toMatch(/akf/);
+    expect(result.state).toEqual(inProgress.state);
   });
 
+  test('a segment reporting a different aid is ignored, established state left intact', () => {
+    const inProgress = acceptSegment(null, SRC_24, PDU_0_OF_24);
+    if (inProgress.kind !== 'incomplete') throw new Error('expected incomplete after only segment 0');
+
+    const result = acceptSegment(inProgress.state, SRC_24, wrongHeaderSegment({ aid: 0x01 }));
+    expect(result.kind).toBe('ignored');
+    if (result.kind !== 'ignored') throw new Error('unreachable');
+    expect(result.reason).toMatch(/aid/);
+    expect(result.state).toEqual(inProgress.state);
+  });
+
+  test('a segment reporting a different szmic is ignored, established state left intact', () => {
+    const inProgress = acceptSegment(null, SRC_24, PDU_0_OF_24);
+    if (inProgress.kind !== 'incomplete') throw new Error('expected incomplete after only segment 0');
+
+    const result = acceptSegment(inProgress.state, SRC_24, wrongHeaderSegment({ szmic: false }));
+    expect(result.kind).toBe('ignored');
+    if (result.kind !== 'ignored') throw new Error('unreachable');
+    expect(result.reason).toMatch(/szmic/);
+    expect(result.state).toEqual(inProgress.state);
+  });
+
+  test('a message whose own two segments disagree on akf completes with byte-correct payload but still reports only one set of flags (documents the known limit, not a bug in this test)', () => {
+    // This is the exact end-to-end scenario the coordinator's review
+    // measured: nothing stops acceptSegment itself from completing once
+    // every SLOT is filled - the cross-check above only rejects a
+    // DISAGREEING segment from reaching a slot in the first place. A
+    // disagreeing segment is "ignored" before it is ever stored, so two
+    // genuinely-disagreeing segments can never BOTH be stored into the same
+    // reassembly - this test exists to make that guarantee explicit, not to
+    // show a gap.
+    const inProgress = acceptSegment(null, SRC_24, PDU_0_OF_24);
+    if (inProgress.kind !== 'incomplete') throw new Error('expected incomplete after only segment 0');
+    const rejected = acceptSegment(inProgress.state, SRC_24, wrongHeaderSegment({ akf: false }));
+    expect(rejected.kind).toBe('ignored');
+
+    // The real segment 1 (agreeing AKF) still completes the message normally.
+    const completed = acceptSegment(inProgress.state, SRC_24, PDU_1_OF_24);
+    expect(completed.kind).toBe('complete');
+  });
+});
+
+describe("acceptSegment: a pdu that does not decode as a Segmented Access message is 'ignored', not thrown (review round - Finding 2)", () => {
+  test('with no reassembly in progress, there is no state to report, so it is undefined', () => {
+    // A genuine, published UNSEGMENTED Access message (SEG=0) - reachable
+    // in practice if a caller ever mis-routes one here, and also simply
+    // too short/malformed to be a segment in other ways.
+    const result = acceptSegment(null, SRC_24, hex(LOWER_TRANSPORT_SAMPLE_ACCESS_1.expected));
+    expect(result).toEqual({
+      kind: 'ignored',
+      state: undefined,
+      reason: expect.stringMatching(/does not decode as a Segmented Access message/),
+    });
+  });
+
+  test('a genuinely reachable case: the network layer admits Access transport PDUs down to a single octet, so a 3-octet PDU with SEG set authenticates and routes here, too short for any segment', () => {
+    // SEG bit (0x80) set, 3 octets total - decodeSegmentedAccess's own
+    // length guard (pdu.length <= 4) rejects this before it even reads
+    // SegO/SegN, exactly the "too short for a non-empty segment" case the
+    // module header cites as genuinely reachable, not hypothetical.
+    const tooShort = Buffer.from([0x80, 0x00, 0x00]);
+    const result = acceptSegment(null, SRC_24, tooShort);
+    expect(result.kind).toBe('ignored');
+    if (result.kind !== 'ignored') throw new Error('unreachable');
+    expect(result.state).toBeUndefined();
+    expect(result.reason).toMatch(/does not decode/);
+  });
+
+  test('with a reassembly already in progress, that in-progress state is returned untouched, not discarded', () => {
+    const inProgress = acceptSegment(null, SRC_24, PDU_0_OF_24);
+    if (inProgress.kind !== 'incomplete') throw new Error('expected incomplete after only segment 0');
+
+    const result = acceptSegment(inProgress.state, SRC_24, hex(LOWER_TRANSPORT_SAMPLE_ACCESS_1.expected));
+    expect(result.kind).toBe('ignored');
+    if (result.kind !== 'ignored') throw new Error('unreachable');
+    expect(result.reason).toMatch(/does not decode/);
+    // The decisive assertion: one unparseable PDU must not wipe out a
+    // real, already-collected segment.
+    expect(result.state).toEqual(inProgress.state);
+
+    // And the reassembly is still completable afterward.
+    const completed = acceptSegment(result.state ?? null, SRC_24, PDU_1_OF_24);
+    expect(completed.kind).toBe('complete');
+  });
+});
+
+describe('caller mistakes throw rather than being treated as a verification failure', () => {
   test('acceptSegment rejects an out-of-range src', () => {
-    expect(() => acceptSegment(null, 0x10000, SEGMENT_0_OF_24)).toThrow(
+    expect(() => acceptSegment(null, 0x10000, PDU_0_OF_24)).toThrow(
       /reassembly field "src" must be an integer in \[0, 65535\], got 65536/,
     );
-    expect(() => acceptSegment(null, -1, SEGMENT_0_OF_24)).toThrow(/reassembly field "src"/);
+    expect(() => acceptSegment(null, -1, PDU_0_OF_24)).toThrow(/reassembly field "src"/);
+  });
+});
+
+describe('acceptSegment: stored segments are copies, not views onto the caller-owned buffer (review round - minor finding)', () => {
+  test('mutating the original pdu buffer AFTER it was accepted, but BEFORE completion, does not change the eventual upperTransportPdu', () => {
+    // Fresh, mutable copies - NOT the shared PDU_0_OF_24/PDU_1_OF_24
+    // constants above, so mutating them here cannot affect any other test.
+    //
+    // The mutation happens BETWEEN the two acceptSegment calls, deliberately
+    // - not after both, and not after completion. `Buffer.concat` (used by
+    // `finish()` on completion) always allocates a brand-new buffer and
+    // copies into it, so mutating an input buffer AFTER the message is
+    // already complete can never reveal an aliasing bug: the output would
+    // already be an independent copy regardless of how the segment was
+    // stored while incomplete. Mutating segment 0's buffer while the
+    // reassembly is still *incomplete* - before segment 1 arrives and the
+    // concatenation actually runs - is what actually exercises whether the
+    // INCOMPLETE state stored a copy of segment 0 or a view onto it.
+    const ownPdu0 = Buffer.from(PDU_0_OF_24);
+    const ownPdu1 = Buffer.from(PDU_1_OF_24);
+    const expected = Buffer.from(UPPER_TRANSPORT_PDU_24);
+
+    const first = acceptSegment(null, SRC_24, ownPdu0);
+    if (first.kind !== 'incomplete') throw new Error('expected incomplete after only segment 0');
+
+    // Mutate segment 0's ORIGINAL buffer now, while it is only sitting in
+    // the (still incomplete) state, not yet concatenated into anything.
+    ownPdu0.fill(0xff);
+
+    const second = acceptSegment(first.state, SRC_24, ownPdu1);
+    if (second.kind !== 'complete') throw new Error('expected complete after both segments');
+
+    // Mutate segment 1's buffer too, now that the message is complete -
+    // this half is not load-bearing (Buffer.concat already copied by this
+    // point regardless), but costs nothing to also assert.
+    ownPdu1.fill(0xff);
+
+    expect(second.upperTransportPdu).toEqual(expected);
   });
 });
 
 describe('blockAckFrom (Section 3.5.2.3.1, Table 3.21 AckedSegments field)', () => {
   test('bit 0 only, after just segment 0 of a 2-segment message', () => {
-    const state: ReassemblyState = { src: SRC_24, seqZero: SEQ_ZERO_24, segN: 1, segments: [Buffer.alloc(12), undefined] };
+    const state: ReassemblyState = {
+      src: SRC_24,
+      seqZero: SEQ_ZERO_24,
+      segN: 1,
+      akf: AKF_24,
+      aid: AID_24,
+      szmic: SZMIC_24,
+      segments: [Buffer.alloc(12), undefined],
+    };
     expect(blockAckFrom(state)).toBe(0b01);
   });
 
   test('bit 1 only, after just segment 1 of a 2-segment message - LSB is segment 0, not arrival order', () => {
-    const state: ReassemblyState = { src: SRC_24, seqZero: SEQ_ZERO_24, segN: 1, segments: [undefined, Buffer.alloc(4)] };
+    const state: ReassemblyState = {
+      src: SRC_24,
+      seqZero: SEQ_ZERO_24,
+      segN: 1,
+      akf: AKF_24,
+      aid: AID_24,
+      szmic: SZMIC_24,
+      segments: [undefined, Buffer.alloc(4)],
+    };
     expect(blockAckFrom(state)).toBe(0b10);
   });
 
@@ -315,6 +535,9 @@ describe('blockAckFrom (Section 3.5.2.3.1, Table 3.21 AckedSegments field)', () 
       src: SRC_24,
       seqZero: SEQ_ZERO_24,
       segN: 2,
+      akf: AKF_24,
+      aid: AID_24,
+      szmic: SZMIC_24,
       segments: [Buffer.alloc(12), undefined, Buffer.alloc(1)],
     };
     expect(blockAckFrom(state)).toBe(0b101);
@@ -325,13 +548,48 @@ describe('blockAckFrom (Section 3.5.2.3.1, Table 3.21 AckedSegments field)', () 
       src: SRC_24,
       seqZero: SEQ_ZERO_24,
       segN: 3,
+      akf: AKF_24,
+      aid: AID_24,
+      szmic: SZMIC_24,
       segments: [undefined, undefined, undefined, Buffer.alloc(1)],
     };
     expect(blockAckFrom(state)).toBe(0b1000);
   });
 
   test('an empty reassembly (no segments received yet) acknowledges nothing', () => {
-    const state: ReassemblyState = { src: SRC_24, seqZero: SEQ_ZERO_24, segN: 1, segments: [undefined, undefined] };
+    const state: ReassemblyState = {
+      src: SRC_24,
+      seqZero: SEQ_ZERO_24,
+      segN: 1,
+      akf: AKF_24,
+      aid: AID_24,
+      szmic: SZMIC_24,
+      segments: [undefined, undefined],
+    };
     expect(blockAckFrom(state)).toBe(0);
+  });
+
+  // Review round (minor finding): the documented reason for using `2**segO`
+  // instead of `1 << segO` - a signed 32-bit shift goes negative at bit 31
+  // - was asserted nowhere: every case above tops out at bit 3. SegN's own
+  // field width (5 bits, Table 3.18) is what the specification actually
+  // bounds the highest segment index by - MAX_SEG_NUMBER above is derived
+  // from that width, not from running this module's code, so segN=31
+  // (32 segments) is the highest legal case, not an arbitrarily large one.
+  test('bit 31 (the highest segment index the specification allows) is a large POSITIVE number, not negative', () => {
+    const segments: Array<Buffer | undefined> = new Array(MAX_SEG_NUMBER + 1).fill(undefined);
+    segments[MAX_SEG_NUMBER] = Buffer.alloc(1);
+    const state: ReassemblyState = {
+      src: SRC_24,
+      seqZero: SEQ_ZERO_24,
+      segN: MAX_SEG_NUMBER,
+      akf: AKF_24,
+      aid: AID_24,
+      szmic: SZMIC_24,
+      segments,
+    };
+    const ack = blockAckFrom(state);
+    expect(ack).toBe(2 ** 31);
+    expect(ack).toBeGreaterThan(0);
   });
 });
