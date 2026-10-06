@@ -14,6 +14,9 @@ export function k2(n: Buffer, p: Buffer): { nid: number; encryptionKey: Buffer; 
   if (n.length !== 16) {
     throw new Error(`k2: N must be 16 bytes (128-bit NetKey), got ${n.length}`);
   }
+  if (p.length < 1) {
+    throw new Error(`k2: P must be at least 1 octet, got ${p.length}`);
+  }
   const salt = s1(Buffer.from('smk2', 'ascii'));
   const t = aesCmac(salt, n);
   const t1 = aesCmac(t, Buffer.concat([p, Buffer.from([0x01])]));

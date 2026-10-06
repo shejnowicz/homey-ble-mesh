@@ -5,9 +5,13 @@ const BLOCK = 16;
 const RB = 0x87;
 
 /**
- * The single AES-128 ECB block cipher primitive, exported as `e` (RFC 4493's
- * own name for it) because the provisioning plan's header obfuscation needs
- * exactly this primitive, not a re-derivation of it.
+ * The single AES-128 ECB block cipher primitive, exported as `e` because
+ * that is the Mesh specification's own name for it (Security Toolbox,
+ * "Encryption function": "ciphertext = e(key, plaintext)" — section 3.8.2.1
+ * in Mesh Profile 1.0.1, renumbered 3.9.2.1 in Mesh Protocol v1.1). RFC 4493
+ * never names this primitive `e`; it calls it AES-128(K,M). Exported because
+ * the provisioning plan's header obfuscation needs exactly this primitive,
+ * not a re-derivation of it.
  */
 export function e(key: Buffer, block: Buffer): Buffer {
   const cipher = createCipheriv('aes-128-ecb', key, null);

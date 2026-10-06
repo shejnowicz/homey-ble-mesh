@@ -5,9 +5,16 @@
  * BTM_ECDH_P256_CMAC_AES128_AES_CCM). Transcribed by hand from the official
  * Bluetooth SIG "Mesh Protocol" specification v1.1 HTML document
  * (https://www.bluetooth.com/wp-content/uploads/Files/Specification/HTML/MshPRT_v1.1/out/en/index-en.html),
- * fetched and parsed on 2026-10-06. This section carries forward unchanged
- * from Mesh Profile 1.0.1 (same section/subsection numbers, same keys, same
- * expected outputs).
+ * fetched and parsed on 2026-10-06. The 8.1.x security sample data (s1, k1,
+ * k2, k3, k4) carries forward unchanged from Mesh Profile 1.0.1 — same
+ * section numbers, same keys, same expected outputs (verified against the
+ * Mesh Profile 1.0.1 PDF, section 8.1 "Security sample data"). The
+ * provisioning sample's VALUES also carry forward from 1.0.1 unchanged, but
+ * not its section number: Mesh Profile 1.0.1 has no section 8.17 at all —
+ * its section 8 only runs to 8.10 "Composition Data sample data" — and
+ * lists this identical key/shared-secret sample under section 8.7 "PB-ADV
+ * provisioning sample data" instead. v1.1 moved and renamed it to 8.17.1
+ * when it introduced the BTM_ECDH_P256_CMAC_AES128_AES_CCM algorithm name.
  */
 export const hex = (s: string): Buffer => Buffer.from(s.replace(/\s+/g, ''), 'hex');
 

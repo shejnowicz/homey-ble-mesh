@@ -59,3 +59,17 @@ test('k4 rejects an AppKey shorter than 128 bits rather than deriving a plausibl
   const shortN = hex(K4_SAMPLE.n).subarray(0, 15);
   expect(() => k4(shortN)).toThrow(/16 bytes/);
 });
+
+test('k2 rejects an empty P rather than deriving a plausible wrong answer', () => {
+  expect(() => k2(hex(K2_MASTER.n), Buffer.alloc(0))).toThrow(/at least 1 octet/);
+});
+
+import { randomBytes } from 'node:crypto';
+
+test('k4 never returns a value wider than six bits, over many keys', () => {
+  for (let i = 0; i < 200; i += 1) {
+    const value = k4(randomBytes(16));
+    expect(value).toBeGreaterThanOrEqual(0);
+    expect(value).toBeLessThanOrEqual(0x3f);
+  }
+});

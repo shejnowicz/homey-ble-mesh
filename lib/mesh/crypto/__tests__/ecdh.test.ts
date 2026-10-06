@@ -81,3 +81,28 @@ describe('known-answer: section 8.17.1 provisioning sample', () => {
     expect(secret.toString('hex')).toBe(PROVISIONING_SAMPLE.expectedSharedSecret);
   });
 });
+
+import { padPrivateKey } from '../ecdh';
+
+test('a short scalar is padded on the LEFT, preserving its value', () => {
+  const short = Buffer.alloc(31, 0xab);
+  const padded = padPrivateKey(short);
+  expect(padded).toHaveLength(32);
+  expect(padded[0]).toBe(0x00);
+  expect(padded.subarray(1).equals(short)).toBe(true);
+});
+
+test('a full-length scalar is returned unchanged', () => {
+  const full = Buffer.alloc(32, 0xcd);
+  expect(padPrivateKey(full).equals(full)).toBe(true);
+});
+
+test('sharedSecret rejects a private key that is not 32 bytes rather than deriving a plausible wrong answer', () => {
+  const peer = generateKeyPair();
+  expect(() => sharedSecret(Buffer.alloc(31, 0x01), peer.publicKey)).toThrow(/32 bytes/);
+});
+
+test('sharedSecret rejects a peer public key that is not 64 bytes rather than deriving a plausible wrong answer', () => {
+  const ours = generateKeyPair();
+  expect(() => sharedSecret(ours.privateKey, Buffer.alloc(63, 0x02))).toThrow(/64 bytes/);
+});
