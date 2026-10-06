@@ -294,7 +294,7 @@ export function decryptUpperTransport(
   // but by two different routes - which the old comment collapsed into one:
   //
   // - For 11 of the 12 short cases the tag comes out at some length mesh
-  //   never uses (0, 1, 2, 3 or 6 octets), so `ccmDecrypt`'s own
+  //   never uses (0, 1, 2 or 3 octets), so `ccmDecrypt`'s own
   //   MESH_MIC_LENGTHS check drops it before any crypto runs - the
   //   "truncated foreign packet" case that check is built for.
   // - The ONE exception is szmic=true with a 4-octet PDU: 4 + (4-8) = 0, so
