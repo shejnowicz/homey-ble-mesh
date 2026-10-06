@@ -16,8 +16,10 @@ import { networkNonce } from './nonce';
  * the "P" input the specification assigns to managed-flooding security
  * material, as opposed to the different P values used for friendship or
  * directed-forwarding credentials, neither of which this encoder handles:
- * a 7-bit NID carried in clear so a receiver can find the right NetKey
- * without trying every one it knows; a 128-bit EncryptionKey for the
+ * a 7-bit NID carried in clear, which only narrows down which NetKey was
+ * used rather than identifying it outright — Section 3.9.6.3.1 itself notes
+ * there are up to 2^121 possible keys for each NID, so a receiver still has
+ * to try every NetKey sharing that NID; a 128-bit EncryptionKey for the
  * payload; and a 128-bit PrivacyKey used only to obscure the header, kept
  * separate so that compromising one does not expose the other.
  *
@@ -46,8 +48,10 @@ import { networkNonce } from './nonce';
  * the Privacy Plaintext: five zero octets, then the 32-bit IV Index, then a
  * 7-octet "Privacy Random" taken as the first seven octets of whatever was
  * just produced by encryption (EncDST || EncTransportPDU || NetMIC — at
- * least seven octets always exist there because EncDST alone is already two
- * octets and NetMIC is at least four). Running that 16-octet Privacy
+ * least seven octets always exist there because EncDST is two octets,
+ * TransportPDU is never empty (Table 3.10's width is "8 to 128" bits, i.e.
+ * at least one octet, so EncTransportPDU contributes at least one), and
+ * NetMIC is at least four). Running that 16-octet Privacy
  * Plaintext through the single-block cipher `e` under the PrivacyKey yields
  * the PECB; only its first six octets are used. XOR-ing those six octets
  * against the six plain octets CTL||TTL||SEQ||SRC (in that order — CTL and
@@ -62,6 +66,16 @@ import { networkNonce } from './nonce';
  * and the NetMIC. Note this places the derived NID (not the caller's IV
  * Index) in the leading octet, while the actual IV Index only appears
  * indirectly, folded into the obfuscation mask.
+ *
+ * The TransportPDU's own width is bounded in two places: Table 3.10 gives
+ * its generic range as 8 to 128 bits (1 to 16 octets), and Section 3.4.4.8
+ * narrows the maximum by CTL — 128 bits (16 octets) for an Access message
+ * (CTL=0), but only 96 bits (12 octets) for a Transport Control message
+ * (CTL=1), because a Transport Control message carries no upper-transport
+ * MIC of its own and the network layer already spends more of the fixed
+ * PDU budget on its own longer (64-bit) NetMIC. A caller that bypasses this
+ * check would silently produce a non-compliant PDU — Node's AES-CCM has no
+ * opinion on mesh's own length rules and encrypts whatever it is given.
  */
 
 export interface NetworkPduInput {
@@ -79,7 +93,13 @@ export interface NetworkPduInput {
   src: number;
   /** 16-bit destination address; encrypted (not merely obfuscated) on the wire. */
   dst: number;
-  /** Lower Transport PDU, 1-16 octets; encrypted (not merely obfuscated) on the wire. */
+  /**
+   * Lower Transport PDU; encrypted (not merely obfuscated) on the wire.
+   * Never empty (Table 3.10: 8 to 128 bits, i.e. 1 to 16 octets), and
+   * further capped by `ctl` (Section 3.4.4.8): 1-16 octets for an Access
+   * message (ctl=false), 1-12 octets for a Transport Control message
+   * (ctl=true).
+   */
   transportPdu: Buffer;
 }
 
@@ -94,9 +114,25 @@ const MAX_SEQ = 0xffffff;
 const MAX_ADDRESS = 0xffff;
 const MAX_IV_INDEX = 0xffffffff;
 
+// Table 3.10's generic TransportPDU width is "8 to 128 bits" (1-16 octets);
+// Section 3.4.4.8 narrows the maximum by CTL: 128 bits (16 octets) for an
+// Access message, 96 bits (12 octets) for a Transport Control message.
+const MIN_TRANSPORT_PDU_LENGTH = 1;
+const MAX_TRANSPORT_PDU_LENGTH_ACCESS = 16; // 128 bits (Section 3.4.4.8, CTL=0).
+const MAX_TRANSPORT_PDU_LENGTH_CONTROL = 12; // 96 bits (Section 3.4.4.8, CTL=1).
+
 function assertRange(field: string, value: number, max: number): void {
   if (!Number.isInteger(value) || value < 0 || value > max) {
     throw new Error(`network PDU field "${field}" must be an integer in [0, ${max}], got ${value}`);
+  }
+}
+
+function assertTransportPduLength(transportPdu: Buffer, ctl: boolean): void {
+  const max = ctl ? MAX_TRANSPORT_PDU_LENGTH_CONTROL : MAX_TRANSPORT_PDU_LENGTH_ACCESS;
+  if (transportPdu.length < MIN_TRANSPORT_PDU_LENGTH || transportPdu.length > max) {
+    throw new Error(
+      `network PDU field "transportPdu" must be ${MIN_TRANSPORT_PDU_LENGTH}-${max} bytes when ctl=${ctl}, got ${transportPdu.length}`,
+    );
   }
 }
 
@@ -109,6 +145,7 @@ export function encodeNetworkPdu(input: NetworkPduInput): Buffer {
   if (input.networkKey.length !== 16) {
     throw new Error(`network PDU field "networkKey" must be 16 bytes, got ${input.networkKey.length}`);
   }
+  assertTransportPduLength(input.transportPdu, input.ctl);
 
   // Step 1: derive NID, EncryptionKey and PrivacyKey from the network key.
   const { nid, encryptionKey, privacyKey } = k2(input.networkKey, MANAGED_FLOODING_P);
