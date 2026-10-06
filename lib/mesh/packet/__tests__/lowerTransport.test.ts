@@ -5,7 +5,11 @@ import {
   decodeUnsegmentedControl,
   segmentAccessMessage,
   decodeSegmentedAccess,
+  encodeSegmentAck,
+  decodeSegmentAck,
+  SegmentAck,
 } from '../lowerTransport';
+import { acceptSegment, blockAckFrom } from '../reassembly';
 import {
   hex,
   LOWER_TRANSPORT_SAMPLE_CONTROL_1,
@@ -17,6 +21,8 @@ import {
   LOWER_TRANSPORT_SAMPLE_ACCESS_VIRTUAL_2,
   LOWER_TRANSPORT_SAMPLE_SEGMENTED,
   LOWER_TRANSPORT_SAMPLE_SEGMENTED_DEVICE_KEY,
+  LOWER_TRANSPORT_SAMPLE_SEGMENT_ACK_1,
+  LOWER_TRANSPORT_SAMPLE_SEGMENT_ACK_2,
   NETWORK_PDU_SAMPLE_1,
   NETWORK_PDU_SAMPLE_2,
   NETWORK_PDU_SAMPLE_3,
@@ -905,5 +911,188 @@ describe('LOWER_TRANSPORT_SAMPLE_SEGMENTED_DEVICE_KEY: every field cross-checks 
         hex(LOWER_TRANSPORT_SAMPLE_SEGMENTED_DEVICE_KEY.segment1),
       ]),
     ).toEqual(hex(UPPER_TRANSPORT_SAMPLE_DEVICE_KEY.expected));
+  });
+});
+
+describe('Segment Acknowledgment message (Section 3.5.2.3.1, Table 3.21)', () => {
+  // 8.3.7 "Message #7": OBO=1, SeqZero=0x9ab, BlockAck=0x00000002 (bit 1
+  // only, of a 2-segment message). This is the fixture the mutation step
+  // below relies on: reversing AckedSegments' 32 bits turns 0x00000002
+  // into 0x40000000 (bit 1 moves to bit 30), a completely different value -
+  // not a value a symmetric fixture (e.g. 0x00000000 or a palindromic
+  // bit pattern) could ever catch. See vectors.ts's own note on this value.
+  test('encodeSegmentAck matches the published Message #7 Parameters', () => {
+    const parameters = encodeSegmentAck({
+      obo: LOWER_TRANSPORT_SAMPLE_SEGMENT_ACK_1.obo,
+      seqZero: LOWER_TRANSPORT_SAMPLE_SEGMENT_ACK_1.seqZero,
+      blockAck: LOWER_TRANSPORT_SAMPLE_SEGMENT_ACK_1.blockAck,
+    });
+    expect(parameters.toString('hex')).toBe(LOWER_TRANSPORT_SAMPLE_SEGMENT_ACK_1.parameters);
+    expect(parameters).toEqual(hex(LOWER_TRANSPORT_SAMPLE_SEGMENT_ACK_1.parameters));
+  });
+
+  test('decodeSegmentAck recovers the published Message #7 OBO/SeqZero/BlockAck', () => {
+    const decoded = decodeSegmentAck(hex(LOWER_TRANSPORT_SAMPLE_SEGMENT_ACK_1.parameters));
+    expect(decoded).toEqual({
+      obo: LOWER_TRANSPORT_SAMPLE_SEGMENT_ACK_1.obo,
+      seqZero: LOWER_TRANSPORT_SAMPLE_SEGMENT_ACK_1.seqZero,
+      blockAck: LOWER_TRANSPORT_SAMPLE_SEGMENT_ACK_1.blockAck,
+    });
+  });
+
+  // 8.3.9 "Message #9": same OBO/SeqZero as Message #7 (same in-flight
+  // transfer, one message later), but BlockAck=3 - both segments
+  // acknowledged, not just one. Without this sample, an encoder/decoder
+  // that only ever produced/recognised "bit 1 only" would still pass the
+  // Message #7 tests above.
+  test('encodeSegmentAck matches the published Message #9 Parameters', () => {
+    const parameters = encodeSegmentAck({
+      obo: LOWER_TRANSPORT_SAMPLE_SEGMENT_ACK_2.obo,
+      seqZero: LOWER_TRANSPORT_SAMPLE_SEGMENT_ACK_2.seqZero,
+      blockAck: LOWER_TRANSPORT_SAMPLE_SEGMENT_ACK_2.blockAck,
+    });
+    expect(parameters.toString('hex')).toBe(LOWER_TRANSPORT_SAMPLE_SEGMENT_ACK_2.parameters);
+  });
+
+  test('decodeSegmentAck recovers the published Message #9 OBO/SeqZero/BlockAck', () => {
+    const decoded = decodeSegmentAck(hex(LOWER_TRANSPORT_SAMPLE_SEGMENT_ACK_2.parameters));
+    expect(decoded).toEqual({
+      obo: LOWER_TRANSPORT_SAMPLE_SEGMENT_ACK_2.obo,
+      seqZero: LOWER_TRANSPORT_SAMPLE_SEGMENT_ACK_2.seqZero,
+      blockAck: LOWER_TRANSPORT_SAMPLE_SEGMENT_ACK_2.blockAck,
+    });
+  });
+
+  // End-to-end through the generic envelope this message reuses (SEG=0,
+  // Opcode=0x00 - Section 3.5.2.3's own Unsegmented Control message format,
+  // Table 3.19): proves encodeSegmentAck/decodeSegmentAck really do compose
+  // with encodeUnsegmentedControl/decodeUnsegmentedControl the way this
+  // module's own header documents, against the complete published
+  // LowerTransportPDU (Header || Parameters), not just the Parameters alone.
+  test('the complete Lower Transport PDU round-trips through encodeUnsegmentedControl + encodeSegmentAck (Message #7)', () => {
+    const ack = {
+      obo: LOWER_TRANSPORT_SAMPLE_SEGMENT_ACK_1.obo,
+      seqZero: LOWER_TRANSPORT_SAMPLE_SEGMENT_ACK_1.seqZero,
+      blockAck: LOWER_TRANSPORT_SAMPLE_SEGMENT_ACK_1.blockAck,
+    };
+    const pdu = encodeUnsegmentedControl({ opcode: 0x00, parameters: encodeSegmentAck(ack) });
+    expect(pdu.toString('hex')).toBe(LOWER_TRANSPORT_SAMPLE_SEGMENT_ACK_1.expected);
+
+    const envelope = decodeUnsegmentedControl(pdu);
+    expect(envelope).not.toBeNull();
+    expect(envelope?.opcode).toBe(0x00);
+    expect(decodeSegmentAck(envelope!.parameters)).toEqual(ack);
+  });
+
+  test('decodeSegmentAck returns null for a Parameters field that is not exactly 6 bytes', () => {
+    expect(decodeSegmentAck(Buffer.alloc(5))).toBeNull();
+    expect(decodeSegmentAck(Buffer.alloc(7))).toBeNull();
+    expect(decodeSegmentAck(Buffer.alloc(0))).toBeNull();
+  });
+
+  describe('caller mistakes throw rather than being treated as a verification failure', () => {
+    test('encodeSegmentAck rejects an out-of-range seqZero', () => {
+      expect(() => encodeSegmentAck({ obo: false, seqZero: 0x2000, blockAck: 0 })).toThrow(
+        /lower transport field "seqZero" must be an integer in \[0, 8191\], got 8192/,
+      );
+      expect(() => encodeSegmentAck({ obo: false, seqZero: -1, blockAck: 0 })).toThrow(
+        /lower transport field "seqZero"/,
+      );
+      expect(() => encodeSegmentAck({ obo: false, seqZero: 0x1fff, blockAck: 0 })).not.toThrow();
+    });
+
+    test('encodeSegmentAck rejects an out-of-range blockAck', () => {
+      expect(() => encodeSegmentAck({ obo: false, seqZero: 0, blockAck: 0x100000000 })).toThrow(
+        /lower transport field "blockAck" must be an integer in \[0, 4294967295\], got 4294967296/,
+      );
+      expect(() => encodeSegmentAck({ obo: false, seqZero: 0, blockAck: -1 })).toThrow(
+        /lower transport field "blockAck"/,
+      );
+      expect(() => encodeSegmentAck({ obo: false, seqZero: 0, blockAck: 0xffffffff })).not.toThrow();
+    });
+  });
+
+  // Boundary case at both fields' own maxima, hand-computed from Table
+  // 3.21's own bit widths (SeqZero 13 bits, AckedSegments 32 bits) - NOT
+  // read back from encodeSegmentAck's own output. OBO=1, SeqZero=0x1fff:
+  // octet0 = 0x80 | (0x1fff >>> 6 & 0x7f) = 0x80 | 0x7f = 0xff; octet1 =
+  // (0x1fff & 0x3f) << 2 = 0x3f << 2 = 0xfc (RFU, bits 1-0, left at 0).
+  // AckedSegments = 0xffffffff, all 32 bits set -> ff ff ff ff.
+  test('seqZero and blockAck round-trip at their own maxima (0x1fff, 0xffffffff), against hand-computed Parameters bytes', () => {
+    const parameters = encodeSegmentAck({ obo: true, seqZero: 0x1fff, blockAck: 0xffffffff });
+    expect(parameters).toEqual(hex('fffcffffffff'));
+
+    const decoded = decodeSegmentAck(parameters);
+    expect(decoded).toEqual({ obo: true, seqZero: 0x1fff, blockAck: 0xffffffff });
+  });
+
+  // Review-discipline boundary: OBO=0 is never published by Section 8.3
+  // (both samples above are OBO=1 - see vectors.ts's own note), so without
+  // this round trip nothing would notice an encoder/decoder that silently
+  // ignored `obo` and always treated it as 1. seqZero/blockAck reuse
+  // Message #7's own published values so only `obo` differs from that
+  // known-answer test above.
+  test('obo=0 round-trips (no Section 8.3 sample publishes one - see vectors.ts)', () => {
+    const ack = {
+      obo: false,
+      seqZero: LOWER_TRANSPORT_SAMPLE_SEGMENT_ACK_1.seqZero,
+      blockAck: LOWER_TRANSPORT_SAMPLE_SEGMENT_ACK_1.blockAck,
+    };
+    const parameters = encodeSegmentAck(ack);
+    expect(parameters[0]! & 0x80).toBe(0); // OBO bit clear.
+    expect(decodeSegmentAck(parameters)).toEqual(ack);
+  });
+});
+
+// `blockAckFrom` lives in `./reassembly`, not here, to avoid an import
+// cycle (see that module's own doc comment on the function) - these tests
+// import it from there and feed its output straight into encodeSegmentAck,
+// exercising the real boundary between the two modules the brief for this
+// task asked for, rather than a hand-built ReassemblyState.
+describe('Segment Acknowledgment message: blockAckFrom (./reassembly) feeds encodeSegmentAck directly', () => {
+  const SRC_24 = UPPER_TRANSPORT_SAMPLE_SZMIC.src; // 0x1234 - Message #24's own source address.
+
+  // Step 3's first required test: blockAckFrom, after only the first of two
+  // segments has arrived, sets EXACTLY the bit Table 3.21 assigns to
+  // segment 0 (the least significant bit) - built from a REAL, in-progress
+  // reassembly of Message #24's own first segment (acceptSegment), not a
+  // hand-built ReassemblyState object.
+  test('after only segment 0 of Message #24, blockAckFrom sets exactly bit 0 - and that bit lands on the wire where Table 3.21 puts it', () => {
+    const afterSegment0 = acceptSegment(null, SRC_24, hex(LOWER_TRANSPORT_SAMPLE_SEGMENTED.pdu));
+    if (afterSegment0.kind !== 'incomplete') throw new Error('expected incomplete after only segment 0');
+
+    const blockAck = blockAckFrom(afterSegment0.state);
+    expect(blockAck).toBe(0b01);
+
+    const parameters = encodeSegmentAck({ obo: false, seqZero: afterSegment0.state.seqZero, blockAck });
+    // AckedSegments occupies Parameters' last 4 octets (Table 3.21); within
+    // that 32-bit field, bit 0 is segment 0 ("the least significant bit,
+    // bit 0, shall represent segment 0"). Checking the actual WIRE byte's
+    // low bit - not just blockAck's own JS-integer value again - is the
+    // assertion the mutation step below needs to be meaningful.
+    expect(parameters.readUInt32BE(2)).toBe(0b01);
+    expect(parameters[parameters.length - 1]! & 0x01).toBe(1);
+  });
+
+  // Step 3's second required test: a COMPLETE state (every segment
+  // received) produces a field with exactly segN+1 bits set - the general
+  // property (derived from Table 3.21's one-bit-per-segment rule), checked
+  // alongside the concrete value for this specific (2-segment) message, so
+  // this would also catch an implementation that stopped one segment short
+  // or set a bit past segN.
+  test('after a complete reassembly of Message #24, blockAckFrom sets exactly segN+1 bits, and round-trips through encodeSegmentAck/decodeSegmentAck', () => {
+    const afterSegment0 = acceptSegment(null, SRC_24, hex(LOWER_TRANSPORT_SAMPLE_SEGMENTED.pdu));
+    if (afterSegment0.kind !== 'incomplete') throw new Error('expected incomplete after only segment 0');
+    const complete = acceptSegment(afterSegment0.state, SRC_24, hex(LOWER_TRANSPORT_SAMPLE_SEGMENTED.pdu1));
+    if (complete.kind !== 'complete') throw new Error('expected complete after both segments');
+
+    const blockAck = blockAckFrom(complete.state);
+    const segN = complete.state.segN;
+    expect(blockAck).toBe(2 ** (segN + 1) - 1); // every bit from 0 to segN set, derived from the field width rule.
+    expect(blockAck).toBe(0b11); // the concrete value for this 2-segment (segN=1) message.
+
+    const ack: SegmentAck = { obo: true, seqZero: complete.state.seqZero, blockAck };
+    const parameters = encodeSegmentAck(ack);
+    expect(decodeSegmentAck(parameters)).toEqual(ack);
   });
 });

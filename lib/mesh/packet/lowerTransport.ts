@@ -2,13 +2,16 @@ import { assertRange } from './ranges';
 
 /**
  * The lower transport layer (Mesh Protocol v1.1, Section 3.5.2 "Lower
- * Transport PDU"): the UNSEGMENTED PDUs (both encode and decode), plus
- * splitting an Upper Transport Access PDU into Segmented Access messages
- * and decoding a single received one back. REASSEMBLING a complete Upper
- * Transport PDU from several received segments is the next task and is NOT
- * built here (see that section's own note below) - nor is the Segmented
- * Control message or the Segment Acknowledgment message, both later tasks
- * too.
+ * Transport PDU"): the UNSEGMENTED PDUs (both encode and decode), splitting
+ * an Upper Transport Access PDU into Segmented Access messages and decoding
+ * a single received one back, and the Segment Acknowledgment message
+ * (Section 3.5.2.3.1, Table 3.21 - built further down in this same file).
+ * REASSEMBLING a complete Upper Transport PDU from several received
+ * segments lives in `./reassembly` instead (a separate module, to avoid an
+ * import cycle with this one - see that module's own header and
+ * `blockAckFrom`'s doc comment there for why). The Segmented Control message
+ * (Table 3.15's fourth row) is still a later task - see this file's own
+ * closing note.
  *
  * Section 3.5.2 states the shared rule both formats below follow: "The most
  * significant bit of the first octet of the Lower Transport PDU is the SEG
@@ -42,13 +45,17 @@ import { assertRange } from './ranges';
  * reused unchanged by the Segmented Access message (Table 3.18, Section
  * 3.5.2.2 - built further down in this same file), and the Opcode
  * field/range is shared with the Segment Acknowledgment message (Table
- * 3.21, Section 3.5.2.3.1 - still a later task, see that section's own note
- * below). Only the two UNSEGMENTED formats' LENGTH bounds differ from their
- * segmented siblings, so those two stay qualified ("unsegmented") and local
- * to each section below; the Segmented Access message's own length-related
- * constants are local to its own section for the same reason, just not
- * qualified the same way since there is no risk of confusing them with an
- * unsegmented bound of the same name.
+ * 3.21, Section 3.5.2.3.1 - also built further down this file, see that
+ * section's own note). Likewise `MAX_SEQ_ZERO` (introduced below for the
+ * Segmented Access message's own SeqZero field, Table 3.18) is reused
+ * unchanged by the Segment Acknowledgment message's own SeqZero field
+ * (Table 3.21) - the same 13-bit field, carried by both message formats for
+ * the same Upper Transport PDU. Only the two UNSEGMENTED formats' LENGTH
+ * bounds differ from their segmented siblings, so those two stay qualified
+ * ("unsegmented") and local to each section below; the Segmented Access
+ * message's own length-related constants are local to its own section for
+ * the same reason, just not qualified the same way since there is no risk
+ * of confusing them with an unsegmented bound of the same name.
  *
  * UNSEGMENTED ACCESS MESSAGE (Section 3.5.2.1, Table 3.17 "Unsegmented
  * Access message format"):
@@ -107,9 +114,16 @@ import { assertRange } from './ranges';
  * Opcode field to exactly 0x00, i.e. the Unsegmented Control message format
  * above is also how a Segment Acknowledgment message is carried,
  * distinguished from an ordinary Upper Transport Control PDU only by that
- * reserved opcode. Recognising and parsing that specific message is the
- * segment-acknowledgement task's job, not this one's - `opcode`/`parameters`
- * here are a generic envelope, and this module does not special-case 0x00.
+ * reserved opcode. Recognising and parsing that specific message's own
+ * Parameters is `encodeSegmentAck`/`decodeSegmentAck`'s job (Section
+ * 3.5.2.3.1, Table 3.21 - built further down this same file), not this
+ * section's: `opcode`/`parameters` here stay a generic envelope, and
+ * `encodeUnsegmentedControl`/`decodeUnsegmentedControl` still do not
+ * special-case 0x00 themselves - a caller recognises a Segment
+ * Acknowledgment message by checking `decodeUnsegmentedControl`'s own
+ * `opcode` result for 0x00 and, if so, handing that same result's
+ * `parameters` to `decodeSegmentAck`, exactly as `lowerTransport.test.ts`
+ * does.
  */
 
 // Shared header bits/fields - see the module header above for why these are
@@ -494,8 +508,127 @@ export function decodeSegmentedAccess(pdu: Buffer): SegmentedAccessPdu | null {
 }
 
 // ===========================================================================
-// Segmented Control message (Section 3.5.2.4), and the Segment
-// Acknowledgment message (Section 3.5.2.3.1, opcode 0x00 of the
-// Unsegmented Control format above), are later tasks. Append their code
-// below this line, grouped the same way as above.
+// Segment Acknowledgment message (Section 3.5.2.3.1, Table 3.21)
+// ===========================================================================
+
+// Table 3.21's own Figure 3.14 lists SEG(1)+Opcode(7) first, exactly the
+// Unsegmented Control message's header octet above (reused unchanged,
+// SEG=0/Opcode=0x00 fixed by Table 3.21 itself) - `encodeSegmentAck`/
+// `decodeSegmentAck` below do NOT touch that header octet at all, only the
+// Parameters that follow it (see the Unsegmented Control section's own
+// closing note on this split). Those Parameters are OBO(1)+SeqZero(13)+
+// RFU(2)+AckedSegments(32) = 48 bits = 6 octets, packed MSB-first in that
+// field order (the same convention already used for Table 3.18's header
+// above): OBO occupies bit 7 of the first Parameters octet, SeqZero's 13
+// bits follow immediately (the remaining 7 bits of that first octet, then
+// the top 6 bits of the second), RFU is the second octet's bottom 2 bits
+// (always written as 0, per Table 3.21: "Reserved for Future Use"), and
+// AckedSegments fills the remaining 4 octets as a single big-endian 32-bit
+// integer - `Buffer.prototype.writeUInt32BE`/`readUInt32BE` do exactly that
+// packing/unpacking, so there is no need to hand-roll it in three more
+// shift-and-mask lines the way Table 3.18's header above has to (that
+// header interleaves several sub-8-bit fields across octet boundaries in a
+// way no single built-in Buffer method covers; Table 3.21's own last field
+// is, by contrast, one whole 32-bit integer with nothing else sharing its
+// octets).
+const SEGMENT_ACK_PARAMETERS_LENGTH = 6;
+const OBO_BIT = 0x80; // bit 7 of Parameters octet 0 (Table 3.21).
+const MAX_BLOCK_ACK = 0xffffffff; // 32 bits (Table 3.21's AckedSegments field) - comfortably inside Number's exact-integer range.
+
+export interface SegmentAck {
+  /**
+   * Table 3.21's OBO field: "set to 0 by a node that is directly addressed
+   * by the received message and ... set to 1 by a Friend node that is
+   * acknowledging this message on behalf of a Low Power node." Section
+   * 8.3.7 "Message #7" ("A friend of the destination acknowledges only one
+   * of the segments") and Section 8.3.9 "Message #9" are both OBO=1
+   * samples - no Section 8.3 sample publishes an OBO=0 Segment
+   * Acknowledgment message, so that half of the bit is pinned only by
+   * Table 3.21's own text above, not by a published wire sample (recorded
+   * here rather than silently relied on).
+   */
+  obo: boolean;
+  /**
+   * 13-bit SeqZero of the Upper Transport PDU being acknowledged (Table
+   * 3.21) - the same field, same width, same value as the segmented
+   * message's own SeqZero (Table 3.18, `SegmentedAccessPdu.seqZero`'s own
+   * doc comment above): "the SeqZero field is included in the segmented
+   * message and Segment Acknowledgment message to identify the Upper
+   * Transport PDU" (Section 3.5.3.1).
+   */
+  seqZero: number;
+  /**
+   * Table 3.21's own name for this field is AckedSegments; Section 8.3's
+   * worked examples caption the identical bits "BlockAck" instead (Messages
+   * #7 and #9 below) - both names refer to the same 32-bit value, and
+   * `blockAckFrom` (`./reassembly`) is named after the sample caption, not
+   * the table. "The least significant bit, bit 0, shall represent segment
+   * 0; and the most significant bit, bit 31, shall represent segment 31. If
+   * bit n is set to 1, then segment n is being acknowledged" (Table 3.21) -
+   * the exact convention `blockAckFrom` already builds its return value
+   * under, so that function's output can be passed straight through as this
+   * field, as `lowerTransport.test.ts` does. "Any bits for segments larger
+   * than the SegN field value of the upper transport layer message being
+   * acknowledged shall be set to 0 and ignored upon receipt" (same table) -
+   * a rule about how a SENDER populates this field (and how a receiver
+   * matching it against its OWN in-flight SegN should treat any surplus
+   * bits), not something `encodeSegmentAck`/`decodeSegmentAck` enforce
+   * themselves: a Segment Acknowledgment message carries no SegN field of
+   * its own, so neither function has one to mask against here.
+   */
+  blockAck: number;
+}
+
+/**
+ * Builds a Segment Acknowledgment message's 6-octet Parameters field (Table
+ * 3.21) - NOT the complete Lower Transport PDU, which also needs the
+ * generic SEG=0/Opcode=0x00 header octet
+ * `encodeUnsegmentedControl({ opcode: 0x00, parameters: encodeSegmentAck(ack) })`
+ * already builds unchanged (see the Unsegmented Control section's own
+ * closing note on why that header is not duplicated here).
+ */
+export function encodeSegmentAck(ack: SegmentAck): Buffer {
+  assertLowerTransportField('seqZero', ack.seqZero, MAX_SEQ_ZERO);
+  assertLowerTransportField('blockAck', ack.blockAck, MAX_BLOCK_ACK);
+
+  const parameters = Buffer.alloc(SEGMENT_ACK_PARAMETERS_LENGTH);
+  parameters[0] = (ack.obo ? OBO_BIT : 0) | ((ack.seqZero >>> 6) & 0x7f);
+  parameters[1] = (ack.seqZero & 0x3f) << 2; // bits 1-0 (RFU) left at 0.
+  parameters.writeUInt32BE(ack.blockAck, 2);
+  return parameters;
+}
+
+/**
+ * Inverts `encodeSegmentAck`. Takes the 6-octet Parameters field ALONE
+ * (typically `decodeUnsegmentedControl(pdu)`'s own `parameters` result,
+ * once that same call's `opcode` has already been checked for 0x00 - the
+ * generic envelope is `decodeUnsegmentedControl`'s job, not this
+ * function's, same split as the encode direction above).
+ *
+ * Returns `null`, not an error, for a Parameters field that is not exactly
+ * 6 octets - the same "not decodable by this function" stance every other
+ * decoder in this file takes (Table 3.21's own fields sum to exactly 48
+ * bits/6 octets, with no variable-length component, so any other length is
+ * not a compliant sender's output; Section 3.5.4.3 "Message error
+ * procedure" states the matching receive-side rule directly: "A Segment
+ * Acknowledgment message that is not understood includes messages that
+ * have incorrect size").
+ */
+export function decodeSegmentAck(parameters: Buffer): SegmentAck | null {
+  if (parameters.length !== SEGMENT_ACK_PARAMETERS_LENGTH) {
+    return null;
+  }
+  const firstByte = parameters[0] as number;
+  const secondByte = parameters[1] as number;
+
+  return {
+    obo: (firstByte & OBO_BIT) !== 0,
+    seqZero: ((firstByte & 0x7f) << 6) | ((secondByte >>> 2) & 0x3f),
+    blockAck: parameters.readUInt32BE(2),
+  };
+}
+
+// ===========================================================================
+// Segmented Control message (Section 3.5.2.4) is the one remaining later
+// task. Append its code below this line, grouped the same way as above.
 // ===========================================================================

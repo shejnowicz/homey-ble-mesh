@@ -183,6 +183,63 @@
  * for Message #24, the Access-message block's own `Segment#0`/`Segment#1`
  * rows - read independently for this task; see the module-scope comments on
  * each constant for the exact rows and values found.
+ *
+ * SEGMENT ACKNOWLEDGMENT TASK ADDITION (`lowerTransport.ts`'s
+ * `encodeSegmentAck`/`decodeSegmentAck`): fetched the same 9,945,160-byte
+ * v1.1 document independently for this task on 2026-10-06 (same URL, same
+ * `</td>`/`</tr>`-before-tag-stripping method). Section 3.5.2.3.1 "Segment
+ * Acknowledgment message", Table 3.21 "Segment Acknowledgment message
+ * format" (Figure 3.14), gives the field layout: SEG 1 bit (fixed 0),
+ * Opcode 7 bits (fixed 0x00), OBO 1, SeqZero 13, RFU 2, AckedSegments 32 -
+ * 56 bits/7 octets total, of which the first octet (SEG||Opcode) is the
+ * SAME header octet the Unsegmented Control message format above already
+ * builds/reads, and the remaining 48 bits/6 octets are this message's own
+ * Parameters, packed MSB-first in that field order.
+ *
+ * TWO new message numbers, both from the friendship procedure's worked
+ * example (Section 8.3.4 through 8.3.15) - not previously transcribed
+ * anywhere in this file for any purpose. Checked directly, independent of
+ * this project's own code: both messages' own "NetworkPDU" blocks publish
+ * NetKey 7dd7364cd842ad18c17c2b820c84c3d6 and derive NID 0x68 - the SAME
+ * NetKey/NID as every other sample in this file, NOT the friendship
+ * SECURITY CREDENTIAL (NID 0x5e) `NETWORK_PDU_SAMPLE_ODD_IV`'s own comment
+ * above says this project does not implement; that note is about a
+ * different, unrelated set of messages (the ones whose Network PDU is
+ * itself encrypted/authenticated under rotated friendship credentials), not
+ * about these two, whose network-layer security is entirely ordinary. Only
+ * each message's own "Transport Control message" block (its Segment
+ * Acknowledgment fields) and its "LowerTransportUnsegmentedControlPDU"
+ * block (Header/Parameters/LowerTransportPDU, the only rows
+ * `lowerTransport.ts` itself reads) were mined for this task; the
+ * surrounding friendship procedure (why a Friend node is acknowledging on
+ * a Low Power node's behalf) is scene-setting, not something this module
+ * implements or needs.
+ *
+ * Section 8.3.7 "Message #7" ("A friend of the destination acknowledges
+ * only one of the segments"): Opcode=00 (Segment Acknowledgment), OBO=01,
+ * SeqZero=09ab, BlockAck=00000002 - these four are the per-message
+ * "Transport Control message" block's own labelled fields, already decoded
+ * by hand as a cross-check before being trusted: SeqZero 0x9ab's top 7 bits
+ * (0x9ab >>> 6 = 0x26) and bottom 6 bits (0x9ab & 0x3f = 0x2b) pack with
+ * OBO=1 into octets a6/ac exactly as the message's own
+ * "LowerTransportUnsegmentedControlPDU" block publishes them (Header=00,
+ * its own "UpperTransportPDU" row - this block's name for the Segment
+ * Acknowledgment message's Parameters field -
+ * a6ac00000002, LowerTransportPDU=00a6ac00000002 = Header||Parameters).
+ * BlockAck=00000002 (bit 1 set, bit 0 clear) is also the fixture this
+ * task's known-answer test relies on to be asymmetric under a full 32-bit
+ * reversal (0x00000002 reversed is 0x40000000, not itself) - recorded here,
+ * not just in the test file, since it is a property of the TRANSCRIBED
+ * value, not of the test.
+ *
+ * Section 8.3.9 "Message #9" ("The Friend node receives this last segment
+ * and sends an acknowledgment of this last segment"): same OBO=01,
+ * SeqZero=09ab as Message #7 (the same in-flight transfer, one message
+ * later), but BlockAck=00000003 - BOTH of a 2-segment message's bits set
+ * (0b11), i.e. a COMPLETE acknowledgment, not a partial one like Message
+ * #7's. Header=00, Parameters=a6ac00000003,
+ * LowerTransportPDU=00a6ac00000003 - verified by hand the same way as
+ * Message #7's above.
  */
 export const hex = (s: string): Buffer => Buffer.from(s.replace(/\s+/g, ''), 'hex');
 
@@ -892,4 +949,40 @@ export const LOWER_TRANSPORT_SAMPLE_SEGMENTED_DEVICE_KEY = {
   header1: '8026ac21',
   segment1: 'cfdc18c52fdef772e0e17308',
   pdu1: '8026ac21cfdc18c52fdef772e0e17308',
+};
+
+/**
+ * Section 8.3.7 "Message #7": a Segment Acknowledgment message, OBO=1
+ * (a Friend node acknowledging on behalf of a Low Power node), SeqZero
+ * 0x9ab, BlockAck 0x00000002 (segment 1 only, of a 2-segment message - see
+ * the module header's note on why this is the fixture the known-answer
+ * test relies on for mutation resistance). `parameters` is this message's
+ * own "LowerTransportUnsegmentedControlPDU" block's "UpperTransportPDU" row
+ * (its name, in the source, for the Segment Acknowledgment message's own
+ * Parameters field - not the generic Upper Transport Control PDU this
+ * field holds for every OTHER opcode `LOWER_TRANSPORT_SAMPLE_CONTROL_1`/
+ * `_2` above represent); `expected` is that same block's "LowerTransportPDU"
+ * row, Header (00) || Parameters.
+ */
+export const LOWER_TRANSPORT_SAMPLE_SEGMENT_ACK_1 = {
+  obo: true,
+  seqZero: 0x9ab,
+  blockAck: 0x00000002,
+  parameters: 'a6ac00000002',
+  expected: '00a6ac00000002',
+};
+
+/**
+ * Section 8.3.9 "Message #9": the next Segment Acknowledgment message in
+ * the same friendship exchange as Message #7 above - same OBO/SeqZero, but
+ * BlockAck 0x00000003 (both segments of the same 2-segment message, i.e. a
+ * COMPLETE acknowledgment where Message #7's was partial). Same field
+ * provenance as Message #7's own comment above.
+ */
+export const LOWER_TRANSPORT_SAMPLE_SEGMENT_ACK_2 = {
+  obo: true,
+  seqZero: 0x9ab,
+  blockAck: 0x00000003,
+  parameters: 'a6ac00000003',
+  expected: '00a6ac00000003',
 };
