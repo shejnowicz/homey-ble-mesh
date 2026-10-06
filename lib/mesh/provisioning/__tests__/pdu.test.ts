@@ -416,3 +416,50 @@ describe('encodeProvisioningPdu: caller-mistake field validation', () => {
     ).toThrow(/provisioning field "mic" must be 8 bytes, got 4/);
   });
 });
+
+// ===========================================================================
+// Buffer aliasing - `decodeProvisioningPdu` must hand back COPIES of the
+// recovered bytes, never views onto the caller's own `pdu` (its own module
+// header says so; the same reused-receive-buffer reasoning
+// `packet/access.ts` and `packet/lowerTransport.ts` already have their own
+// aliasing tests for). A review measured that reverting any one of this
+// decoder's defensive copies to a bare `.subarray` passed the whole suite,
+// because nothing here mutated an input buffer after decoding it. Every
+// Type carrying a Buffer field is swept, so no single copy can be reverted
+// unnoticed.
+// ===========================================================================
+
+describe('decoded Buffer fields do not alias the input PDU', () => {
+  test.each<[string, string]>([
+    ['publicKey (Public Key X and Y)', PDU_TYPE_SAMPLE_PUBLIC_KEY_DEVICE.message],
+    ['confirmation', PDU_TYPE_SAMPLE_CONFIRMATION_DEVICE.message],
+    ['random', PDU_TYPE_SAMPLE_RANDOM_DEVICE.message],
+    ['data (EncProvisioningData and MIC)', PDU_TYPE_SAMPLE_DATA.message],
+  ])('%s: overwriting the source PDU after decoding leaves the decoded fields unchanged', (_label, message) => {
+    const pdu = hex(message);
+    const decoded = decodeProvisioningPdu(pdu);
+    expect(decoded).not.toBeNull();
+    // Snapshot BEFORE the mutation, so the comparison below is against what
+    // was decoded, not against a fixture that could coincidentally match.
+    const before = JSON.parse(JSON.stringify(decoded)) as unknown;
+
+    pdu.fill(0xff); // simulate a caller reusing/zeroing its receive buffer.
+
+    expect(JSON.parse(JSON.stringify(decoded)) as unknown).toEqual(before);
+    // And the decoded bytes are still the published ones, not 0xff.
+    expect(JSON.stringify(decoded)).not.toContain('255,255,255,255');
+  });
+
+  test('writing through a decoded Buffer field does not corrupt the caller’s PDU', () => {
+    const pdu = hex(PDU_TYPE_SAMPLE_CONFIRMATION_DEVICE.message);
+    const pduCopy = Buffer.from(pdu);
+    const decoded = decodeProvisioningPdu(pdu);
+    // Asserted, not optional-chained: `decoded?.x.fill()` would silently
+    // skip the write and let this pass vacuously if decode ever returned
+    // null (the exact vacuous-pass a review caught in this project's
+    // `lowerTransport.test.ts` sibling).
+    expect(decoded).not.toBeNull();
+    (decoded as { type: 'confirmation'; confirmation: Buffer }).confirmation.fill(0xff);
+    expect(pdu).toEqual(pduCopy);
+  });
+});

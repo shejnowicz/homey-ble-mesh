@@ -80,6 +80,27 @@ import { assertRange, MAX_IV_INDEX } from '../packet/ranges';
  * module that rolled its own randomness could only ever be tested against
  * itself.
  *
+ * INPUT OWNERSHIP: because those inputs are the CALLER's, this module
+ * COPIES every Buffer it is handed (`beginProvisioning` copies the ephemeral
+ * key pair, RandomProvisioner and the NetKey, and rebuilds
+ * `ProvisioningDataInput` as a fresh object) rather than retaining a
+ * reference to it, and likewise never retains a view into an incoming PDU or
+ * into a buffer it hands back in `send`. The rule this follows is the
+ * project-wide one these modules already state for their own decoders
+ * (`pdu.ts`'s "Every Buffer field returned is a COPY", `composition.ts`'s NO
+ * BUFFER ALIASING note): a caller's buffer may be reused, overwritten or
+ * zeroed the moment the call returns, and this module reads its inputs again
+ * several `step` calls later - the ephemeral key pair in
+ * `onCapabilities`/`onPublicKeyDevice`, RandomProvisioner in
+ * `onConfirmationDevice`/`onRandomDevice`, the NetKey in `onRandomDevice`.
+ * This is not hypothetical here: Section 5.4.2.3's "After the ECDHSecret is
+ * computed, the Provisioner ... shall delete its private-public key pair",
+ * quoted again at that call site below, is an instruction a conscientious
+ * caller may well follow by zeroing the very pair it handed in - which, with
+ * a retained reference, would silently change the ConfirmationProvisioner
+ * this module sends and the device key it derives. `machine.test.ts` pins
+ * each of these copies with its own mutate-the-caller's-buffer test.
+ *
  * ONE NULLISH CONVENTION, same reasoning as `packet/reassembly.ts`'s own
  * header: there is no `null`/`undefined` anywhere in this module's own
  * surface. Every `ProvisioningState` - including the three terminal
@@ -219,11 +240,19 @@ import { assertRange, MAX_IV_INDEX } from '../packet/ranges';
  * Authentication Method, so this module refuses as soon as it sees that
  * bit, before ever building a Start PDU. This is `'unsupported'`, not
  * `'failed'`: nothing has been sent, no protocol error has occurred, and
- * the design document is explicit that this is an open product decision
- * ("the wizard reports this and we decide later whether to add that
- * path"), not a defect - "it must not be silently treated as the no-OOB
- * case" is the brief's own wording for why this gets its own phase rather
- * than being folded into `'failed'`. The same `'unsupported'` phase (with
+ * the design document is explicit that this is an open product decision -
+ * "If one demands an out-of-band code, the wizard says so and we decide
+ * then whether to add that path; it is not in this design."
+ * (docs/superpowers/specs/2026-10-06-ble-mesh-provisioner-design.md) - not
+ * a defect. The task brief's own restatement of that, "it must not be
+ * silently treated as the no-out-of-band case", is why this gets its own
+ * phase rather than being folded into `'failed'`. (An earlier revision of
+ * this note quoted the brief's paraphrase of the design document - "the
+ * wizard reports this and we decide later whether to add that path" - as
+ * though it were the design document's own sentence, and compressed the
+ * brief's "no-out-of-band" to "no-OOB" inside its quotation marks; both
+ * are corrected above, and the conclusion they support is unchanged.) The
+ * same `'unsupported'` phase (with
  * a different `reason`) also covers a device whose Capabilities PDU does
  * not offer BTM_ECDH_P256_CMAC_AES128_AES_CCM at all (Table 5.21 bit 0
  * clear) - this project has no other algorithm to fall back to (see
@@ -251,9 +280,16 @@ import { assertRange, MAX_IV_INDEX } from '../packet/ranges';
  * little-endian". Section 4.3.1.1's Figure 4.4/4.5 packing lives in
  * Chapter 4 (the access-layer/Foundation-Model chapter) and - covering
  * explicitly both the two-index case (Figure 4.4) AND the single-index
- * case (Figure 4.5: "To pack ONE key index into two octets...") - IS that
+ * case (Figure 4.5: "To pack one key index into two octets, 8 LSbs of
+ * first key index value are packed into the first octet, placing the
+ * remaining 4 MSbs into 4 LSbs of the second octet, and the 4 MSbs of the
+ * second octet shall be set to 0.") - IS that
  * layer's own little-endian representation of a 12-bit value, not a
- * separate "packing" convention layered on top of endianness. Table
+ * separate "packing" convention layered on top of endianness (the
+ * capitalisation of "one" in an earlier revision of this quotation was
+ * this file's own emphasis, not the document's, and is removed - the
+ * single-index coverage it was emphasising is stated plainly instead).
+ * Table
  * 5.47's citation of it for Provisioning's OWN Key Index field imports
  * the wrong layer's convention.
  *
@@ -315,7 +351,7 @@ const MAX_UNICAST_ADDRESS = 0x7fff;
 const ALGORITHM_CMAC_AES128 = 0x00;
 /** Table 5.21 bit 0 (Provisioning Capabilities' Algorithms field): BTM_ECDH_P256_CMAC_AES128_AES_CCM support. */
 const ALGORITHM_CMAC_AES128_BIT = 0x0001;
-/** Table 5.30: Public Key field value for "no OOB public key" - this design never uses an OOB-retrieved device public key. */
+/** Table 5.30's own 0x00 row, "No OOB Public Key is used" - this design never uses an OOB-retrieved device public key. */
 const PUBLIC_KEY_NOT_OOB = 0x00;
 /** Table 5.31: Authentication Method value for "No OOB" - the only method this module uses. */
 const AUTHENTICATION_METHOD_NO_OOB = 0x00;
@@ -595,6 +631,34 @@ export function beginProvisioning(input: BeginProvisioningInput): ProvisioningSt
   const invitePdu: ProvisioningInvite = { type: 'invite', attentionDuration: input.attentionDuration };
   const inviteBytes = encodeProvisioningPdu(invitePdu);
 
+  // EVERY caller-owned input is COPIED here, not retained by reference (see
+  // the module header's INPUT OWNERSHIP note). `input.ephemeralKeyPair`,
+  // `input.randomProvisioner` and `input.provisioningData.netKey` are the
+  // CALLER's buffers; the exchange reads all three again, several `step`
+  // calls later (the key pair in `onCapabilities`/`onPublicKeyDevice`, the
+  // random in `onConfirmationDevice`/`onRandomDevice`, the NetKey in
+  // `onRandomDevice`'s Provisioning Data block), so a view into any of them
+  // would let a mutation made after this call returns change what this
+  // module later sends - and this module's own header quotes the very
+  // instruction ("After the ECDHSecret is computed, the Provisioner ...
+  // shall delete its private-public key pair") a caller might follow
+  // literally by zeroing the pair it just handed in. `provisioningData`'s
+  // numeric fields are copied for the same reason, into a fresh object: the
+  // caller's own object is an ordinary mutable record to the caller,
+  // whatever `readonly` says to a TypeScript consumer.
+  const ephemeralKeyPair: EphemeralKeyPair = {
+    publicKey: Buffer.from(input.ephemeralKeyPair.publicKey),
+    privateKey: Buffer.from(input.ephemeralKeyPair.privateKey),
+  };
+  const randomProvisioner = Buffer.from(input.randomProvisioner);
+  const provisioningData: ProvisioningDataInput = {
+    netKey: Buffer.from(input.provisioningData.netKey),
+    netKeyIndex: input.provisioningData.netKeyIndex,
+    flags: input.provisioningData.flags,
+    ivIndex: input.provisioningData.ivIndex,
+    unicastAddress: input.provisioningData.unicastAddress,
+  };
+
   const state: ProvisioningState = {
     phase: 'awaitingCapabilities',
     // Buffer.from(...) COPIES - `inviteBytes` itself is also handed to the
@@ -608,9 +672,9 @@ export function beginProvisioning(input: BeginProvisioningInput): ProvisioningSt
     // changed, after the call returned). Parameters only - Section
     // 5.4.2.4.1's "...PDUValue" excludes the Type octet.
     inviteValue: Buffer.from(inviteBytes.subarray(1)),
-    ephemeralKeyPair: input.ephemeralKeyPair,
-    randomProvisioner: input.randomProvisioner,
-    provisioningData: input.provisioningData,
+    ephemeralKeyPair,
+    randomProvisioner,
+    provisioningData,
   };
   return { state, send: [inviteBytes] };
 }
@@ -690,6 +754,17 @@ function onCapabilities(state: AwaitingCapabilitiesState, pdu: Buffer): Provisio
   };
   const startBytes = encodeProvisioningPdu(startPdu);
 
+  // BELT AND BRACES, measured: unlike the three copies around it, reverting
+  // these two to bare `.subarray` views changes NO observable behaviour and
+  // no test can catch it, because `encodeProvisioningPdu` builds its output
+  // with `Buffer.concat`, which already copies - so the PDU handed to the
+  // caller never shares memory with `state.ephemeralKeyPair.publicKey`
+  // whether these copies are here or not. They are kept so that this
+  // module's own `ProvisioningPublicKey` value owns its bytes regardless of
+  // what the encoder happens to do with them, but do not read them as the
+  // thing that protects the stored key pair; that is the copy
+  // `beginProvisioning` makes (see the module header's INPUT OWNERSHIP note),
+  // which IS pinned by its own test.
   const publicKeyPdu: ProvisioningPublicKey = {
     type: 'publicKey',
     publicKeyX: Buffer.from(state.ephemeralKeyPair.publicKey.subarray(0, 32)),

@@ -388,10 +388,19 @@ export function encodeConfigAppKeyAdd(params: ConfigAppKeyAddParams): Buffer {
     throw new Error(`config field "appKey" must be ${APP_KEY_LENGTH} bytes (Table 4.119), got ${params.appKey.length}`);
   }
   const indexes = packTwoKeyIndexes(params.netKeyIndex, params.appKeyIndex);
-  // Buffer.from(Buffer) copies - never retain a view into the caller's own
-  // `appKey` buffer (the global constraint this project's earlier tasks
-  // left unmet in three places - see `composition.ts`'s own NO BUFFER
-  // ALIASING note).
+  // BELT AND BRACES, NOT LOAD-BEARING - do not read this `Buffer.from` as
+  // the thing that keeps the caller's `appKey` out of the returned PDU.
+  // `Buffer.concat` already allocates a fresh buffer and copies its inputs
+  // into it, so the result never aliases `params.appKey` whether or not
+  // this copy is here; measured, not assumed (filling `appKey` with a
+  // different byte after the call leaves the returned PDU unchanged with
+  // the inner `Buffer.from` removed). It is kept because it makes the
+  // no-aliasing property local and obvious at the one site that handles
+  // caller-supplied key material, rather than resting on a reader knowing
+  // `Buffer.concat`'s copying semantics - but the genuine aliasing hazard
+  // this project documents elsewhere (`composition.ts`'s NO BUFFER
+  // ALIASING note, `provisioning/machine.ts`'s INPUT OWNERSHIP note) is a
+  // RETAINED reference across calls, and nothing is retained here at all.
   const parameters = Buffer.concat([indexes, Buffer.from(params.appKey)]);
   return encodeAccessMessage({ opcode: OPCODE_APPKEY_ADD, parameters });
 }
@@ -534,6 +543,21 @@ export function decodeConfigStatus(pdu: Buffer): ConfigStatus | null {
     }
 
     case OPCODE_MODEL_APP_STATUS: {
+      // MOSTLY BELT AND BRACES. Table 4.130's Parameters are Status (1) ||
+      // ElementAddress (2) || AppKeyIndex (2) || ModelIdentifier (2 or 4),
+      // so 7 and 9 are the only legal lengths - but `decodeModelIdentifier`
+      // below already rejects every other length on its own, because what
+      // it is handed is exactly `parameters.length - 5` octets and it
+      // accepts only 2 or 4. Measured: deleting this guard outright passes
+      // the whole suite. It is NOT quite dead, and that is the only reason
+      // it survives review as code rather than as a comment: for a
+      // Parameters field shorter than 3 octets, `readUInt16LE(1)` on the
+      // next line throws before `decodeModelIdentifier` is ever reached
+      // (measured - a `80 3E` PDU with 0, 1 or 2 Parameters octets throws a
+      // RangeError without this guard and returns `null` with it), and this
+      // module's whole decode stance is `null`, never a throw. So read this
+      // as "keep the short-buffer cases out of the field reads below", not
+      // as the check that decides which lengths are legal.
       if (parameters.length !== 7 && parameters.length !== 9) {
         return null;
       }

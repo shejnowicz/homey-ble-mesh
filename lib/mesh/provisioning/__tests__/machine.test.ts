@@ -274,6 +274,85 @@ describe('a PDU arriving out of order', () => {
 });
 
 // ===========================================================================
+// THE FULL ORDERING SWEEP: every PDU type, at every phase.
+//
+// The per-phase cases above pin each phase against ONE specific wrong type,
+// which a review measured to be weaker than it looks: a bypass that accepts
+// one SPECIFIC other type survived at two phases, because no case at those
+// phases ever fed that particular type. (The realistic defect - a handler
+// losing its type check entirely - is caught everywhere by the cases above,
+// which is why that finding was Minor.) Driving every type this project's
+// `pdu.ts` decodes at every phase closes it exhaustively.
+//
+// The Provisioning Failed PDU is deliberately NOT in this sweep: `pdu.ts`'s
+// own DIRECTION table makes it legal at every phase (it replaces whatever
+// the Provisionee was about to send), so it is never "unexpected" and is
+// covered by its own tests under "malformed or foreign bytes" below.
+// ===========================================================================
+
+describe('per-phase type checks, swept over every PDU type this module decodes', () => {
+  // Each entry is a complete, decodable PDU of that type: the published
+  // sample where Section 8.7 publishes one, and - for Input Complete, which
+  // this document publishes no sample for (see `vectors.ts`'s own NO
+  // FABRICATED SAMPLES note) - its own published empty-Parameters shape.
+  const everyType: ReadonlyArray<[string, Buffer]> = [
+    ['invite', hex(PDU_TYPE_SAMPLE_INVITE.message)],
+    ['capabilities', hex(PDU_TYPE_SAMPLE_CAPABILITIES.message)],
+    ['start', hex(PDU_TYPE_SAMPLE_START.message)],
+    ['publicKey', hex(PDU_TYPE_SAMPLE_PUBLIC_KEY_DEVICE.message)],
+    ['inputComplete', encodeProvisioningPdu({ type: 'inputComplete' })],
+    ['confirmation', hex(PDU_TYPE_SAMPLE_CONFIRMATION_DEVICE.message)],
+    ['random', hex(PDU_TYPE_SAMPLE_RANDOM_DEVICE.message)],
+    ['data', hex(PDU_TYPE_SAMPLE_DATA.message)],
+    ['complete', hex(PDU_TYPE_SAMPLE_COMPLETE.message)],
+  ];
+
+  function driveToPhase(target: string) {
+    let result = begin();
+    if (target === 'awaitingCapabilities') return result;
+    result = step(result.state, hex(PDU_TYPE_SAMPLE_CAPABILITIES.message));
+    if (target === 'awaitingPublicKeyDevice') return result;
+    result = step(result.state, hex(PDU_TYPE_SAMPLE_PUBLIC_KEY_DEVICE.message));
+    if (target === 'awaitingConfirmationDevice') return result;
+    result = step(result.state, hex(PDU_TYPE_SAMPLE_CONFIRMATION_DEVICE.message));
+    if (target === 'awaitingRandomDevice') return result;
+    result = step(result.state, hex(PDU_TYPE_SAMPLE_RANDOM_DEVICE.message));
+    return result; // awaitingComplete
+  }
+
+  // phase, the label this module's own `unexpectedType` message uses, and
+  // the one type that phase legitimately accepts (skipped in its sweep).
+  describe.each<[string, string, string]>([
+    ['awaitingCapabilities', 'Capabilities', 'capabilities'],
+    ['awaitingPublicKeyDevice', 'Public Key', 'publicKey'],
+    ['awaitingConfirmationDevice', 'Confirmation', 'confirmation'],
+    ['awaitingRandomDevice', 'Random', 'random'],
+    ['awaitingComplete', 'Complete', 'complete'],
+  ])('at %s (expecting a %s PDU)', (phase, label, acceptedType) => {
+    const wrongTypes = everyType.filter(([typeName]) => typeName !== acceptedType);
+
+    test.each(wrongTypes)('a %s PDU is rejected as Unexpected PDU (Table 5.41 0x03)', (typeName, pduBytes) => {
+      const atPhase = driveToPhase(phase);
+      expect(atPhase.state.phase).toBe(phase);
+
+      const result = step(atPhase.state, pduBytes);
+      expect(result.send).toEqual([]);
+      expect(result.state).toEqual({
+        phase: 'failed',
+        errorCode: 0x03,
+        errorName: 'Unexpected PDU',
+        reason: `expected a ${label} PDU but received a ${typeName} PDU`,
+      });
+    });
+
+    test('the sweep above really did omit exactly one type - the accepted one', () => {
+      expect(everyType).toHaveLength(wrongTypes.length + 1);
+      expect(everyType.map(([typeName]) => typeName)).toContain(acceptedType);
+    });
+  });
+});
+
+// ===========================================================================
 // A confirmation value that does not match.
 // ===========================================================================
 
@@ -311,51 +390,67 @@ describe('a confirmation value that does not match', () => {
     expect(result.send).toEqual([hex(PDU_TYPE_SAMPLE_DATA.message)]);
   });
 
-  // A review found that the mutation test above does not actually prove
-  // the comparison checks all 16 bytes: it corrupts a byte of RANDOM, not
-  // of the stored confirmation, so the recomputed value differs from the
-  // stored one starting at byte 0 - a comparison truncated to the first 8
-  // bytes, or even the first 1 byte, would still catch it. This test
-  // instead corrupts only the LAST byte of the device's confirmation
-  // value (derived by flipping one bit of the published, verified value -
-  // not a value taken on trust), then completes the exchange with the
-  // GENUINE published RandomDevice. The recomputed ConfirmationDevice
-  // therefore matches the published value everywhere EXCEPT that last
-  // byte - the one shape of mismatch a prefix-only comparison would miss.
-  test('a device confirmation differing from the published value ONLY in its last byte still fails (closes a truncated-comparison gap)', () => {
-    const genuineConfirmationDevice = hex(PDU_TYPE_SAMPLE_CONFIRMATION_DEVICE.fields.confirmation);
-    const almostGenuineConfirmationDevice = Buffer.from(genuineConfirmationDevice);
-    const lastIndex = almostGenuineConfirmationDevice.length - 1;
-    almostGenuineConfirmationDevice[lastIndex] = (almostGenuineConfirmationDevice[lastIndex] as number) ^ 0x01;
-    // Sanity check on the fixture itself: everything BUT the last byte is
-    // still identical to the genuine value - otherwise this would not be
-    // testing what it claims to.
-    expect(almostGenuineConfirmationDevice.subarray(0, lastIndex)).toEqual(genuineConfirmationDevice.subarray(0, lastIndex));
-    expect(almostGenuineConfirmationDevice.subarray(lastIndex)).not.toEqual(genuineConfirmationDevice.subarray(lastIndex));
+  // THE ONE CHECK IN THIS MODULE WHOSE WEAKENING HAS A SECURITY
+  // CONSEQUENCE, so it gets the one exhaustive sweep in this file.
+  //
+  // The mutation test above does not prove the comparison checks all 16
+  // bytes: it corrupts a byte of RANDOM, not of the stored confirmation, so
+  // the recomputed value differs from the stored one starting at byte 0 - a
+  // comparison truncated to any prefix, even one byte, would still catch
+  // it. A first round closed the prefix direction with a single case
+  // corrupting the LAST byte; a second review measured that this still left
+  // the suite blind in the other direction, because BOTH negative cases
+  // then differed at that last position, so a comparison keeping only the
+  // last byte - or only the second half - passed all 542 tests. A forged
+  // confirmation getting through means provisioning a node that never
+  // proved it knows the shared secret.
+  //
+  // So: one case per position. Each flips exactly ONE bit of the published,
+  // already-verified ConfirmationDevice (never a value taken on trust),
+  // feeds that as the device's Confirmation PDU, then completes the
+  // exchange with the GENUINE published RandomDevice - so the recomputed
+  // ConfirmationDevice equals the published value everywhere EXCEPT that
+  // one position. A comparison that ignores position `i` for any reason
+  // (prefix, suffix, single byte, either half) fails the case for `i`.
+  describe.each(Array.from({ length: 16 }, (_unused, index) => index))(
+    'a device confirmation differing from the published value ONLY at byte %i',
+    (index) => {
+      test('still fails as Confirmation Failed - no single-position comparison survives this sweep', () => {
+        const genuineConfirmationDevice = hex(PDU_TYPE_SAMPLE_CONFIRMATION_DEVICE.fields.confirmation);
+        expect(genuineConfirmationDevice).toHaveLength(16);
+        const almostGenuineConfirmationDevice = Buffer.from(genuineConfirmationDevice);
+        almostGenuineConfirmationDevice[index] = (almostGenuineConfirmationDevice[index] as number) ^ 0x01;
+        // Sanity check on the fixture itself: EXACTLY this one byte differs
+        // - otherwise this case would not be testing the position it claims.
+        expect(almostGenuineConfirmationDevice.subarray(0, index)).toEqual(genuineConfirmationDevice.subarray(0, index));
+        expect(almostGenuineConfirmationDevice.subarray(index + 1)).toEqual(genuineConfirmationDevice.subarray(index + 1));
+        expect(almostGenuineConfirmationDevice[index]).not.toBe(genuineConfirmationDevice[index]);
 
-    let result = begin();
-    result = step(result.state, hex(PDU_TYPE_SAMPLE_CAPABILITIES.message));
-    result = step(result.state, hex(PDU_TYPE_SAMPLE_PUBLIC_KEY_DEVICE.message));
-    const almostGenuineConfirmationPdu: ProvisioningConfirmation = {
-      type: 'confirmation',
-      confirmation: almostGenuineConfirmationDevice,
-    };
-    result = step(result.state, encodeProvisioningPdu(almostGenuineConfirmationPdu));
-    expect(result.state.phase).toBe('awaitingRandomDevice');
+        let result = begin();
+        result = step(result.state, hex(PDU_TYPE_SAMPLE_CAPABILITIES.message));
+        result = step(result.state, hex(PDU_TYPE_SAMPLE_PUBLIC_KEY_DEVICE.message));
+        const almostGenuineConfirmationPdu: ProvisioningConfirmation = {
+          type: 'confirmation',
+          confirmation: almostGenuineConfirmationDevice,
+        };
+        result = step(result.state, encodeProvisioningPdu(almostGenuineConfirmationPdu));
+        expect(result.state.phase).toBe('awaitingRandomDevice');
 
-    // The genuine RandomDevice - recomputing ConfirmationDevice from it
-    // reproduces the GENUINE value, which now disagrees with the altered
-    // one stored above by exactly one byte, at the end.
-    result = step(result.state, hex(PDU_TYPE_SAMPLE_RANDOM_DEVICE.message));
-    expect(result.send).toEqual([]);
-    expect(result.state).toEqual({
-      phase: 'failed',
-      errorCode: 0x04,
-      errorName: 'Confirmation Failed',
-      reason:
-        'ConfirmationDevice recomputed from the received RandomDevice does not match the value received earlier (Section 5.4.2.4.2: the Provisionee is not authenticated)',
-    });
-  });
+        // The genuine RandomDevice - recomputing ConfirmationDevice from it
+        // reproduces the GENUINE value, which disagrees with the altered one
+        // stored above at exactly one position, this case's own.
+        result = step(result.state, hex(PDU_TYPE_SAMPLE_RANDOM_DEVICE.message));
+        expect(result.send).toEqual([]);
+        expect(result.state).toEqual({
+          phase: 'failed',
+          errorCode: 0x04,
+          errorName: 'Confirmation Failed',
+          reason:
+            'ConfirmationDevice recomputed from the received RandomDevice does not match the value received earlier (Section 5.4.2.4.2: the Provisionee is not authenticated)',
+        });
+      });
+    },
+  );
 
   test('a 32-byte device Confirmation (wrong algorithm length) is rejected as Invalid Format, not fed into the comparison', () => {
     let result = begin();
@@ -704,5 +799,275 @@ describe('fields the published sample happens to leave at zero', () => {
         fullPlaintext.subarray(23, 25), // Unicast Address, unchanged.
       ]),
     );
+  });
+});
+
+// ===========================================================================
+// EVERY Provisioning Data field is the CALLER's, not the sample's.
+//
+// A review measured that replacing the NetKey, its index, the IV index or
+// the unicast address with the published sample's literal values inside
+// `machine.ts` each passed all 542 tests. The test above varies only two
+// fields (Attention Duration and Flags), and the way it builds its expected
+// plaintext - by splicing the published plaintext around the one byte it
+// changed - would match whatever the implementation hardcoded for the rest.
+//
+// These are exactly the fields the next plan's address allocator will
+// supply. Mis-wiring one would provision every bulb into the SAMPLE's
+// network at the SAMPLE's address, and would present on hardware as "the
+// bulb provisions and then never answers," with nothing locally able to say
+// why. So this case drives the exchange with ALL of them set to values
+// unlike the sample's and asserts the decrypted block byte by byte,
+// assembled BY HAND from those values per Table 5.47's own field order and
+// sizes - never read back from this module's own encoder.
+//
+// The five caller values are SYNTHETIC. They are not published anywhere in
+// the specification and carry no citation of their own; they exist only to
+// be recognisably unlike the sample's in every field (asserted below before
+// anything else), exactly as this file's non-zero Flags case and
+// `config/__tests__/composition.test.ts`'s synthetic Features values do.
+// ===========================================================================
+
+describe('the Provisioning Data block carries the caller-supplied network membership, never the published sample', () => {
+  const callerNetKey = Buffer.from([
+    0xa0, 0xa1, 0xa2, 0xa3, 0xa4, 0xa5, 0xa6, 0xa7, 0xa8, 0xa9, 0xaa, 0xab, 0xac, 0xad, 0xae, 0xaf,
+  ]);
+  const callerNetKeyIndex = 0x0abc; // 12-bit domain (Section 4.3.1.1), unlike the sample's 0x0567.
+  const callerFlags = 0x02; // Table 5.48 bit 1 (IV Update), unlike the sample's 0x00.
+  const callerIvIndex = 0x89abcdef; // 32 bits, unlike the sample's 0x01020304.
+  const callerUnicastAddress = 0x7a5c; // Table 3.5 unicast range, unlike the sample's 0x0b0c.
+
+  // Table 5.47 "Provisioning data format": Network Key (16) || Key Index (2)
+  // || Flags (1) || IV Index (4) || Unicast Address (2), 25 octets, every
+  // multi-octet field big-endian (Section 3.1.1's Provisioning rule - see
+  // machine.ts's PROVISIONING DATA FIELD ENCODING note). Written out as
+  // literal octets, hand-derived from the five values above: 0x0abc -> 0a bc;
+  // 0x89abcdef -> 89 ab cd ef; 0x7a5c -> 7a 5c.
+  const expectedPlaintext = Buffer.from([
+    0xa0, 0xa1, 0xa2, 0xa3, 0xa4, 0xa5, 0xa6, 0xa7, 0xa8, 0xa9, 0xaa, 0xab, 0xac, 0xad, 0xae, 0xaf, // Network Key
+    0x0a, 0xbc, // Key Index
+    0x02, // Flags
+    0x89, 0xab, 0xcd, 0xef, // IV Index
+    0x7a, 0x5c, // Unicast Address
+  ]);
+
+  test('the fixture is actually unlike the published sample in every field (so this case can catch a hardcoded one)', () => {
+    expect(expectedPlaintext).toHaveLength(25);
+    expect(fullPlaintext).toHaveLength(25);
+    expect(callerNetKey).not.toEqual(provisioningData.netKey);
+    expect(callerNetKeyIndex).not.toBe(provisioningData.netKeyIndex);
+    expect(callerFlags).not.toBe(provisioningData.flags);
+    expect(callerIvIndex).not.toBe(provisioningData.ivIndex);
+    expect(callerUnicastAddress).not.toBe(provisioningData.unicastAddress);
+    // Stronger than field-by-field: not one octet of the hand-assembled
+    // block coincides with the published one at the same position, so a
+    // hardcoded sample value anywhere in the assembly shows up here.
+    for (let i = 0; i < expectedPlaintext.length; i++) {
+      expect(expectedPlaintext[i]).not.toBe(fullPlaintext[i]);
+    }
+  });
+
+  test('all five fields reach the encrypted block exactly as supplied', () => {
+    let result = beginProvisioning({
+      attentionDuration: PDU_TYPE_SAMPLE_INVITE.fields.attentionDuration,
+      ephemeralKeyPair,
+      randomProvisioner,
+      provisioningData: {
+        netKey: callerNetKey,
+        netKeyIndex: callerNetKeyIndex,
+        flags: callerFlags,
+        ivIndex: callerIvIndex,
+        unicastAddress: callerUnicastAddress,
+      },
+    });
+    result = step(result.state, hex(PDU_TYPE_SAMPLE_CAPABILITIES.message));
+    result = step(result.state, hex(PDU_TYPE_SAMPLE_PUBLIC_KEY_DEVICE.message));
+    result = step(result.state, hex(PDU_TYPE_SAMPLE_CONFIRMATION_DEVICE.message));
+    result = step(result.state, hex(PDU_TYPE_SAMPLE_RANDOM_DEVICE.message));
+    expect(result.state.phase).toBe('awaitingComplete');
+
+    // SessionKey/SessionNonce come from ECDHSecret and ProvisioningSalt only
+    // (Section 5.4.2.5), and none of the five fields above feeds either, so
+    // the published sample's own SessionKey/SessionNonce still decrypt this
+    // block - which is what lets the plaintext be checked against hand-built
+    // bytes rather than against this module's own ciphertext.
+    const decodedData = decodeProvisioningPdu(result.send[0] as Buffer);
+    expect(decodedData?.type).toBe('data');
+    const { encryptedProvisioningData, mic } = decodedData as ProvisioningData;
+    const plaintext = ccmDecrypt(
+      hex(PROVISIONING_SAMPLE.sessionKey),
+      hex(PROVISIONING_SAMPLE.sessionNonce),
+      encryptedProvisioningData,
+      mic,
+    );
+    expect(plaintext).toEqual(expectedPlaintext);
+  });
+});
+
+// ===========================================================================
+// BUFFER OWNERSHIP (machine.ts's INPUT OWNERSHIP note).
+//
+// Two halves, both measured by a review before being written here.
+//
+// (a) The defensive copies this module already made - the Invite, the
+//     incoming Capabilities PDU, the Start PDU and the Provisioner's own
+//     Public Key PDU - had NO test at all: reverting any of them to a bare
+//     `.subarray` passed all 542 tests. The two sibling modules that do have
+//     aliasing tests (`packet/access.ts`, `packet/lowerTransport.ts`) are the
+//     pattern followed here.
+//
+// (b) The module also RETAINED live references to three caller-owned inputs
+//     (the ephemeral key pair, RandomProvisioner, and the NetKey inside
+//     `provisioningData`). That was a real defect, not only an untested
+//     discipline: zeroing the caller's random after `beginProvisioning`
+//     changed the ConfirmationProvisioner this module went on to send and
+//     the device key it derived, and zeroing the public key broke the
+//     exchange outright - the exact hazard the module's own header invokes
+//     two lines above the key pair, where it quotes the specification
+//     telling a Provisioner to delete its key pair after use. Fixed by
+//     copying in `beginProvisioning`; pinned below.
+//
+// Every case here uses FRESH copies of the shared fixtures, because the
+// point of each is to scribble over a caller's buffer afterwards.
+// ===========================================================================
+
+describe('the machine never keeps a live view into a buffer its caller owns', () => {
+  function freshInput() {
+    return {
+      attentionDuration: PDU_TYPE_SAMPLE_INVITE.fields.attentionDuration,
+      ephemeralKeyPair: {
+        publicKey: Buffer.from(ephemeralKeyPair.publicKey),
+        privateKey: Buffer.from(ephemeralKeyPair.privateKey),
+      },
+      randomProvisioner: Buffer.from(randomProvisioner),
+      provisioningData: {
+        netKey: Buffer.from(provisioningData.netKey),
+        netKeyIndex: provisioningData.netKeyIndex,
+        flags: provisioningData.flags,
+        ivIndex: provisioningData.ivIndex,
+        unicastAddress: provisioningData.unicastAddress,
+      },
+    };
+  }
+
+  /**
+   * Runs the rest of the published exchange from `begun` and asserts that
+   * every remaining PDU, and the final device key, are still the published
+   * ones - i.e. that whatever was scribbled over in between reached nothing.
+   */
+  function expectTheRestOfTheExchangeIsStillPublished(begun: { state: ProvisioningState; send: readonly Buffer[] }) {
+    let result = step(begun.state, hex(PDU_TYPE_SAMPLE_CAPABILITIES.message));
+    expect(result.send).toEqual([hex(PDU_TYPE_SAMPLE_START.message), hex(PDU_TYPE_SAMPLE_PUBLIC_KEY_PROVISIONER.message)]);
+
+    result = step(result.state, hex(PDU_TYPE_SAMPLE_PUBLIC_KEY_DEVICE.message));
+    expect(result.send).toEqual([hex(PDU_TYPE_SAMPLE_CONFIRMATION_PROVISIONER.message)]);
+
+    result = step(result.state, hex(PDU_TYPE_SAMPLE_CONFIRMATION_DEVICE.message));
+    expect(result.send).toEqual([hex(PDU_TYPE_SAMPLE_RANDOM_PROVISIONER.message)]);
+
+    result = step(result.state, hex(PDU_TYPE_SAMPLE_RANDOM_DEVICE.message));
+    expect(result.send).toEqual([hex(PDU_TYPE_SAMPLE_DATA.message)]);
+
+    result = step(result.state, hex(PDU_TYPE_SAMPLE_COMPLETE.message));
+    expect(result.state).toEqual({ phase: 'provisioned', deviceKey: hex(PROVISIONING_CRYPTO_SAMPLE.deviceKey) });
+  }
+
+  // --- (b) inputs handed to beginProvisioning ------------------------------
+
+  test("zeroing the caller's RandomProvisioner after beginProvisioning changes nothing it later sends", () => {
+    const input = freshInput();
+    const begun = beginProvisioning(input);
+    input.randomProvisioner.fill(0x00);
+    expectTheRestOfTheExchangeIsStillPublished(begun);
+  });
+
+  test("zeroing the caller's ephemeral key pair after beginProvisioning changes nothing it later sends", () => {
+    // Section 5.4.2.3 tells a Provisioner to delete its private-public key
+    // pair once the ECDHSecret is computed; a caller may reasonably read
+    // that as "zero the buffers I handed in". It must not break the
+    // exchange that is still running.
+    const input = freshInput();
+    const begun = beginProvisioning(input);
+    input.ephemeralKeyPair.publicKey.fill(0x00);
+    input.ephemeralKeyPair.privateKey.fill(0x00);
+    expectTheRestOfTheExchangeIsStillPublished(begun);
+  });
+
+  test("zeroing the caller's NetKey after beginProvisioning leaves the Provisioning Data block unchanged", () => {
+    const input = freshInput();
+    const begun = beginProvisioning(input);
+    input.provisioningData.netKey.fill(0x00);
+    expectTheRestOfTheExchangeIsStillPublished(begun);
+  });
+
+  test("rewriting the caller's provisioningData numbers after beginProvisioning leaves the Provisioning Data block unchanged", () => {
+    const input = freshInput();
+    const begun = beginProvisioning(input);
+    input.provisioningData.netKeyIndex = 0x0fff;
+    input.provisioningData.flags = 0xff;
+    input.provisioningData.ivIndex = 0xffffffff;
+    input.provisioningData.unicastAddress = 0x7fff;
+    expectTheRestOfTheExchangeIsStillPublished(begun);
+  });
+
+  // --- (a) buffers this module hands back, and the one it is handed --------
+
+  test('overwriting the Invite PDU this module handed back does not change the Confirmation it later computes', () => {
+    // A transport adapter is free to reuse or zero a send buffer once it
+    // believes the bytes are on the wire; `inviteValue` feeds every
+    // ConfirmationSalt computed afterwards (Section 5.4.2.4.1).
+    const begun = beginProvisioning(freshInput());
+    (begun.send[0] as Buffer).fill(0xff);
+    expectTheRestOfTheExchangeIsStillPublished(begun);
+  });
+
+  test('overwriting the incoming Capabilities PDU after the step returns does not change the Confirmation', () => {
+    // The caller's receive buffer, which a real GATT adapter reuses for the
+    // next notification - and `capabilitiesValue` is read much later.
+    const begun = beginProvisioning(freshInput());
+    const capabilitiesBuffer = hex(PDU_TYPE_SAMPLE_CAPABILITIES.message);
+    let result = step(begun.state, capabilitiesBuffer);
+    capabilitiesBuffer.fill(0xff);
+
+    result = step(result.state, hex(PDU_TYPE_SAMPLE_PUBLIC_KEY_DEVICE.message));
+    expect(result.send).toEqual([hex(PDU_TYPE_SAMPLE_CONFIRMATION_PROVISIONER.message)]);
+  });
+
+  test('overwriting the Start and Public Key PDUs this module handed back does not change the Confirmation', () => {
+    // Both are in the same step's `send` array, and both feed
+    // ConfirmationInputs: `startValue` directly, the Provisioner public key
+    // through `ephemeralKeyPair.publicKey`. The `startValue` half of this is
+    // load-bearing (reverting that copy to a view fails this test). The
+    // public-key half is not, and measurement says so: `encodeProvisioningPdu`
+    // builds its output with `Buffer.concat`, which copies, so the sent PDU
+    // can never alias the stored key whatever `onCapabilities` does - see
+    // machine.ts's own BELT AND BRACES note at that site. It is asserted here
+    // anyway because a future encoder that stopped copying would make it
+    // load-bearing overnight, and this is the test that would notice.
+    const begun = beginProvisioning(freshInput());
+    let result = step(begun.state, hex(PDU_TYPE_SAMPLE_CAPABILITIES.message));
+    expect(result.send).toHaveLength(2);
+    (result.send[0] as Buffer).fill(0xff); // Start
+    (result.send[1] as Buffer).fill(0xff); // Public Key (Provisioner)
+
+    result = step(result.state, hex(PDU_TYPE_SAMPLE_PUBLIC_KEY_DEVICE.message));
+    expect(result.send).toEqual([hex(PDU_TYPE_SAMPLE_CONFIRMATION_PROVISIONER.message)]);
+  });
+
+  test('overwriting the Confirmation PDU this module handed back does not change the Random it sends next', () => {
+    // `ownConfirmation` is kept for Section 5.4.2.4.2's "values are equal"
+    // sanity check, and the same bytes went out in `send`.
+    const begun = beginProvisioning(freshInput());
+    let result = step(begun.state, hex(PDU_TYPE_SAMPLE_CAPABILITIES.message));
+    result = step(result.state, hex(PDU_TYPE_SAMPLE_PUBLIC_KEY_DEVICE.message));
+    const sentConfirmation = result.send[0] as Buffer;
+    const sentConfirmationCopy = Buffer.from(sentConfirmation);
+    sentConfirmation.fill(0xff);
+
+    // The device's own Confirmation, which must still be compared against
+    // the unchanged ConfirmationProvisioner rather than against 0xff...
+    result = step(result.state, hex(PDU_TYPE_SAMPLE_CONFIRMATION_DEVICE.message));
+    expect(result.send).toEqual([hex(PDU_TYPE_SAMPLE_RANDOM_PROVISIONER.message)]);
+    expect(sentConfirmationCopy).toEqual(hex(PDU_TYPE_SAMPLE_CONFIRMATION_PROVISIONER.message));
   });
 });

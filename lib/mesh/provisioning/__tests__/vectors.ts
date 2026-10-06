@@ -70,8 +70,12 @@
  * Key Type octet `03`, not Start's `02`, and lists `Public Key X`/`Public Key
  * Y` fields Table 5.28 (Start) does not have. Matched on the fields actually
  * present and the Type octet in `Message`, not on the mis-copied caption -
- * exactly the "match on position and meaning, not on a caption" rule the
- * brief states.
+ * exactly the rule the plan states for this document's wrong captions and
+ * row labels: "Match on position and meaning."
+ * (docs/superpowers/plans/2026-10-06-ble-mesh-provisioning-config.md; an
+ * earlier revision of this note quoted it as "match on position and
+ * meaning, not on a caption" and credited it to the task brief, which
+ * carries neither that sentence nor that clause).
  *
  * SECOND ERRATA NOTE: Section 8.7.5's own field-by-field breakdown of the
  * Provisioning Start sample prints its `Public Key` row as `0000` - TWO

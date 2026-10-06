@@ -30,7 +30,11 @@ import { k1 } from '../crypto/derive';
  *
  * ...and the confirmation value itself (Section 5.4.2.4.1 - the formula is
  * textually identical for both sides, only the Random operand differs; see
- * the ERRATA note below):
+ * the ERRATA note below). NOTATION: the document sets the key name as a
+ * SUBSCRIPT on the function name, which plain text cannot carry, so every
+ * formula quoted in this file renders that subscript with an underscore
+ * (`AES-CMAC_ConfirmationKey`, `HMAC-SHA-256_ConfirmationKey`) - the one
+ * deliberate, systematic departure from verbatim transcription here:
  *
  *   ConfirmationProvisioner = AES-CMAC_ConfirmationKey(RandomProvisioner || AuthValue)
  *   ConfirmationDevice      = AES-CMAC_ConfirmationKey(RandomDevice      || AuthValue)
@@ -56,9 +60,11 @@ import { k1 } from '../crypto/derive';
  *       rows (Section 8.17.1) confirm this second formula, built from
  *       RandomDevice, is the one producing ConfirmationDevice.
  * Matched on the formula's own Random operand and these three independent
- * confirmations, not on the mis-copied left-hand name - the same "match on
- * position and meaning" rule `provisioning/__tests__/vectors.ts` already
- * documents for this same section's table-caption errata. `confirmationValue`
+ * confirmations, not on the mis-copied left-hand name - the same
+ * match-on-position-and-meaning rule `provisioning/__tests__/vectors.ts`
+ * already documents for this same section's table-caption errata (quoted
+ * from the plan there; this cross-reference deliberately names the rule
+ * rather than re-quoting it). `confirmationValue`
  * below is the one function both sides share, taking whichever Random value
  * the caller already knows is its own.
  *
@@ -71,7 +77,7 @@ import { k1 } from '../crypto/derive';
  *
  * "Least significant" means the rightmost (last) bytes of the 16-octet k1
  * output, not the leftmost - settled by the specification's own wording
- * ("the nonce shall be the 13 least significant octets of" a value, and a
+ * ("The nonce shall be the 13 least significant octets of" a value, and a
  * least-significant octet is by definition a low-order one, which in a
  * big-endian encoding sits at the END of the byte string) together with the
  * published sample, which pins the direction concretely: `SessionNonceFull`

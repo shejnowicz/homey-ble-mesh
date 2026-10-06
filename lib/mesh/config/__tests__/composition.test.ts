@@ -170,6 +170,35 @@ describe('parseCompositionData', () => {
       });
     });
 
+    // Relay (bit 0) and Proxy (bit 1) had no isolation case of their own
+    // until a review measured the gap: the ONE published Features value
+    // (0x0003, Section 8.10.1) sets BOTH, and the synthetic cases above set
+    // all four or none, so swapping the two bits' constants outright passed
+    // all 542 tests. That is pointed here, because this task's whole errata
+    // argument is about which of those two bits the published 0x0003 means
+    // (see composition.ts's ERRATA note: the sample's prose says "Relay and
+    // Friend", Table 4.3 says Relay and Proxy). These two cases pin each of
+    // them alone.
+    test('only Relay (bit 0, 0x0001) decodes to relay alone', () => {
+      const buffer = hex(header + '0100' + elementBytes);
+      expect(parseCompositionData(buffer)?.features).toEqual({
+        relay: true,
+        proxy: false,
+        friend: false,
+        lowPower: false,
+      });
+    });
+
+    test('only Proxy (bit 1, 0x0002) decodes to proxy alone', () => {
+      const buffer = hex(header + '0200' + elementBytes);
+      expect(parseCompositionData(buffer)?.features).toEqual({
+        relay: false,
+        proxy: true,
+        friend: false,
+        lowPower: false,
+      });
+    });
+
     test('only Friend (bit 2, 0x0004) decodes to friend alone', () => {
       const buffer = hex(header + '0400' + elementBytes);
       expect(parseCompositionData(buffer)?.features).toEqual({
