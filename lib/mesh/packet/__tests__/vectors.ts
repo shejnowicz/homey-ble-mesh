@@ -683,6 +683,112 @@ export const UPPER_TRANSPORT_SAMPLE_SZMIC = {
 };
 
 /**
+ * Access message sample data (Section 3.7.2 "Access message", Table 3.60
+ * "Access message fields": Opcode 1/2/3 octets, Parameters 0-379 octets).
+ * Fetched the same 9,945,160-byte v1.1 document independently for this task
+ * on 2026-10-06 (same URL, same `</td>`/`</tr>`-before-tag-stripping
+ * method).
+ *
+ * The opcode FORMAT rules themselves (Section 3.7.2.1 "Opcode field", Table
+ * 3.62 "Opcode formats") are:
+ *
+ *   Opcode Format                      | Description
+ *   -----------------------------------|---------------------
+ *   0xxxxxxx (excluding 01111111)      | 1-octet Opcodes
+ *   01111111                           | Reserved for Future Use
+ *   10xxxxxx xxxxxxxx                  | 2-octet Opcodes
+ *   11xxxxxx zzzzzzzz zzzzzzzz         | 3-octet Opcodes
+ *
+ * i.e. 1-octet opcodes are 0x00-0x7E (0x7F reserved), 2-octet opcodes have
+ * their first octet in 0x80-0xBF, and 3-octet ("vendor") opcodes have their
+ * first octet in 0xC0-0xFF with the company identifier in the second/third
+ * octets ("z" in the table). Section 3.7.2.1's own prose: "The company
+ * identifiers are 16-bit values defined by the Bluetooth SIG and are coded
+ * into the second and third octets of the 3-octet opcodes ... using
+ * endianness as defined in Section 3.7.1" - and Section 3.7.1 ("Endianness",
+ * inside the Access layer chapter) states: "All multiple-octet numeric
+ * values in this layer shall be little-endian as described in Section
+ * 3.1.1.2." This is NOT the byte order used by the network/lower transport/
+ * upper transport layers below it: Section 3.1.1 ("Endianness and field
+ * ordering") draws the contrast explicitly - "For the network layer, lower
+ * transport layer, upper transport layer, mesh beacons, and Provisioning,
+ * all multiple-octet numeric values shall be sent in big-endian ... For the
+ * access layer and Foundation Models, all multiple-octet numeric values
+ * shall be little-endian" - i.e. every SRC/DST/SEQ/IV Index this file's
+ * other sections transcribe is big-endian (as `network.ts`/`nonce.ts`
+ * already encode them), while the company identifier packed into a vendor
+ * opcode is little-endian: least-significant octet first. Section 3.7.2.1's
+ * own worked example proves the direction, not just the general rule: "when
+ * the manufacturer-specific opcode is equal to 0x23 and the company
+ * identifier is equal to 0x0136 [4], then the 3-octet opcode is equal to
+ * 0xE3 0x36 0x01" - company ID 0x0136's LOW byte (0x36) is written first,
+ * its HIGH byte (0x01) second.
+ *
+ * Section 3.7.3.4 "Message error procedure" gives the receive-side rule for
+ * an opcode nothing recognises (the reserved value included, since no model
+ * is ever bound to it): "When receiving a message that is not understood by
+ * an element, it shall ignore the message, ... [including when] the opcode
+ * field of the Access message is unknown by the receiving element."
+ *
+ * Three of the five vendor-opcode messages already transcribed above
+ * (#22, #23, #24) publish their own "Access message" block with an explicit
+ * "Opcode" row, independently confirming both the company identifier VALUE
+ * and its byte order straight from the primary source, not merely derived
+ * from the general endianness rule: Message #22/#23 (Section 8.3.22/
+ * 8.3.23): "Opcode : 15 : 000a (Vendor 15 : 000a)" - vendor sub-opcode 0x15,
+ * company ID 0x000A - against wire bytes d5 0a 00 (`UPPER_TRANSPORT_SAMPLE_
+ * VIRTUAL_SHORT_MIC(_SHARED_LABEL).accessPayload` below), where byte1=0x0a
+ * is the company ID's LOW octet and byte2=0x00 its HIGH octet - exactly
+ * what reading them little-endian (0x0a | 0x00<<8 = 0x000a) produces, and
+ * NOT what reading them big-endian (0x0a00 = 2560) would. Message #24
+ * (Section 8.3.24) is more explicit still, captioning the company ID by
+ * name: "Company ID: 0x000A - Cambridge Silicon Radio (See Bluetooth
+ * Assigned Numbers)" and "Vendor Opcode: 0x2A", with its own Access message
+ * row reading "Vendor Opcode : 0x2A : 0x000A (Opcode 2a : Company ID 000a)"
+ * against wire bytes ea 0a 00 (`UPPER_TRANSPORT_SAMPLE_SZMIC.accessPayload`
+ * below) - same company ID, same byte pair, different vendor sub-opcode
+ * (0x2A vs 0x15), so between the two messages the test suite exercises two
+ * different first-octet values while the company-ID byte pair (0x0a, 0x00)
+ * - asymmetric, not a palindrome like 0x0101 - stays fixed, which is what
+ * actually catches a byte-order bug: swapping the two octets changes the
+ * decoded company ID (0x000a vs 0x0a00) regardless of which message's
+ * vendor sub-opcode is under test.
+ *
+ * Messages #6 and #18, transcribed above for their upper-transport rows,
+ * ALSO publish their own "Access message" block with an explicit "Opcode"
+ * row - read here for the first time, independent confirmation that the
+ * leading octet already relied on by `lowerTransport.ts`'s AKF/AID decoding
+ * is genuinely this message's OPCODE octet, not a coincidence of bit
+ * position: Message #6 (Section 8.3.6): "Opcode : 00 (Config AppKey Add)"
+ * against `UPPER_TRANSPORT_SAMPLE_DEVICE_KEY.accessPayload` (leading byte
+ * 0x00 - also the reused-elsewhere 1-octet form's lower boundary value).
+ * Message #18 (Section 8.3.18): "Opcode : 04 (Health Current Status)"
+ * against `UPPER_TRANSPORT_SAMPLE_APPLICATION_KEY.accessPayload` (leading
+ * byte 0x04). Both are reused as-is below (no new constant), per this
+ * file's own "reuse rather than duplicate" convention - search this file for
+ * `accessPayload` to see every opcode form a published sample already
+ * covers before adding another.
+ *
+ * Message #16's own "Access message" block (Section 8.3.16), by contrast, IS
+ * new: nothing above transcribes its plaintext Access message (only its
+ * ENCRYPTED ciphertext, `LOWER_TRANSPORT_SAMPLE_ACCESS_DEVICE_KEY`'s
+ * `upperTransportPdu`, and its Device nonce, `DEVICE_NONCE_SAMPLE_2`, were
+ * read before) - and it is the only sample anywhere in this file with a
+ * genuine 2-octet SIG opcode, so it is the one new fixture this task
+ * actually needs. "Opcode : 8003 (Config AppKey Status)", Status=00,
+ * NetKeyIndex=456, AppKeyIndex=123, "Access message : 800300563412" - wire
+ * bytes 80 03 read in the SAME order Table 3.62 displays them ("10xxxxxx
+ * xxxxxxxx", first octet most significant), matching the document's own
+ * "8003" caption directly: unlike the vendor opcode's embedded company ID,
+ * the 2-octet opcode's own two octets are NOT byte-swapped.
+ */
+export const ACCESS_SAMPLE_CONFIG_APPKEY_STATUS = {
+  opcode: 0x8003,
+  parameters: '00563412',
+  expected: '800300563412',
+};
+
+/**
  * Lower Transport PDU sample data (Section 3.5.2; Table 3.15 "Lower
  * Transport PDU format types", Table 3.17 "Unsegmented Access message
  * format", Table 3.19 "Unsegmented Control message format"). Every sample below
