@@ -2,6 +2,7 @@ import { e } from '../crypto/cmac';
 import { ccmEncrypt, ccmDecrypt } from '../crypto/ccm';
 import { k2 } from '../crypto/derive';
 import { networkNonce } from './nonce';
+import { assertRange, MAX_TTL, MAX_SEQ, MAX_ADDRESS, MAX_IV_INDEX } from './ranges';
 
 /**
  * Builds the on-the-wire Network PDU for a message leaving this node,
@@ -109,11 +110,6 @@ const MANAGED_FLOODING_P = Buffer.from([0x00]);
 const NET_MIC_LENGTH_ACCESS = 4; // 32 bits (Table 3.11, CTL=0).
 const NET_MIC_LENGTH_CONTROL = 8; // 64 bits (Table 3.11, CTL=1).
 
-const MAX_TTL = 0x7f;
-const MAX_SEQ = 0xffffff;
-const MAX_ADDRESS = 0xffff;
-const MAX_IV_INDEX = 0xffffffff;
-
 // Table 3.10's generic TransportPDU width is "8 to 128 bits" (1-16 octets);
 // Section 3.4.4.8 narrows the maximum by CTL: 128 bits (16 octets) for an
 // Access message, 96 bits (12 octets) for a Transport Control message.
@@ -132,10 +128,9 @@ const HEADER_LENGTH = 7; // 1 (IVI|NID) + 6 (obfuscated CTL/TTL/SEQ/SRC), Sectio
 const MIN_ENCRYPTED_LENGTH = DST_LENGTH + MIN_TRANSPORT_PDU_LENGTH + NET_MIC_LENGTH_ACCESS;
 const MIN_PDU_LENGTH = HEADER_LENGTH + MIN_ENCRYPTED_LENGTH;
 
-function assertRange(field: string, value: number, max: number): void {
-  if (!Number.isInteger(value) || value < 0 || value > max) {
-    throw new Error(`network PDU field "${field}" must be an integer in [0, ${max}], got ${value}`);
-  }
+/** Keeps this module's error messages exactly as specific as before `assertRange` moved to `./ranges`. */
+function assertNetworkField(field: string, value: number, max: number): void {
+  assertRange(`network PDU field "${field}"`, value, max);
 }
 
 function assertTransportPduLength(transportPdu: Buffer, ctl: boolean): void {
@@ -148,11 +143,11 @@ function assertTransportPduLength(transportPdu: Buffer, ctl: boolean): void {
 }
 
 export function encodeNetworkPdu(input: NetworkPduInput): Buffer {
-  assertRange('ttl', input.ttl, MAX_TTL);
-  assertRange('seq', input.seq, MAX_SEQ);
-  assertRange('src', input.src, MAX_ADDRESS);
-  assertRange('dst', input.dst, MAX_ADDRESS);
-  assertRange('ivIndex', input.ivIndex, MAX_IV_INDEX);
+  assertNetworkField('ttl', input.ttl, MAX_TTL);
+  assertNetworkField('seq', input.seq, MAX_SEQ);
+  assertNetworkField('src', input.src, MAX_ADDRESS);
+  assertNetworkField('dst', input.dst, MAX_ADDRESS);
+  assertNetworkField('ivIndex', input.ivIndex, MAX_IV_INDEX);
   if (input.networkKey.length !== 16) {
     throw new Error(`network PDU field "networkKey" must be 16 bytes, got ${input.networkKey.length}`);
   }
@@ -219,14 +214,7 @@ export interface DecodeNetworkPduInput {
 }
 
 /** A successfully decoded, authenticated Network PDU - `NetworkPduInput` minus the NetKey/IV Index used to decode it. */
-export interface DecodedNetworkPdu {
-  ctl: boolean;
-  ttl: number;
-  seq: number;
-  src: number;
-  dst: number;
-  transportPdu: Buffer;
-}
+export type DecodedNetworkPdu = Omit<NetworkPduInput, 'networkKey' | 'ivIndex'>;
 
 /**
  * Inverts `encodeNetworkPdu`: recovers a received Network PDU's header and
@@ -279,7 +267,7 @@ export function decodeNetworkPdu(input: DecodeNetworkPduInput): DecodedNetworkPd
   if (input.networkKey.length !== 16) {
     throw new Error(`network PDU field "networkKey" must be 16 bytes, got ${input.networkKey.length}`);
   }
-  assertRange('ivIndex', input.ivIndex, MAX_IV_INDEX);
+  assertNetworkField('ivIndex', input.ivIndex, MAX_IV_INDEX);
 
   // Step 1: derive NID/EncryptionKey/PrivacyKey and check NID first - cheap,
   // and lets us drop traffic for other networks before any AES-CCM work.

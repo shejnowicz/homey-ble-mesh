@@ -12,21 +12,17 @@
  * the sender intended.
  */
 
+import { assertRange, MAX_TTL, MAX_SEQ, MAX_ADDRESS, MAX_IV_INDEX } from './ranges';
+
 const NONCE_LENGTH = 13;
 
 const NONCE_TYPE_NETWORK = 0x00;
 const NONCE_TYPE_APPLICATION = 0x01;
 const NONCE_TYPE_DEVICE = 0x02;
 
-const MAX_TTL = 0x7f; // 7 bits (Table 3.67)
-const MAX_SEQ = 0xffffff; // 24 bits (SEQ is always 3 octets)
-const MAX_ADDRESS = 0xffff; // 16 bits (SRC/DST are always 2 octets)
-const MAX_IV_INDEX = 0xffffffff; // 32 bits (IV Index is always 4 octets)
-
-function assertRange(field: string, value: number, max: number): void {
-  if (!Number.isInteger(value) || value < 0 || value > max) {
-    throw new Error(`nonce field "${field}" must be an integer in [0, ${max}], got ${value}`);
-  }
+/** Keeps this module's error messages exactly as specific as before `assertRange` moved to `./ranges`. */
+function assertNonceField(field: string, value: number, max: number): void {
+  assertRange(`nonce field "${field}"`, value, max);
 }
 
 export interface NetworkNonceInput {
@@ -47,10 +43,10 @@ export interface NetworkNonceInput {
  * Table 3.67) | SEQ (3) | SRC (2) | Pad (2, 0x0000) | IV Index (4).
  */
 export function networkNonce(input: NetworkNonceInput): Buffer {
-  assertRange('ttl', input.ttl, MAX_TTL);
-  assertRange('seq', input.seq, MAX_SEQ);
-  assertRange('src', input.src, MAX_ADDRESS);
-  assertRange('ivIndex', input.ivIndex, MAX_IV_INDEX);
+  assertNonceField('ttl', input.ttl, MAX_TTL);
+  assertNonceField('seq', input.seq, MAX_SEQ);
+  assertNonceField('src', input.src, MAX_ADDRESS);
+  assertNonceField('ivIndex', input.ivIndex, MAX_IV_INDEX);
 
   const nonce = Buffer.alloc(NONCE_LENGTH);
   nonce.writeUInt8(NONCE_TYPE_NETWORK, 0);
@@ -81,10 +77,10 @@ export interface UpperTransportNonceInput {
  * SRC (2) | DST (2) | IV Index (4).
  */
 function upperTransportNonce(nonceType: number, input: UpperTransportNonceInput): Buffer {
-  assertRange('seq', input.seq, MAX_SEQ);
-  assertRange('src', input.src, MAX_ADDRESS);
-  assertRange('dst', input.dst, MAX_ADDRESS);
-  assertRange('ivIndex', input.ivIndex, MAX_IV_INDEX);
+  assertNonceField('seq', input.seq, MAX_SEQ);
+  assertNonceField('src', input.src, MAX_ADDRESS);
+  assertNonceField('dst', input.dst, MAX_ADDRESS);
+  assertNonceField('ivIndex', input.ivIndex, MAX_IV_INDEX);
 
   const nonce = Buffer.alloc(NONCE_LENGTH);
   nonce.writeUInt8(nonceType, 0);
