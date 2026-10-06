@@ -19,7 +19,45 @@
  * from Table 3.65 "Nonce types") and by the row using "DevKey" rather than
  * "AppKey" as the sample's encryption key. The transcribed hex is unaffected
  * by the mislabelling; only the row's English caption is wrong in the
- * source.
+ * source. Re-checked for this task against the same document: every row in
+ * Section 8.3 captioned "Application nonce" was listed with its own first
+ * octet, and exactly two of them — Message #6 (Section 8.3.6) and Message
+ * #16 (Section 8.3.16) — carry 0x02 and sit beside a "DevKey" row; no row
+ * anywhere in Section 8.3 is captioned "Device nonce" at all. The note above
+ * still holds exactly as written.
+ *
+ * A SECOND, UNRELATED DEFECT in the same Section 8.3 sample data, recorded
+ * here because the lower transport layer's work will read precisely the rows
+ * it affects: in Message #22 (Section 8.3.22) and Message #23 (Section
+ * 8.3.23) — and, checked across the whole of Section 8.3 by comparing every
+ * "LowerTransportPDU" row against the other such rows in its own message, in
+ * those two messages ONLY — the "NetworkPDU" block repeats the message's
+ * LowerTransportPDU with a corrupted FIRST OCTET, 0x34 where it should read
+ * 0x66:
+ *
+ *   Message #22: ...3871b904d431526316ca48a0 — the message's own
+ *     LowerTransportUnsegmentedAccessPDU block and the "TransportPDU" row
+ *     inside the very same NetworkPDU block both publish a leading 66; that
+ *     block's own "LowerTransportPDU" row publishes 34.
+ *   Message #23: ...2456db5e3100eef65daa7a38 — same disagreement, same two
+ *     values.
+ *
+ * 0x66 is the correct octet, and this is not a judgement call. It is what
+ * each message's own published lower transport Header row says (SEG=0,
+ * AKF=1, AID=0x26, i.e. 0<<7 | 1<<6 | 0x26 = 0x66, whereas 0x34 would mean
+ * AKF=0 and AID=0x34, contradicting the same block's published AKF and AID),
+ * and it is what AES-CCM actually recovers from each message's published
+ * wire "NetworkPDU" row under the published NetKey — decrypting both PDUs
+ * authenticated cleanly and returned a TransportPDU beginning 66, which
+ * settles it: the authentication tag covers that octet, so a value the tag
+ * verifies cannot be the corrupted one. (Messages #6 and #24 also publish
+ * two differing "LowerTransportPDU" values each, but those are not errata:
+ * each is a two-segment message publishing one row per segment, and each
+ * row agrees with its own segment's "TransportPDU".)
+ *
+ * TRUST, for those two messages: the lower-transport block's own
+ * "LowerTransportPDU" row and the NetworkPDU block's "TransportPDU" row.
+ * DISTRUST: the "LowerTransportPDU" row inside those two NetworkPDU blocks.
  */
 export const hex = (s: string): Buffer => Buffer.from(s.replace(/\s+/g, ''), 'hex');
 
@@ -207,6 +245,62 @@ export const NETWORK_PDU_SAMPLE_3 = {
   dst: 0xffff,
   transportPdu: '665a8bde6d9106ea078a',
   expected: '6848cba437860e5673728a627fb938535508e21a6baf57',
+};
+
+/**
+ * Section 8.3.20 "Message #20": the only sample in this file whose IV Index
+ * is ODD — 0x12345677, least significant bit 1, where every sample above
+ * uses 0x12345678.
+ *
+ * That one bit is why this sample exists. The IV Index reaches the wire in
+ * three different ways, and with an EVEN IV Index all three agree with an
+ * implementation that quietly drops the bit, so none of the samples above
+ * can tell a correct implementation from a broken one:
+ *   - IVI, the leading octet's bit 7 (Table 3.10), is that bit, sent in
+ *     clear;
+ *   - the full 32-bit value is folded into the network nonce (Table 3.66),
+ *     so it is authenticated;
+ *   - the full 32-bit value is folded into the obfuscation's Privacy
+ *     Plaintext (Section 3.9.7.3), so it masks the header.
+ * On the decoding side the same bit decides whether a receiver strips IVI
+ * out of the leading octet before comparing NID (Section 3.9.6.3.1): a
+ * comparison that forgot to would match on an even IV Index and reject
+ * EVERY inbound packet on an odd one. The design follows the IV Index from
+ * secure network beacons, so it does change over time, and that failure
+ * would arrive later, silently, looking like foreign traffic.
+ *
+ * A Health Current Status Access message (CTL=0, so a 32-bit NetMIC per
+ * Table 3.11) from SRC 0x1234 to the all-nodes address 0xffff, SEQ=0x070809,
+ * TTL=0x03. It uses the same managed-flooding security material as the
+ * samples above — the same NetKey, deriving NID 0x68 and EncryptionKey
+ * 0953fa93e7caac9638f58820220a398e — and is deliberately NOT one of Section
+ * 8.3's friendship-credential samples (Messages #4-#5 and #10-#15), which
+ * derive NID 0x5e and EncryptionKey be635105434859f484fc798e043ce40e from a
+ * different k2 input and are not what this module implements.
+ *
+ * Transcription verified the same way as the samples above and, again,
+ * without running the code under test — a standalone AES-CMAC/k2/AES-CCM
+ * script reproduced, from the transcribed inputs alone, every one of this
+ * message's own published intermediate rows: NID 68, EncryptionKey
+ * 0953fa93e7caac9638f58820220a398e, PrivacyKey
+ * 8b84eedec100067d670971dd2aa700cf, Network nonce
+ * 00030708091234000012345677, EncDST || EncTransportPDU
+ * 8c3dc87344a16c787f6b08cc897c, NetMIC 941a5368, Privacy Plaintext
+ * 0000000000123456778c3dc87344a16c, PECB 5fcd59ebfaad, CTL||TTL||SEQ||SRC
+ * 030708091234, and finally the wire NetworkPDU below. The document's own
+ * "IVI NID" row for this message reads e8 = 0x80 | 0x68, which is the
+ * document itself stating that IVI is set here.
+ */
+export const NETWORK_PDU_SAMPLE_ODD_IV = {
+  networkKey: '7dd7364cd842ad18c17c2b820c84c3d6',
+  ivIndex: 0x12345677,
+  ctl: false,
+  ttl: 0x03,
+  seq: 0x070809,
+  src: 0x1234,
+  dst: 0xffff,
+  transportPdu: '669c9803e110fea929e9542d',
+  expected: 'e85cca51e2e8998c3dc87344a16c787f6b08cc897c941a5368',
 };
 
 /**
