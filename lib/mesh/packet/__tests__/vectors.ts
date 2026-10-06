@@ -1,15 +1,49 @@
 /**
- * Nonce and Network PDU sample data transcribed from the Bluetooth SIG
- * "Mesh Protocol" specification v1.1 HTML document
+ * Nonce, Network PDU and Upper Transport PDU sample data transcribed from
+ * the Bluetooth SIG "Mesh Protocol" specification v1.1 HTML document
  * (https://www.bluetooth.com/wp-content/uploads/Files/Specification/HTML/MshPRT_v1.1/out/en/index-en.html),
  * fetched and parsed programmatically (markup stripped, tables flattened to
  * row/field text, no reading off a rendered page) on 2026-10-06.
  *
  * The layouts (Table 3.66 Network nonce format, Table 3.67 CTL and TTL field
  * format, Table 3.68 Application nonce format, Table 3.69 ASZMIC and Pad
- * field format, Table 3.70 Device nonce format, all in Section 3.9.5) and the
- * worked examples below (Section 8.3 "Mesh message sample data", messages
- * #1, #2, #6, #16, #18, #20, #24) came from this same v1.1 document.
+ * field format, Table 3.70 Device nonce format, all in Section 3.9.5; Table
+ * 3.25 Upper Transport Access PDU fields and Figure 3.17 in Section 3.6.2)
+ * and the worked examples below (Section 8.3 "Mesh message sample data",
+ * messages #1, #2, #6, #16, #18, #20, #24) came from this same v1.1
+ * document.
+ *
+ * UPPER TRANSPORT ADDITION (same task that added `upperTransport.ts`): no
+ * new message numbers were needed - the three upper-transport samples below
+ * reuse Messages #6, #18 and #24, already transcribed above for their
+ * nonces, now also transcribing each message's AppKey/DevKey, Access
+ * message, EncAccessMessage, TransMIC and UpperTransportPDU rows. Also
+ * fetched independently for this task (same URL, same 9,945,160-byte HTML,
+ * same method) and found identical to the existing transcription where they
+ * overlap (the three nonces).
+ *
+ * Message #24 ("the Low Power node sends a vendor command to a virtual
+ * address using a 64-bit TransMIC") is addressed to a VIRTUAL address, and
+ * its row publishes a "Label UUID" (f4a002c7fb1e4ca0a469a021de0db875) beside
+ * "DST (Virtual Address)". Section 3.4.2.3 "Virtual address" states the
+ * Label UUID "shall be used as the Additional Data field of the message
+ * integrity check value in the upper transport layer (see Section 3.9.7.1
+ * )", and Section 3.9.7.1 gives the virtual-address case its own formula,
+ * distinct from the unicast/group one:
+ * `EncAccessMessage, TransMIC=AES-CCM_AppKey(application nonce, Access
+ * message, Label UUID)`. Checked directly, independent of this project's own
+ * code, with a standalone `node:crypto` AES-CCM call: encrypting Message
+ * #24's Access message under its published AppKey and application nonce
+ * WITHOUT that Label UUID as additional data produces TransMIC
+ * c77bf543bdb352c1 - not the document's published aa5001f31c01cea6. With the
+ * Label UUID as additional data it reproduces aa5001f31c01cea6 exactly. This
+ * matters because Message #24 is also Section 8.3's only sample with the
+ * ASZMIC bit set (see the existing note on APPLICATION_NONCE_SAMPLE_2 below)
+ * - the one sample this task must reproduce exactly to exercise the 64-bit
+ * TransMIC path - and it cannot be reproduced at all without that Label
+ * UUID, a field the task-2 brief's own `UpperTransportInput` interface did
+ * not include. `labelUuid` was added to that interface for exactly this
+ * reason; see `upperTransport.ts`'s module header for the full account.
  *
  * A labelling quirk in the source document: the per-message sample tables in
  * Section 8.3 reuse the row label "Application nonce" for every upper
@@ -320,3 +354,81 @@ export const NETWORK_PDU_SAMPLE_ODD_IV = {
  * catch a regression in - the authentication check itself.
  */
 export const FOREIGN_NETWORK_KEY_SAME_NID = '00000000000000000000000000000033';
+
+/**
+ * Upper Transport Access PDU sample data (Section 3.6.2, Table 3.25;
+ * encryption rule in Section 3.9.7.1). Each sample's "UpperTransportAccessPDU"
+ * block in its Section 8.3 message publishes the Access message, the
+ * key, the nonce (already cross-checked against the nonce samples above),
+ * EncAccessMessage, TransMIC and the assembled UpperTransportPDU. Only the
+ * fields `encryptUpperTransport`/`decryptUpperTransport` take as input or
+ * produce as output are kept below; `expected` is the UpperTransportPDU
+ * (EncAccessMessage || TransMIC).
+ *
+ * Transcription for all three was independently cross-checked with a
+ * standalone AES-CCM call via `node:crypto` directly (not through
+ * `ccmEncrypt`/`encryptUpperTransport`), reusing each message's
+ * already-known-answer-tested nonce (`APPLICATION_NONCE_SAMPLE_1`,
+ * `DEVICE_NONCE_SAMPLE_1`, `APPLICATION_NONCE_SAMPLE_2` above): every one
+ * reproduced its message's published EncAccessMessage and TransMIC exactly.
+ */
+
+/**
+ * Section 8.3.18 "Message #18": the same Health Current Status message as
+ * APPLICATION_NONCE_SAMPLE_1 - AppKey, unsegmented (so a 32-bit TransMIC,
+ * szmic=false), unicast/group destination (DST 0xffff, no Label UUID
+ * published for this message - not a virtual address).
+ */
+export const UPPER_TRANSPORT_SAMPLE_APPLICATION_KEY = {
+  keyKind: 'application' as const,
+  key: '63964771734fbd76e3b40519d1d94a48',
+  seq: 0x000007,
+  src: 0x1201,
+  dst: 0xffff,
+  ivIndex: 0x12345678,
+  szmic: false,
+  accessPayload: '0400000000',
+  expected: '5a8bde6d9106ea078a',
+};
+
+/**
+ * Section 8.3.6 "Message #6": the same Config AppKey Add response as
+ * DEVICE_NONCE_SAMPLE_1 - DevKey, sent in two lower-transport segments but
+ * still with a 32-bit TransMIC (szmic=false; see the module header on why a
+ * 64-bit TransMIC is not available here, and `DEVICE_NONCE_SAMPLE_1`'s own
+ * note on this row's mislabelled "Application nonce" caption).
+ */
+export const UPPER_TRANSPORT_SAMPLE_DEVICE_KEY = {
+  keyKind: 'device' as const,
+  key: '9d6dd0e96eb25dc19a40ed9914f8f03f',
+  seq: 0x3129ab,
+  src: 0x0003,
+  dst: 0x1201,
+  ivIndex: 0x12345678,
+  szmic: false,
+  accessPayload: '0056341263964771734fbd76e3b40519d1d94a48',
+  expected: 'ee9dddfd2169326d23f3afdfcfdc18c52fdef772e0e17308',
+};
+
+/**
+ * Section 8.3.24 "Message #24": the same vendor command as
+ * APPLICATION_NONCE_SAMPLE_2 - AppKey, segmented with SZMIC=1 (szmic=true,
+ * the only Section 8.3 sample with the ASZMIC bit set), addressed to a
+ * VIRTUAL address (DST 0x9736, hashed from the published Label UUID
+ * f4a002c7fb1e4ca0a469a021de0db875). Reproducing this sample's published
+ * TransMIC requires that Label UUID as AES-CCM additional data - see the
+ * module header above and `upperTransport.ts`'s own header for why
+ * `labelUuid` exists on `UpperTransportInput` at all.
+ */
+export const UPPER_TRANSPORT_SAMPLE_SZMIC = {
+  keyKind: 'application' as const,
+  key: '63964771734fbd76e3b40519d1d94a48',
+  seq: 0x07080d,
+  src: 0x1234,
+  dst: 0x9736,
+  ivIndex: 0x12345677,
+  szmic: true,
+  labelUuid: 'f4a002c7fb1e4ca0a469a021de0db875',
+  accessPayload: 'ea0a00576f726c64',
+  expected: 'c3c51d8e476b28e3aa5001f31c01cea6',
+};
