@@ -240,6 +240,28 @@
  * #7's. Header=00, Parameters=a6ac00000003,
  * LowerTransportPDU=00a6ac00000003 - verified by hand the same way as
  * Message #7's above.
+ *
+ * ACCESS LAYER TASK ADDITION (`access.ts`'s `encodeAccessMessage`/
+ * `decodeAccessMessage`): fetched the same 9,945,160-byte v1.1 document
+ * independently for this task on 2026-10-06 (same URL, same
+ * `</td>`/`</tr>`-before-tag-stripping method). Adds Table 3.60 "Access
+ * message fields" and Table 3.62 "Opcode formats" (both Section 3.7.2/
+ * 3.7.2.1) to the layouts list above, plus Section 3.7.1 "Endianness" (the
+ * access layer's own multi-octet values are little-endian, unlike the
+ * big-endian network/lower/upper transport layers already transcribed
+ * above - see `ACCESS_SAMPLE_CONFIG_APPKEY_STATUS`'s own comment, just
+ * below this header, for the full quote and the published-sample
+ * cross-check). No new message numbers were needed except Message #16
+ * (Section 8.3.16, already listed above for its Device nonce and
+ * encrypted Upper Transport PDU) - what is new is that message's own
+ * plaintext "Access message" block, the only sample in this file with a
+ * genuine 2-octet SIG opcode. Messages #6, #18, #22, #23 and #24's own
+ * "Access message"/"Opcode" rows were ALSO read for the first time here
+ * (their `accessPayload` fields were already transcribed for the upper
+ * transport task, but nothing had read the per-message Opcode row
+ * confirming that leading octet really is this layer's own field) -
+ * reused as-is, not duplicated under new constants, per this file's
+ * established convention.
  */
 export const hex = (s: string): Buffer => Buffer.from(s.replace(/\s+/g, ''), 'hex');
 

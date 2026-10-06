@@ -1,4 +1,12 @@
-import { encodeAccessMessage, decodeAccessMessage } from '../access';
+import {
+  encodeAccessMessage,
+  decodeAccessMessage,
+  makeVendorOpcode,
+  decomposeVendorOpcode,
+  MAX_VENDOR_SUB_OPCODE,
+  MAX_COMPANY_ID,
+} from '../access';
+import { decryptUpperTransport } from '../upperTransport';
 import {
   hex,
   ACCESS_SAMPLE_CONFIG_APPKEY_STATUS,
@@ -7,6 +15,8 @@ import {
   UPPER_TRANSPORT_SAMPLE_VIRTUAL_SHORT_MIC,
   UPPER_TRANSPORT_SAMPLE_VIRTUAL_SHORT_MIC_SHARED_LABEL,
   UPPER_TRANSPORT_SAMPLE_SZMIC,
+  DEVICE_NONCE_SAMPLE_2,
+  LOWER_TRANSPORT_SAMPLE_ACCESS_DEVICE_KEY,
 } from './vectors';
 
 // ===========================================================================
@@ -82,6 +92,35 @@ describe('2-octet opcode (Section 3.7.2.1, Table 3.62)', () => {
       parameters: hex(ACCESS_SAMPLE_CONFIG_APPKEY_STATUS.parameters),
     });
     expect(pdu).toEqual(hex(ACCESS_SAMPLE_CONFIG_APPKEY_STATUS.expected));
+  });
+});
+
+// ===========================================================================
+// Binding ACCESS_SAMPLE_CONFIG_APPKEY_STATUS to its OWN message's already-
+// transcribed ciphertext (review item 4): `vectors.ts`'s own stated
+// convention is that a new transcription gets bound to its siblings so a
+// future edit that silently diverges fails a test instead of sitting
+// unread. Message #16's DevKey, Device nonce fields and encrypted
+// UpperTransportPdu were all already in this file (for a different task);
+// this decrypts them with `upperTransport.ts` (already built, already
+// gated) and checks the plaintext is exactly this task's new access
+// payload - everything needed was already in the file, nothing new was
+// transcribed to write this test.
+// ===========================================================================
+
+describe('ACCESS_SAMPLE_CONFIG_APPKEY_STATUS cross-checked against Message #16\'s own ciphertext', () => {
+  test('decrypting Message #16\'s Upper Transport PDU under its DevKey yields the new access payload', () => {
+    const plaintext = decryptUpperTransport({
+      key: hex(UPPER_TRANSPORT_SAMPLE_DEVICE_KEY.key), // Message #16's own "DevKey" row - the SAME DevKey as Message #6 (Section 8.3.16).
+      keyKind: 'device',
+      seq: DEVICE_NONCE_SAMPLE_2.seq,
+      src: DEVICE_NONCE_SAMPLE_2.src,
+      dst: DEVICE_NONCE_SAMPLE_2.dst,
+      ivIndex: DEVICE_NONCE_SAMPLE_2.ivIndex,
+      szmic: false, // unsegmented (Section 8.3.16), so the 32-bit TransMIC.
+      upperTransportPdu: hex(LOWER_TRANSPORT_SAMPLE_ACCESS_DEVICE_KEY.upperTransportPdu),
+    });
+    expect(plaintext).toEqual(hex(ACCESS_SAMPLE_CONFIG_APPKEY_STATUS.expected));
   });
 });
 
@@ -200,6 +239,51 @@ describe('vendor opcode company identifier byte order (Section 3.7.1, Section 3.
 });
 
 // ===========================================================================
+// makeVendorOpcode/decomposeVendorOpcode (exported constructor/destructor
+// for the vendor form's packed `opcode` number) - review item 3: these are
+// the one supported way to build/read a vendor opcode from its two logical
+// parts, so a later model layer does not have to re-derive the shift
+// amounts in the module header's comments by hand.
+// ===========================================================================
+
+describe('makeVendorOpcode/decomposeVendorOpcode', () => {
+  // Round-trips against the same published samples as the known-answer
+  // tests above, so this is checked against real sub-opcode/company pairs,
+  // not just arbitrary numbers.
+  test.each([
+    { label: 'Messages #22/#23', subOpcode: 0x15, companyId: 0x000a, opcode: 0xd5000a },
+    { label: 'Message #24', subOpcode: 0x2a, companyId: 0x000a, opcode: 0xea000a },
+  ])('$label: makeVendorOpcode/decomposeVendorOpcode are inverses', ({ subOpcode, companyId, opcode }) => {
+    expect(makeVendorOpcode(subOpcode, companyId)).toBe(opcode);
+    expect(decomposeVendorOpcode(opcode)).toEqual({ subOpcode, companyId });
+  });
+
+  test('decodeAccessMessage/encodeAccessMessage agree with makeVendorOpcode/decomposeVendorOpcode', () => {
+    const decoded = decodeAccessMessage(hex(UPPER_TRANSPORT_SAMPLE_SZMIC.accessPayload));
+    expect(decomposeVendorOpcode(decoded!.opcode)).toEqual({ subOpcode: 0x2a, companyId: 0x000a });
+    expect(encodeAccessMessage({ opcode: makeVendorOpcode(0x2a, 0x000a), parameters: decoded!.parameters })).toEqual(
+      hex(UPPER_TRANSPORT_SAMPLE_SZMIC.accessPayload),
+    );
+  });
+
+  test('makeVendorOpcode rejects an out-of-range sub-opcode or company identifier', () => {
+    expect(() => makeVendorOpcode(MAX_VENDOR_SUB_OPCODE + 1, 0)).toThrow(/access field "subOpcode"/);
+    expect(() => makeVendorOpcode(0, MAX_COMPANY_ID + 1)).toThrow(/access field "companyId"/);
+    expect(() => makeVendorOpcode(-1, 0)).toThrow(/access field "subOpcode"/);
+  });
+
+  test('makeVendorOpcode accepts the sub-opcode/company-ID extremes', () => {
+    expect(makeVendorOpcode(0, 0)).toBe(0xc00000);
+    expect(makeVendorOpcode(MAX_VENDOR_SUB_OPCODE, MAX_COMPANY_ID)).toBe(0xffffff);
+  });
+
+  test('decomposeVendorOpcode rejects an opcode outside the vendor form\'s range', () => {
+    expect(() => decomposeVendorOpcode(0x04)).toThrow(/access field "opcode" must be a vendor opcode/);
+    expect(() => decomposeVendorOpcode(0x8003)).toThrow(/access field "opcode" must be a vendor opcode/);
+  });
+});
+
+// ===========================================================================
 // Reserved opcode (Table 3.62: "01111111 | Reserved for Future Use"),
 // Section 3.7.3.4 "Message error procedure": an unrecognised opcode is
 // ignored by a receiver, never treated as a throw-worthy malformed PDU.
@@ -224,17 +308,22 @@ describe('reserved opcode 0x7F (Table 3.62)', () => {
 // form, derived from the transcribed ranges rather than from running the
 // code under test.
 //
-// NOTE on the vendor boundaries specifically: 0xC00000 and 0xFFFFFF carry
-// company-ID octet pairs (0x00/0x00 and 0xFF/0xFF) that are THEMSELVES
-// palindromes, so neither boundary test can tell a correct little-endian
-// decode apart from an accidentally big-endian one - confirmed live by the
-// byte-swap mutation in the task report, which left both of these two
-// tests passing while failing the asymmetric known-answer tests above
-// (Messages #22/#23/#24, company 0x000a). The boundary tests below are
-// still kept, because they catch a DIFFERENT bug (an octet misclassified
-// into the wrong form at all), and the asymmetric known-answer tests above
-// are what carries the byte-order burden - recorded here so a future reader
-// does not mistake either pair of boundary tests for byte-order coverage.
+// NOTE on the two EXACT form boundaries specifically: 0xC00000 and
+// 0xFFFFFF carry company-ID octet pairs (0x00/0x00 and 0xFF/0xFF) that are
+// THEMSELVES palindromes, so neither of those two rows alone can tell a
+// correct little-endian decode apart from an accidentally big-endian one -
+// confirmed live by the byte-swap mutation in the task report, which left
+// both of those two rows passing while failing the asymmetric known-answer
+// tests elsewhere in this file (Messages #22/#23/#24, company 0x000a).
+// Rather than leave that gap resting only on fixtures that could be moved
+// or replaced by a future refactor without anyone noticing the byte-order
+// coverage went with them, the THIRD vendor row below is constructed - not
+// transcribed, same as the other two - one step inside the lower boundary
+// (company 0x0001, i.e. octets 0x01/0x00: asymmetric) specifically so a
+// byte-order bug is caught by the boundary table itself, not only by the
+// published samples. Confirmed this row passes against the real code and
+// fails under the same byte-swap mutation while the other two rows stay
+// blind to it (see the task report's "item 1" entry for the exact numbers).
 // ===========================================================================
 
 describe('opcode form boundaries (Table 3.62)', () => {
@@ -244,6 +333,11 @@ describe('opcode form boundaries (Table 3.62)', () => {
     { label: '2-octet lower boundary', opcode: 0x8000, wire: '8000' },
     { label: '2-octet upper boundary', opcode: 0xbfff, wire: 'bfff' },
     { label: 'vendor lower boundary (sub-opcode 0, company 0)', opcode: 0xc00000, wire: 'c00000' },
+    {
+      label: 'vendor just inside the lower boundary (company 0x0001, asymmetric octets)',
+      opcode: 0xc00001,
+      wire: 'c00100',
+    },
     { label: 'vendor upper boundary (sub-opcode 0x3F, company 0xFFFF)', opcode: 0xffffff, wire: 'ffffff' },
   ])('encodeAccessMessage: $label', ({ opcode, wire }) => {
     expect(encodeAccessMessage({ opcode, parameters: Buffer.alloc(0) })).toEqual(hex(wire));
@@ -255,6 +349,11 @@ describe('opcode form boundaries (Table 3.62)', () => {
     { label: '2-octet lower boundary', opcode: 0x8000, wire: '8000' },
     { label: '2-octet upper boundary', opcode: 0xbfff, wire: 'bfff' },
     { label: 'vendor lower boundary (sub-opcode 0, company 0)', opcode: 0xc00000, wire: 'c00000' },
+    {
+      label: 'vendor just inside the lower boundary (company 0x0001, asymmetric octets)',
+      opcode: 0xc00001,
+      wire: 'c00100',
+    },
     { label: 'vendor upper boundary (sub-opcode 0x3F, company 0xFFFF)', opcode: 0xffffff, wire: 'ffffff' },
   ])('decodeAccessMessage: $label', ({ opcode, wire }) => {
     expect(decodeAccessMessage(hex(wire))).toEqual({ opcode, parameters: Buffer.alloc(0) });

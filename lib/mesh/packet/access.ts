@@ -99,6 +99,13 @@ import { assertRange } from './ranges';
  * encode/decode pair (both sides would be equally wrong), but it could
  * never reproduce the SPECIFICATION's own published company identifier for
  * a known wire sample, which is what this module's tests check against.
+ *
+ * `makeVendorOpcode`/`decomposeVendorOpcode` (exported, below) are the one
+ * supported way to build/read a vendor `opcode` number from its two
+ * logical parts - a later model layer should call these rather than
+ * re-deriving the shift amounts above by hand; `encodeOpcode`/
+ * `decodeAccessMessage` themselves are built on these two functions, not a
+ * second, independent copy of the same bit arithmetic.
  */
 
 // Table 3.62: 1-octet opcodes are 0x00-0x7E; 0x7F is reserved.
@@ -111,13 +118,18 @@ const RESERVED_OPCODE = 0x7f;
 const MIN_2_OCTET_OPCODE = 0x8000;
 const MAX_2_OCTET_OPCODE = 0xbfff;
 
-// Table 3.62: a 3-octet (vendor) opcode's first octet is 0xC0-0xFF. This
-// module's own `opcode` packing (module header) keeps that same first octet
-// in bits 23-16 and the little-endian-corrected 16-bit company identifier in
-// bits 15-0, so the full range is 0xC00000-0xFFFFFF.
-const MIN_VENDOR_OPCODE = 0xc00000;
-const MAX_VENDOR_OPCODE = 0xffffff;
-const VENDOR_COMPANY_ID_MASK = 0xffff;
+// Table 3.62: a 3-octet (vendor) opcode's first octet is 0xC0-0xFF: the top
+// two bits (0b11) are the form marker, the bottom six are the vendor-specific
+// sub-opcode (Section 3.7.2.1: "64 3-octet opcodes available per company
+// identifier"). This module's own `opcode` packing (module header) keeps
+// that same first octet in bits 23-16 and the little-endian-corrected
+// 16-bit company identifier in bits 15-0, so the full range is
+// 0xC00000-0xFFFFFF.
+const VENDOR_FORM_MARKER = 0xc0; // 0b11000000.
+export const MAX_VENDOR_SUB_OPCODE = 0x3f; // 6 bits (Table 3.62).
+export const MAX_COMPANY_ID = 0xffff; // 16 bits (Section 3.7.2.1: "16-bit values").
+const MIN_VENDOR_OPCODE = VENDOR_FORM_MARKER << 16; // 0xC00000.
+const MAX_VENDOR_OPCODE = ((VENDOR_FORM_MARKER | MAX_VENDOR_SUB_OPCODE) << 16) | MAX_COMPANY_ID; // 0xFFFFFF.
 
 export interface AccessMessage {
   /**
@@ -134,6 +146,46 @@ export interface AccessMessage {
 /** Keeps this module's error messages prefixed consistently with the rest of the packet layer. */
 function assertAccessField(field: string, value: number, max: number): void {
   assertRange(`access field "${field}"`, value, max);
+}
+
+/**
+ * Builds this module's packed vendor-opcode `number` (the module header's
+ * "IN-MEMORY `opcode` ENCODING" table) from its two logical parts: the
+ * 6-bit vendor-specific sub-opcode and the 16-bit company identifier - the
+ * identifier in its ordinary, non-swapped numeric form (e.g. 0x000a for
+ * "Cambridge Silicon Radio", Section 8.3.24), NOT the little-endian wire
+ * byte order `encodeOpcode`/`decodeAccessMessage` read/write at the wire
+ * level a few lines below. Exported, with `decomposeVendorOpcode` below,
+ * so a later model layer constructs and destructures vendor opcodes
+ * through one shared, tested convention instead of re-deriving these
+ * shifts by hand from this module's comments - both functions are also
+ * what `encodeOpcode`/`decodeAccessMessage` themselves call, so there is
+ * exactly one place this packing is defined, not two copies that could
+ * drift apart.
+ */
+export function makeVendorOpcode(subOpcode: number, companyId: number): number {
+  assertAccessField('subOpcode', subOpcode, MAX_VENDOR_SUB_OPCODE);
+  assertAccessField('companyId', companyId, MAX_COMPANY_ID);
+  return ((VENDOR_FORM_MARKER | subOpcode) << 16) | companyId;
+}
+
+/**
+ * Inverts `makeVendorOpcode`. Throws, rather than returning `null`, when
+ * `opcode` is not in the vendor form's range at all - the same "caller
+ * mistake, not malformed wire data" stance `encodeOpcode` already takes
+ * for an out-of-range `opcode` number (this function never sees wire
+ * bytes, only this module's own in-memory representation).
+ */
+export function decomposeVendorOpcode(opcode: number): { subOpcode: number; companyId: number } {
+  if (!Number.isInteger(opcode) || opcode < MIN_VENDOR_OPCODE || opcode > MAX_VENDOR_OPCODE) {
+    throw new Error(
+      `access field "opcode" must be a vendor opcode (0x${MIN_VENDOR_OPCODE.toString(16)}-0x${MAX_VENDOR_OPCODE.toString(16)}, Table 3.62), got ${opcode}`,
+    );
+  }
+  return {
+    subOpcode: (opcode >>> 16) & MAX_VENDOR_SUB_OPCODE,
+    companyId: opcode & MAX_COMPANY_ID,
+  };
 }
 
 /**
@@ -160,8 +212,8 @@ function encodeOpcode(opcode: number): Buffer {
     return Buffer.from([(opcode >>> 8) & 0xff, opcode & 0xff]);
   }
   if (opcode >= MIN_VENDOR_OPCODE && opcode <= MAX_VENDOR_OPCODE) {
-    const firstOctet = (opcode >>> 16) & 0xff;
-    const companyId = opcode & VENDOR_COMPANY_ID_MASK;
+    const { subOpcode, companyId } = decomposeVendorOpcode(opcode);
+    const firstOctet = VENDOR_FORM_MARKER | subOpcode;
     // Little-endian company identifier (Section 3.7.1/3.7.2.1): low octet
     // of the 16-bit value first, high octet second - see the module header.
     return Buffer.from([firstOctet, companyId & 0xff, (companyId >>> 8) & 0xff]);
@@ -235,8 +287,9 @@ export function decodeAccessMessage(pdu: Buffer): AccessMessage | null {
   // Little-endian company identifier (Section 3.7.1/3.7.2.1) - see the
   // module header's worked example and published-sample cross-check.
   const companyId = companyLowOctet | (companyHighOctet << 8);
+  const subOpcode = firstOctet & MAX_VENDOR_SUB_OPCODE;
   return {
-    opcode: (firstOctet << 16) | companyId,
+    opcode: makeVendorOpcode(subOpcode, companyId),
     parameters: Buffer.from(pdu.subarray(3)),
   };
 }
