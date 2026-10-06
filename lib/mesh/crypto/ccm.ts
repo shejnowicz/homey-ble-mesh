@@ -33,12 +33,17 @@ export function ccmDecrypt(
   if (!MESH_MIC_LENGTHS.has(tag.length)) {
     // Not a length mesh ever produces. This is not a programming error: a
     // parser slicing a MIC off a truncated foreign packet reaches exactly
-    // this, because Buffer.subarray clamps instead of erroring, so a short
-    // or malformed packet yields a tag of some other length. Node itself
-    // would throw ERR_CRYPTO_INVALID_AUTH_TAG for most illegal lengths here,
-    // which would be indistinguishable from the genuine caller bugs below —
-    // so this is checked explicitly, before any of that is reached, and
-    // dropped quietly like any other foreign traffic.
+    // this, because `subarray` does not clamp a negative end index to zero
+    // - it takes a negative end relative to the buffer's own length
+    // (`length + end`, and only THAT result is clamped at 0 if it is still
+    // negative; measured directly, see the same measurement spelled out in
+    // `upperTransport.ts`'s `decryptUpperTransport`), so a short or
+    // malformed packet yields a tag of some other, non-mesh length rather
+    // than erroring. Node itself would throw ERR_CRYPTO_INVALID_AUTH_TAG for
+    // most illegal lengths here, which would be indistinguishable from the
+    // genuine caller bugs below — so this is checked explicitly, before any
+    // of that is reached, and dropped quietly like any other foreign
+    // traffic.
     return null;
   }
   try {
