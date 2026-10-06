@@ -575,6 +575,43 @@ export interface SegmentAck {
    * bits), not something `encodeSegmentAck`/`decodeSegmentAck` enforce
    * themselves: a Segment Acknowledgment message carries no SegN field of
    * its own, so neither function has one to mask against here.
+   *
+   * HAZARD - 0x00000000 is NOT "no segments received yet". It is a
+   * distinct, reserved value meaning CANCEL/REJECT, spelled out in two
+   * places:
+   * - Section 3.5.3.3.2 "Reception of Segment Acknowledgment messages"
+   *   (the SENDING node's own behavior on receiving one): "When a Segment
+   *   Acknowledgment message that is a valid acknowledgment for a
+   *   segmented message with the AckedSegments field set to 0x00000000 is
+   *   received, then the transmission of the Upper Transport PDU shall be
+   *   immediately canceled, and the upper transport layer shall be
+   *   notified that the transmission of the Upper Transport PDU has been
+   *   canceled."
+   * - Section 3.5.3.4 "Reassembly behavior" (the RECEIVING node's own
+   *   behavior when it rejects a message): "When the Processing Result is
+   *   Message Rejected and the message is destined to a unicast address,
+   *   the lower transport layer shall respond with a Segment
+   *   Acknowledgment message with the AckedSegments field set to
+   *   0x00000000."
+   *
+   * So an all-zero field is a REJECTION response (and, read back by the
+   * sender, an instruction to abandon the transfer immediately) - never an
+   * empty/"nothing yet" placeholder. `blockAckFrom` (`./reassembly`)
+   * happens to return exactly 0 for a freshly-started `ReassemblyState`
+   * with no segment slots filled, which is harmless ONLY because that
+   * function is never actually reachable before at least one segment has
+   * already been stored (a `ReassemblyState` is created by `acceptSegment`
+   * itself storing the first segment, not before). A caller that invented
+   * a reason to call `blockAckFrom` on an empty/not-yet-started state - or
+   * otherwise passed a literal 0 into this field to mean "no segments so
+   * far" - would transmit a CANCEL/REJECT to a sender that is still
+   * mid-transmission, not the inert "nothing received" value it might look
+   * like. Neither `encodeSegmentAck` nor `decodeSegmentAck` special-cases
+   * 0 here (Table 3.21 does not ask either direction to), so this is a
+   * caller discipline, not a guard this module enforces - flagged here for
+   * whichever later layer drives retransmission/acknowledgment timing,
+   * since it is the first caller that could get this wrong and it will
+   * read this comment, not re-derive the hazard from the spec itself.
    */
   blockAck: number;
 }

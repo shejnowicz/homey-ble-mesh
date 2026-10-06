@@ -1042,6 +1042,55 @@ describe('Segment Acknowledgment message (Section 3.5.2.3.1, Table 3.21)', () =>
     expect(parameters[0]! & 0x80).toBe(0); // OBO bit clear.
     expect(decodeSegmentAck(parameters)).toEqual(ack);
   });
+
+  // Review finding (pinning, not fixing - the reviewer confirmed the
+  // shipped decoder already behaves correctly): Table 3.21 marks RFU
+  // (bits 1-0 of Parameters octet 1) "Reserved for Future Use", and
+  // Section 1.3.2 "Reserved for Future Use" states the general receive-side
+  // rule for every RFU field in this specification, verbatim: "When a field
+  // value is a bit field, unassigned bits can be marked as Reserved for
+  // Future Use and shall be set to 0. Implementations that receive a
+  // message that contains a Reserved for Future Use bit that is set to 1
+  // shall process the message as if that bit was set to 0" - i.e. ignore
+  // it, don't reject the message. `decodeSegmentAck` already does this (it
+  // masks those two bits out of `secondByte` before ever using it), but
+  // nothing asserted it - making the decoder reject a non-zero-RFU
+  // Parameters field still passed every test before this one was added.
+  // Built from Message #7's own published Parameters (a6ac00000002) with
+  // its own RFU bits (currently 0, per that sample) forced to 1 (0b11):
+  // octet 1 goes from 0xac (1010 1100) to 0xaf (1010 1111).
+  test('decodeSegmentAck ignores the reserved bits (RFU set to 1) rather than rejecting the message (Table 3.21; Section 1.3.2)', () => {
+    const withReservedBitsSet = Buffer.from(LOWER_TRANSPORT_SAMPLE_SEGMENT_ACK_1.parameters, 'hex');
+    withReservedBitsSet[1] = (withReservedBitsSet[1] as number) | 0x03; // force RFU (bits 1-0) to 1.
+    expect(withReservedBitsSet.toString('hex')).toBe('a6af00000002'); // 0xac | 0x03 = 0xaf.
+
+    const decoded = decodeSegmentAck(withReservedBitsSet);
+    expect(decoded).toEqual({
+      obo: LOWER_TRANSPORT_SAMPLE_SEGMENT_ACK_1.obo,
+      seqZero: LOWER_TRANSPORT_SAMPLE_SEGMENT_ACK_1.seqZero,
+      blockAck: LOWER_TRANSPORT_SAMPLE_SEGMENT_ACK_1.blockAck,
+    });
+  });
+
+  // Review finding: nothing pinned that `encodeSegmentAck` allocates a
+  // FRESH buffer per call - replacing `Buffer.alloc(...)` with a shared,
+  // module-level buffer reused (and overwritten) on every call still
+  // passed every test above a call that merely checks each call's OWN
+  // return value in isolation. Scoped to this function only, not the
+  // file's other encoders (`encodeUnsegmentedAccess`,
+  // `encodeUnsegmentedControl`, `segmentAccessMessage`) - the same gap
+  // exists there too, but it is pre-existing, already-reviewed code this
+  // task did not touch; fixing/covering it belongs with whichever task
+  // revisits those functions, not this one.
+  test('encodeSegmentAck does not reuse a buffer across calls - an earlier result is unaffected by a later call', () => {
+    const first = encodeSegmentAck({ obo: true, seqZero: 0x001, blockAck: 0x00000001 });
+    const firstSnapshot = Buffer.from(first);
+
+    const second = encodeSegmentAck({ obo: false, seqZero: 0x1fff, blockAck: 0xffffffff });
+
+    expect(first).toEqual(firstSnapshot); // unchanged by the second call.
+    expect(second).not.toEqual(first); // genuinely a different buffer's worth of bytes.
+  });
 });
 
 // `blockAckFrom` lives in `./reassembly`, not here, to avoid an import
@@ -1094,5 +1143,53 @@ describe('Segment Acknowledgment message: blockAckFrom (./reassembly) feeds enco
     const ack: SegmentAck = { obo: true, seqZero: complete.state.seqZero, blockAck };
     const parameters = encodeSegmentAck(ack);
     expect(decodeSegmentAck(parameters)).toEqual(ack);
+  });
+
+  // Review finding: both tests above acknowledge a CONTIGUOUS run of
+  // segments (just segment 0, or every segment 0..segN) - the one shape a
+  // bit-position error is least likely to be caught by, since a reversed
+  // or off-by-one mapping can still happen to look "mostly right" on a
+  // solid run. A GAP (some segment received, the next one missing, then
+  // another received) is the realistic case over a lossy radio link, and
+  // it is the case where a wrong bit position actually changes which
+  // segments a sender would retransmit - scoped here, not deferred to a
+  // future retransmission-driving layer, because this test is about THIS
+  // module's own integration boundary (does a real, gapped
+  // `ReassemblyState` compose correctly through `blockAckFrom` into
+  // `encodeSegmentAck`/`decodeSegmentAck`), not about retransmission
+  // policy itself - no such layer exists yet in this codebase to own it,
+  // and the bit-position hazard this guards against lives squarely at the
+  // encode/decode boundary this task built.
+  //
+  // CONSTRUCTED (same style as reassembly.test.ts's own 3-segment fixture):
+  // a 37-octet Upper Transport PDU - ceil(37/12)-1 = 3, so 4 segments
+  // (12+12+12+1 octets) - reusing Message #24's own AKF/AID/SZMIC/SeqZero
+  // so the header bits are genuinely self-consistent (segmentAccessMessage,
+  // already verified elsewhere in this file), with segments 0 and 2
+  // accepted and 1 and 3 left missing.
+  test('a 4-segment reassembly with a GAP (segments 0 and 2 present, 1 and 3 missing) produces a non-contiguous bitmask that still round-trips correctly', () => {
+    const FOUR_SEGMENT_UPPER_TRANSPORT_PDU = Buffer.alloc(37, 0xaa);
+    const segments = segmentAccessMessage({
+      akf: LOWER_TRANSPORT_SAMPLE_SEGMENTED.akf,
+      aid: LOWER_TRANSPORT_SAMPLE_SEGMENTED.aid,
+      szmic: LOWER_TRANSPORT_SAMPLE_SEGMENTED.szmic,
+      seqZero: LOWER_TRANSPORT_SAMPLE_SEGMENTED.seqZero,
+      upperTransportPdu: FOUR_SEGMENT_UPPER_TRANSPORT_PDU,
+    });
+    expect(segments).toHaveLength(4); // sanity: this really is a 4-segment fixture, not 2 or 3.
+
+    const afterSeg0 = acceptSegment(null, SRC_24, segments[0] as Buffer);
+    if (afterSeg0.kind !== 'incomplete') throw new Error('expected incomplete after only segment 0');
+    const afterSeg2 = acceptSegment(afterSeg0.state, SRC_24, segments[2] as Buffer);
+    if (afterSeg2.kind !== 'incomplete') throw new Error('expected incomplete after segments 0 and 2 (1 and 3 still missing)');
+
+    const blockAck = blockAckFrom(afterSeg2.state);
+    expect(blockAck).toBe(0b0101); // segment 0 AND segment 2 - NOT a contiguous run, unlike every test above.
+
+    const ack: SegmentAck = { obo: false, seqZero: afterSeg2.state.seqZero, blockAck };
+    const parameters = encodeSegmentAck(ack);
+    expect(decodeSegmentAck(parameters)).toEqual(ack);
+    // Decisive: the wire bytes carry bit 0 AND bit 2, nothing in between.
+    expect(parameters.readUInt32BE(2)).toBe(0b0101);
   });
 });

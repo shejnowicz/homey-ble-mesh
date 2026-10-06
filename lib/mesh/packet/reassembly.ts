@@ -69,7 +69,7 @@ import { assertRange, MAX_ADDRESS } from './ranges';
  *   `new Array(n).fill(undefined)` or an equivalent that leaves no holes,
  *   exactly as this module's own code does.
  *
- * `blockAckFrom` lives in this file, not next to the rest of the (future)
+ * `blockAckFrom` lives in this file, not next to the rest of the
  * Segment Acknowledgment message code in `lowerTransport.ts`, purely to
  * avoid an import cycle: it reads `ReassemblyState`, so putting it there
  * would make `lowerTransport.ts` import this module while this module
@@ -289,7 +289,7 @@ export function acceptSegment(state: ReassemblyState | null, src: number, pdu: B
 }
 
 /**
- * Builds the 32-bit AckedSegments field of a (future) Segment Acknowledgment
+ * Builds the 32-bit AckedSegments field of a Segment Acknowledgment
  * message (Section 3.5.2.3.1, Table 3.21) from the segments received so
  * far: "The least significant bit, bit 0, shall represent segment 0; and
  * the most significant bit, bit 31, shall represent segment 31. If bit n is
