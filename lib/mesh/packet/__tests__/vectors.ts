@@ -841,9 +841,14 @@ export const LOWER_TRANSPORT_SAMPLE_SEGMENTED = {
  * closed for the unsegmented case by LOWER_TRANSPORT_SAMPLE_ACCESS_
  * DEVICE_KEY, for the same reason: every other segmented sample here has
  * AKF=1/SZMIC=1, so a decoder that silently ignored either bit would still
- * pass without this - confirmed by mutation: removing this sample and
- * re-running an AKF-blind and a SZMIC-blind mutation each left the rest of
- * the suite green, both caught only by this sample).
+ * pass without this - confirmed by mutation: with this sample's three
+ * encode/decode tests skipped, an AKF-blind mutation and, separately, a
+ * SZMIC-blind one (both the same "hardcoded true" shape the unsegmented
+ * case's own AKF mutation above uses) each leave the rest of
+ * `lowerTransport.test.ts` fully green (0 failed); with those three tests
+ * enabled, each mutation fails exactly those three and nothing else - this
+ * sample is the only thing in the suite standing between either bug and a
+ * green gate).
  *
  * Segment #0's own block: CTL=00, TTL=04, SEQ=3129ab, SRC=0003, DST=1201,
  * SEG=01, AKF=00, AID=00, SZMIC=00, SeqZero=9ab, SegO=00, SegN=01,
