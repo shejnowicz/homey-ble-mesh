@@ -9,7 +9,7 @@
  * format, Table 3.68 Application nonce format, Table 3.69 ASZMIC and Pad
  * field format, Table 3.70 Device nonce format, all in Section 3.9.5) and the
  * worked examples below (Section 8.3 "Mesh message sample data", messages
- * #1, #2, #6, #16, #18, #24) came from this same v1.1 document.
+ * #1, #2, #6, #16, #18, #20, #24) came from this same v1.1 document.
  *
  * A labelling quirk in the source document: the per-message sample tables in
  * Section 8.3 reuse the row label "Application nonce" for every upper
