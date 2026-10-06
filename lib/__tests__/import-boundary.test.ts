@@ -7,13 +7,21 @@ import { join } from 'node:path';
  * walks every .ts file under lib/mesh and enforces that for real, rather
  * than leaving it as a comment (see lib/mesh/index.ts).
  *
- * This checker deliberately lives OUTSIDE lib/mesh (at lib/__tests__, a
- * sibling of lib/mesh) rather than inside it: the check itself needs
- * node:fs and node:path to walk the tree, and living outside the directory
- * it polices means it is never itself a file the rule has to make an
- * exception for.
+ * lib/models (the Bluetooth SIG Mesh Model layer - lighting et al., built on
+ * top of lib/mesh/packet/access.ts) is held to the exact same rule (this
+ * project's own ruling for that plan of work, not a separate relaxation):
+ * a model is pure wire-format encode/decode, with no more business sending
+ * I/O than the packet layer underneath it has. Both roots are walked by the
+ * same loop below, rather than lib/models getting a second, drifted copy of
+ * this check.
+ *
+ * This checker deliberately lives OUTSIDE both policed directories (at
+ * lib/__tests__, a sibling of each) rather than inside either one: the
+ * check itself needs node:fs and node:path to walk the tree, and living
+ * outside the directories it polices means it is never itself a file the
+ * rule has to make an exception for.
  */
-const MESH_ROOT = join(__dirname, '..', 'mesh');
+const POLICED_ROOTS = [join(__dirname, '..', 'mesh'), join(__dirname, '..', 'models')];
 
 function listTsFiles(dir: string): string[] {
   const files: string[] = [];
@@ -54,11 +62,15 @@ function isAllowed(specifier: string): boolean {
   return specifier.startsWith('.') || specifier === 'node:crypto';
 }
 
-test('lib/mesh files only import relative modules or node:crypto', () => {
-  const files = listTsFiles(MESH_ROOT);
-  // Sanity check: make sure this walked a real, non-empty tree rather than
-  // silently passing over nothing.
+test('lib/mesh and lib/models files only import relative modules or node:crypto', () => {
+  const files = POLICED_ROOTS.flatMap((root) => listTsFiles(root));
+  // Sanity check: make sure this walked real, non-empty trees rather than
+  // silently passing over nothing - lib/models existing but empty (or not
+  // existing yet) would otherwise make this test vacuously pass.
   expect(files.length).toBeGreaterThan(0);
+  for (const root of POLICED_ROOTS) {
+    expect(listTsFiles(root).length).toBeGreaterThan(0);
+  }
 
   const violations: string[] = [];
   for (const file of files) {
