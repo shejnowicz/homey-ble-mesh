@@ -270,10 +270,25 @@ export const PDU_TYPE_SAMPLE_COMPLETE = {
  * corresponding Type-octet-stripped `message` tail), `authValue` (the
  * No-OOB, all-zero 128-bit AuthValue Section 5.4.2.4.1 defines), the
  * genuinely new `confirmationSalt`/`confirmationKey`/`provisioningSalt`
- * intermediates, `sessionNonceFull` (the 16-octet k1 output SessionNonce is
- * truncated FROM - published alongside `SessionNonce` itself, needed to
- * pin which 13 of its 16 octets are kept), and `deviceKey`, the chain's
- * final published value.
+ * intermediates, `confirmationInputs`/`provisioningSaltInput` (the
+ * CONCATENATED inputs `s1` hashes to produce `confirmationSalt`/
+ * `provisioningSalt` - published as their own rows in Section 8.17.1, kept
+ * here as fixtures so the concatenation ORDER is pinned directly by a test,
+ * not only transitively through the salt each one hashes to),
+ * `sessionNonceFull` (the 16-octet k1 output SessionNonce is truncated FROM
+ * - published alongside `SessionNonce` itself, needed to pin which 13 of its
+ * 16 octets are kept), and `deviceKey`, the chain's final published value.
+ *
+ * `provisioningSalt` PROVENANCE: Section 8.17.1 never gives this value its
+ * own labelled row (it reuses the `s1` output silently as "K1 SALT" for the
+ * three `k1` calls below it) - but Section 8.7.12 "PB-ADV Provisioning Data"
+ * publishes the SAME worked exchange a second time, independently, and DOES
+ * name it outright: that subsection's own sample lists `ConfirmationSalt`,
+ * `Random Provisioner`, `Random Device` (all three identical to the values
+ * used here, proving it is the same exchange), then `ProvisioningSalt:
+ * a21c7d45f201cf9489a2fb57145015b4`, then `DeviceKey`, `SessionKey`, `Nonce`
+ * - the value below is transcribed from THAT row, not inferred from Section
+ * 8.17.1's silent reuse.
  *
  * ERRATA: see `lib/mesh/provisioning/crypto.ts`'s own module header for the
  * Section 5.4.2.4.1 formula that misprints "ConfirmationProvisioner" a
@@ -290,8 +305,20 @@ export const PROVISIONING_CRYPTO_SAMPLE = {
   provisioningStart: '0000000000',
   /** Section 5.4.2.4.1: the No-OOB AuthValue, 128-bit all-zero. */
   authValue: '00000000000000000000000000000000',
+  /** Section 8.17.1's own `ConfirmationInputs` row: Invite||Capabilities||Start||PublicKeyProvisionerX||Y||PublicKeyDeviceX||Y, in that order. */
+  confirmationInputs:
+    '00010001000000000000000000000000002c31a47b5779809ef44cb5eaaf5c3e' +
+    '43d5f8faad4a8794cb987e9b03745c78dd919512183898dfbecd52e2408e4387' +
+    '1fd021109117bd3ed4eaf8437743715d4ff465e43ff23d3f1b9dc7dfc04da875' +
+    '8184dbc966204796eccf0d6cf5e16500cc0201d048bcbbd899eeefc424164e33' +
+    'c201c2b010ca6b4d43a8a155cad8ecb279',
   confirmationSalt: '5faabe187337c71cc6c973369dcaa79a',
   confirmationKey: 'e31fe046c68ec339c425fc6629f0336f',
+  /** Section 8.17.1's own `ProvisioningSaltInput` row (Section 8.7.12 publishes the identical bytes under the name `ProvisioningInputs`): ConfirmationSalt||RandomProvisioner||RandomDevice, in that order. */
+  provisioningSaltInput:
+    '5faabe187337c71cc6c973369dcaa79a8b19ac31d58b124c946209b5db1021b9' +
+    '55a2a2bca04cd32ff6f346bd0a0c1a3a',
+  /** Section 8.7.12 "PB-ADV Provisioning Data" names this value outright (see PROVENANCE note above); identical to the value Section 8.17.1 reuses unlabelled as its SessionKey/SessionNonce/DeviceKey "K1 SALT". */
   provisioningSalt: 'a21c7d45f201cf9489a2fb57145015b4',
   /** The 16-octet k1(ECDHSecret, ProvisioningSalt, "prsn") output, before the 13-least-significant-octets truncation (Section 5.4.2.5). */
   sessionNonceFull: 'c5e02eda7ddbe78b5f62b81d6847487e',

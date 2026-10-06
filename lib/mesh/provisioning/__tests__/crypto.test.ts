@@ -52,6 +52,22 @@ describe('confirmationSalt (Section 5.4.2.4.1: s1(ConfirmationInputs))', () => {
     expect(result.toString('hex')).toBe(PROVISIONING_CRYPTO_SAMPLE.confirmationSalt);
   });
 
+  // Section 8.17.1 publishes ConfirmationInputs as its own row - pinning the
+  // concatenation order DIRECTLY against it, not only transitively through
+  // confirmationSalt's hashed output above. A hash match is strong evidence
+  // the input was right, but it is not the same claim as the input matching
+  // a published byte string; this closes that gap explicitly.
+  test('builds ConfirmationInputs itself in the published order (direct, non-transitive pin)', () => {
+    const built = Buffer.concat([
+      hex(PROVISIONING_CRYPTO_SAMPLE.provisioningInvite),
+      hex(PROVISIONING_CRYPTO_SAMPLE.provisioningCapabilities),
+      hex(PROVISIONING_CRYPTO_SAMPLE.provisioningStart),
+      publicKeyProvisioner,
+      publicKeyDevice,
+    ]);
+    expect(built.toString('hex')).toBe(PROVISIONING_CRYPTO_SAMPLE.confirmationInputs);
+  });
+
   test('rejects a public key that is not the 64-byte X‖Y pair rather than deriving a plausible wrong answer', () => {
     expect(() =>
       confirmationSalt(
@@ -100,6 +116,15 @@ describe('provisioningSalt (Section 5.4.2.5: s1(ConfirmationSalt || RandomProvis
   test('matches the published sample, from the published ConfirmationSalt and both Randoms directly', () => {
     const result = provisioningSalt(hex(PROVISIONING_CRYPTO_SAMPLE.confirmationSalt), randomProvisioner, randomDevice);
     expect(result.toString('hex')).toBe(PROVISIONING_CRYPTO_SAMPLE.provisioningSalt);
+  });
+
+  // Section 8.17.1 publishes this concatenation as its own `ProvisioningSaltInput`
+  // row (Section 8.7.12 republishes the identical bytes under the name
+  // `ProvisioningInputs`) - pinning the order DIRECTLY, not only transitively
+  // through provisioningSalt's hashed output above.
+  test('builds the salt input itself in the published order (direct, non-transitive pin)', () => {
+    const built = Buffer.concat([hex(PROVISIONING_CRYPTO_SAMPLE.confirmationSalt), randomProvisioner, randomDevice]);
+    expect(built.toString('hex')).toBe(PROVISIONING_CRYPTO_SAMPLE.provisioningSaltInput);
   });
 
   test('rejects a ConfirmationSalt that is not 16 bytes rather than deriving a plausible wrong answer', () => {

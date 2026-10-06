@@ -3,9 +3,8 @@ import { k1 } from '../crypto/derive';
 
 /**
  * Provisioning's security functions (Mesh Protocol v1.1, Section 5.4.2.4
- * "Authentication" and Section 5.4.2.5 "Generation of ProvisioningSalt,
- * SessionKey, device key and nonce"), restricted to the
- * BTM_ECDH_P256_CMAC_AES128_AES_CCM algorithm - the only one this project's
+ * "Authentication" and Section 5.4.2.5 "Distribution of provisioning data"),
+ * restricted to the BTM_ECDH_P256_CMAC_AES128_AES_CCM algorithm - the only one this project's
  * `crypto/derive.ts` implements (there is no `k5`/`s2`, the key-derivation
  * functions the other algorithm, BTM_ECDH_P256_HMAC_SHA256_AES_CCM, needs;
  * this module's own `RANDOM_LENGTH`/`AUTH_VALUE_LENGTH` constants below are
@@ -39,18 +38,31 @@ import { k1 } from '../crypto/derive';
  * ERRATA (Section 5.4.2.4.1, confirmed against the published sample data,
  * Section 8.17.1): the document's own second formula is printed as
  * "ConfirmationProvisioner=AES-CMAC_ConfirmationKey(RandomDevice || AuthValue)"
- * - the SAME left-hand name as the first formula, which cannot be right
- * since the sample's distinct `ConfirmationDeviceInput`/`ConfirmationDevice`
- * rows confirm this second formula is the one producing ConfirmationDevice
- * (from RandomDevice), not a second definition of ConfirmationProvisioner.
- * Matched on the formula's own Random operand and the sample's row labels,
- * not on the mis-copied left-hand name - the same "match on position and
- * meaning" rule `provisioning/__tests__/vectors.ts` already documents for
- * this same section's table-caption errata. `confirmationValue` below is the
- * one function both sides share, taking whichever Random value the caller
- * already knows is its own.
+ * - the SAME left-hand name as the first formula, which cannot be right.
+ * Three independent pieces of evidence agree on the fix:
+ *   (1) the paragraph's own lead-in prose, immediately above both formulas,
+ *       already names two distinct values ("the confirmation value of the
+ *       Provisioner is a 128-bit value, the confirmation value of the
+ *       Provisionee is a 128-bit value, and they are computed using:") -
+ *       so the second formula is textually introduced as the Provisionee's
+ *       own, not a restatement of the first;
+ *   (2) the parallel block immediately below, for the OTHER algorithm
+ *       (BTM_ECDH_P256_HMAC_SHA256_AES_CCM), gets this right:
+ *       "ConfirmationProvisioner=HMAC-SHA-256_ConfirmationKey(RandomProvisioner)"
+ *       followed correctly by "ConfirmationDevice=HMAC-SHA-256_ConfirmationKey(RandomDevice)"
+ *       - making the CMAC block's repeated name the copy-paste casualty,
+ *       not a second, deliberate definition;
+ *   (3) the sample's own distinct `ConfirmationDeviceInput`/`ConfirmationDevice`
+ *       rows (Section 8.17.1) confirm this second formula, built from
+ *       RandomDevice, is the one producing ConfirmationDevice.
+ * Matched on the formula's own Random operand and these three independent
+ * confirmations, not on the mis-copied left-hand name - the same "match on
+ * position and meaning" rule `provisioning/__tests__/vectors.ts` already
+ * documents for this same section's table-caption errata. `confirmationValue`
+ * below is the one function both sides share, taking whichever Random value
+ * the caller already knows is its own.
  *
- * Section 5.4.2.5 (ProvisioningSalt/SessionKey/SessionNonce):
+ * Section 5.4.2.5 "Distribution of provisioning data" (ProvisioningSalt/SessionKey/SessionNonce):
  *
  *   ProvisioningSalt = s1(ConfirmationSalt || RandomProvisioner || RandomDevice)
  *   SessionKey       = k1(ECDHSecret, ProvisioningSalt, "prsk")
@@ -58,14 +70,18 @@ import { k1 } from '../crypto/derive';
  *                      k1(ECDHSecret, ProvisioningSalt, "prsn")
  *
  * "Least significant" means the rightmost (last) bytes of the 16-octet k1
- * output, not the leftmost - confirmed directly against the sample: its
- * published `SessionNonceFull` is `c5e02e` || `da7ddbe78b5f62b81d6847487e`,
- * and the published `SessionNonce` is that second, 13-octet piece (the
- * LAST 13 bytes), not the first. Section 3.8.2 ("Encryption function" /
- * Figure 3.3's own big-endian "IN" presentation and `k2`'s identical
- * low-order convention for NID in `derive.ts`) is the general mesh
- * convention this follows: later field positions in a big-endian stream are
- * the lower-order ones.
+ * output, not the leftmost - settled by the specification's own wording
+ * ("the nonce shall be the 13 least significant octets of" a value, and a
+ * least-significant octet is by definition a low-order one, which in a
+ * big-endian encoding sits at the END of the byte string) together with the
+ * published sample, which pins the direction concretely: `SessionNonceFull`
+ * is `c5e02e` || `da7ddbe78b5f62b81d6847487e`, and the published
+ * `SessionNonce` is that second, 13-octet piece (the LAST 13 bytes), not the
+ * first (Section 8.17.1; both values are reproduced in
+ * `__tests__/vectors.ts`'s `PROVISIONING_CRYPTO_SAMPLE.sessionNonceFull` and
+ * the already-existing `crypto/__tests__/vectors.ts`'s
+ * `PROVISIONING_SAMPLE.sessionNonce`, and the direction is pinned by its own
+ * dedicated test in `__tests__/crypto.test.ts`, not only by the KAT).
  *
  * Section 3.9.6.1 "Device key" (Figure 3.52):
  *
@@ -79,8 +95,12 @@ import { k1 } from '../crypto/derive';
  * wrong answer - the exact failure category this project's `assertBufferLength`-style
  * guards (`pdu.ts`, `ecdh.ts`) exist to turn into a thrown error instead.
  * `ecdhSecret` is likewise validated here even though `k1`'s own `n` operand
- * accepts any length: Section 5.4.2.3 fixes ECDHSecret at 32 octets (the
- * P-256 shared secret `ecdh.ts#sharedSecret` always returns), so a
+ * accepts any length: Section 5.4.2.3 "Exchanging public keys" defines
+ * ECDHSecret as `P256(private key, peer public key)` but states no octet
+ * count of its own there. 32 octets instead follows from the curve itself
+ * (P-256's shared secret is its x-coordinate, a 256-bit/32-octet field
+ * element - exactly what `ecdh.ts#sharedSecret` returns) and is confirmed by
+ * the Section 8.17.1 sample's own 32-octet published ECDHSecret value, so a
  * wrong-length one reaching this module is a caller bug, not a protocol
  * variation to tolerate.
  */
@@ -107,7 +127,7 @@ const RANDOM_LENGTH = 16;
 const AUTH_VALUE_LENGTH = 16;
 /** Every `s1`/`aesCmac` output this module passes onward - 128 bits, the AES block size. */
 const SALT_OR_KEY_LENGTH = 16;
-/** Section 5.4.2.3: ECDHSecret, the raw P-256 shared secret `ecdh.ts#sharedSecret` returns. */
+/** Section 5.4.2.3's ECDHSecret - 32 octets per the P-256 curve's own field size (not a count Section 5.4.2.3 itself states), matching `ecdh.ts#sharedSecret`'s return and the Section 8.17.1 sample. */
 const ECDH_SECRET_LENGTH = 32;
 
 function assertLength(field: string, value: Buffer, expected: number): void {
