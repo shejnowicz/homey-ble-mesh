@@ -112,8 +112,18 @@ export class FakeBluetoothPort implements BluetoothPort {
   /** Every write that was NOT silently dropped (see `dropWrites`), in
    *  order, with a defensive copy of the bytes (never the caller's own
    *  buffer — see connection.ts's own rule about not retaining a view into
-   *  a buffer this module does not own, applied here too). */
-  readonly writesReceived: Array<{ peripheralId: string; data: Buffer }> = [];
+   *  a buffer this module does not own, applied here too). Records WHICH
+   *  characteristic the write targeted, not just which peripheral and what
+   *  bytes — review finding: without this, swapping the Data In handle for
+   *  the Data Out handle in connection.ts passes every test here, because
+   *  nothing previously distinguished "wrote to the right peripheral" from
+   *  "wrote to the right CHARACTERISTIC on that peripheral." */
+  readonly writesReceived: Array<{ peripheralId: string; characteristicUuid: number; data: Buffer }> = [];
+  /** Every `durationMs` a caller passed to `scan()`, in order — review
+   *  finding: this fixture previously accepted and ignored that argument
+   *  entirely, so connection.ts's SCAN_DURATION_MS constant was never
+   *  actually observed by anything. */
+  readonly scanDurationsRequested: number[] = [];
   private scanCalls = 0;
 
   scanCallCount(): number {
@@ -234,8 +244,9 @@ export class FakeBluetoothPort implements BluetoothPort {
 
   // --- BluetoothPort ---------------------------------------------------
 
-  async scan(_durationMs: number): Promise<ScanResult[]> {
+  async scan(durationMs: number): Promise<ScanResult[]> {
     this.scanCalls += 1;
+    this.scanDurationsRequested.push(durationMs);
     const results: ScanResult[] = [];
     for (const node of this.nodes.values()) {
       if (!node.advertising) continue;
@@ -305,7 +316,11 @@ export class FakeBluetoothPort implements BluetoothPort {
     const handle = this.requireConnectedCharacteristic(characteristic);
     const node = this.node(handle.peripheralId);
     if (node.dropWrites) return; // Write Without Response: silently discarded, no error either way
-    this.writesReceived.push({ peripheralId: handle.peripheralId, data: Buffer.from(data) });
+    this.writesReceived.push({
+      peripheralId: handle.peripheralId,
+      characteristicUuid: handle.characteristicUuid,
+      data: Buffer.from(data),
+    });
   }
 
   async subscribe(characteristic: CharacteristicHandle, onNotify: (data: Buffer) => void): Promise<Subscription> {

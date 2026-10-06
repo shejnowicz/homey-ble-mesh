@@ -5,6 +5,7 @@ import {
   MESH_PROXY_SERVICE_UUID,
   MESH_PROXY_DATA_IN_UUID,
   MESH_PROXY_DATA_OUT_UUID,
+  SCAN_DURATION_MS,
   type BluetoothPort,
   type ScanResult,
   type DiscoveredCharacteristic,
@@ -33,7 +34,7 @@ test('the published Section 8.6.1 sample: k3(NetKey) reproduces the Network ID a
 
   const advData = Buffer.concat([
     hex(NETWORK_ID_ADVERTISING_SAMPLE.advLen),
-    Buffer.from([0x16]), // AD Type: Service Data - 16-bit UUID
+    hex(NETWORK_ID_ADVERTISING_SAMPLE.adType), // AD Type: Service Data - 16-bit UUID
     hex(NETWORK_ID_ADVERTISING_SAMPLE.meshProxyServiceUuidLe),
     hex(NETWORK_ID_ADVERTISING_SAMPLE.identificationType),
     networkId,
@@ -47,6 +48,81 @@ function setUp(netKey: Buffer): { bluetooth: FakeBluetoothPort; clock: ReturnTyp
   const manager = new ProxyConnectionManager(bluetooth, clock, netKey);
   return { bluetooth, clock, manager };
 }
+
+describe('constructor validation', () => {
+  test('rejects a netKey of the wrong length, naming the length', () => {
+    const bluetooth = new FakeBluetoothPort();
+    const clock = createFakeClock();
+    expect(() => new ProxyConnectionManager(bluetooth, clock, randomBytes(15))).toThrow(
+      'ProxyConnectionManager: netKey must be 16 bytes, got 15',
+    );
+  });
+
+  /**
+   * Review finding: this defensive copy is one of the plan's GLOBAL
+   * constraints ("never retain a view into a buffer it does not own"),
+   * not an incidental nicety -- it should not have been one of the
+   * unpinned lines.
+   *
+   * FIRST ATTEMPT AT THIS TEST, and why it was wrong: mutating `netKey`
+   * AFTER construction (then checking whether the manager still recognised
+   * a node keyed off the original bytes) cannot discriminate "copied
+   * before use" from "used directly" here, because `k3` consumes its input
+   * SYNCHRONOUSLY during the constructor call and returns a brand-new
+   * buffer; nothing ever reads `netKey` again afterwards either way. I
+   * mutation-tested that version and it passed unchanged with the
+   * defensive copy removed -- a false pin. This version instead spies on
+   * the imported `k3` function itself and asserts the ACTUAL buffer
+   * instance connection.ts hands it is not the caller's own.
+   */
+  test('passes k3 a copy of the netKey, never the caller-supplied buffer instance', () => {
+    const deriveModule: typeof import('../../mesh/crypto/derive') = require('../../mesh/crypto/derive');
+    const spy = jest.spyOn(deriveModule, 'k3');
+    try {
+      const netKey = randomBytes(16);
+      new ProxyConnectionManager(new FakeBluetoothPort(), createFakeClock(), netKey);
+
+      expect(spy).toHaveBeenCalledTimes(1);
+      const passed = spy.mock.calls[0]?.[0] as Buffer;
+      expect(passed).not.toBe(netKey); // a distinct Buffer instance...
+      expect(passed.equals(netKey)).toBe(true); // ...with the same bytes
+    } finally {
+      spy.mockRestore();
+    }
+  });
+});
+
+describe('the published sample, end-to-end', () => {
+  /**
+   * Review finding: every other identity test in this suite generates a
+   * random key and derives BOTH the advertisement (via the fake's
+   * `networkKey` option) and the manager's own check with the same k3
+   * call -- self-consistent, but not anchored: if k3 and this module's use
+   * of it were wrong in the same way, every one of those tests would still
+   * pass. This test feeds the PUBLISHED NetKey through the manager's own
+   * constructor and advertises the LITERAL published bytes (string
+   * constants transcribed from Section 8.6.1, not computed by calling k3
+   * anywhere in this test) -- the only test in this suite where the
+   * "expected" side comes from the specification text rather than from
+   * this project's own code on both sides at once.
+   */
+  test('feeding the published NetKey through the manager accepts the literal published advertisement', async () => {
+    const netKey = hex(NETWORK_ID_ADVERTISING_SAMPLE.netKey);
+    const { bluetooth, clock, manager } = setUp(netKey);
+    bluetooth.addNode({
+      id: 'published-sample-node',
+      rssi: -50,
+      serviceDataOverride: hex(
+        NETWORK_ID_ADVERTISING_SAMPLE.identificationType + NETWORK_ID_ADVERTISING_SAMPLE.expectedNetworkId,
+      ),
+    });
+
+    manager.start();
+    await clock.advance(0);
+
+    expect(manager.getState()).toEqual({ status: 'connected', peripheralId: 'published-sample-node' });
+  });
+});
 
 describe('selection', () => {
   test('the strongest of several of our nodes is chosen', async () => {
@@ -91,17 +167,25 @@ describe('selection', () => {
    * identification type this module can check without a connection (see
    * connection.ts's module header). It must still never be selected on the
    * strength of an identity this module cannot verify.
+   *
+   * REVIEW FINDING: an earlier version of this test used RANDOM bytes as
+   * the identity parameters under the wrong type octet. That is no test of
+   * the type check at all -- the random bytes already fail the byte
+   * comparison against our real Network ID, so the node is rejected before
+   * the type octet is ever consulted; deleting the type check entirely
+   * still passed the whole suite. This version carries the GENUINE derived
+   * identity (k3(ourKey)) under the wrong type octet, so the type check is
+   * the ONLY thing that can reject it -- a byte-comparison bug could not.
    */
-  test('a node advertising Node Identity (type 0x01) rather than Network ID is never selected', async () => {
+  test('a node advertising our genuine identity under the wrong identification type is never selected', async () => {
     const ourKey = randomBytes(16);
     const { bluetooth, clock, manager } = setUp(ourKey);
-    // Same 8-octet length as a real Network ID, only the type octet
-    // differs -- so a selection bug that checks length but not type would
-    // still pass this unless this specific case is exercised.
     bluetooth.addNode({
-      id: 'node-identity',
+      id: 'wrong-type',
       rssi: -10,
-      serviceDataOverride: Buffer.concat([Buffer.from([0x01]), randomBytes(8)]),
+      // Type 0x01 (Node Identity), but the Identification Parameters ARE
+      // our real k3(ourKey) -- only the type octet is wrong.
+      serviceDataOverride: Buffer.concat([Buffer.from([0x01]), k3(ourKey)]),
     });
     bluetooth.addNode({ id: 'ours', rssi: -60, networkKey: ourKey });
 
@@ -268,6 +352,131 @@ describe('availability', () => {
     await clock.advance(1000); // backoff still applies to this failure mode
     expect(bluetooth.connectCalls).toEqual(['incomplete', 'incomplete']);
   });
+
+  /** Review finding: `discoverBehavior`/`subscribeBehavior` existed on the
+   *  fixture from the start (the brief explicitly lists failing a
+   *  discovery or a subscribe among the fake's required capabilities) but
+   *  nothing exercised them -- the corresponding `try`/`catch` paths in
+   *  `runAttempt` were live code with no test ever taking them. */
+  test('a node whose GATT discovery call itself fails (not just an incomplete result) fails the attempt and keeps trying', async () => {
+    const netKey = randomBytes(16);
+    const { bluetooth, clock, manager } = setUp(netKey);
+    bluetooth.addNode({ id: 'A', rssi: -50, networkKey: netKey, discoverBehavior: 'fail' });
+
+    manager.start();
+    await clock.advance(0);
+    expect(manager.getState()).toEqual({ status: 'unavailable', peripheralId: null });
+    expect(bluetooth.connectCalls).toEqual(['A']);
+
+    await clock.advance(1000); // the backoff schedule applies to this failure mode too
+    expect(bluetooth.connectCalls).toEqual(['A', 'A']);
+  });
+
+  test('a node whose subscribe() call fails fails the attempt and keeps trying', async () => {
+    const netKey = randomBytes(16);
+    const { bluetooth, clock, manager } = setUp(netKey);
+    bluetooth.addNode({ id: 'A', rssi: -50, networkKey: netKey, subscribeBehavior: 'fail' });
+
+    manager.start();
+    await clock.advance(0);
+    expect(manager.getState()).toEqual({ status: 'unavailable', peripheralId: null });
+    expect(bluetooth.connectCalls).toEqual(['A']);
+
+    await clock.advance(1000);
+    expect(bluetooth.connectCalls).toEqual(['A', 'A']);
+  });
+});
+
+describe('epoch guards against stale or superseded port callbacks', () => {
+  /**
+   * Review finding: the earlier report disclosed this guard as untested
+   * but reasoned it was unreachable through the fixture's public surface.
+   * That conclusion was wrong -- a hand-written stub port that captures
+   * the `onDisconnect` callback (the same technique already used for the
+   * buffer-retention test above) reaches it directly in about twenty-five
+   * lines.
+   */
+  test('a stale disconnect callback from a superseded connection attempt does not disturb the current connection', async () => {
+    const netKey = randomBytes(16);
+    const serviceData = Buffer.concat([Buffer.from([0x00]), k3(netKey)]);
+    const disconnectCallbacks: Array<() => void> = [];
+    const port: BluetoothPort = {
+      scan: async (): Promise<ScanResult[]> => [{ peripheralId: 'A', rssi: -50, proxyServiceData: serviceData }],
+      connect: async (_id, onDisconnect): Promise<unknown> => {
+        disconnectCallbacks.push(onDisconnect);
+        return {};
+      },
+      discover: async (): Promise<DiscoveredCharacteristic[]> => [
+        { serviceUuid: MESH_PROXY_SERVICE_UUID, characteristicUuid: MESH_PROXY_DATA_IN_UUID, handle: {} },
+        { serviceUuid: MESH_PROXY_SERVICE_UUID, characteristicUuid: MESH_PROXY_DATA_OUT_UUID, handle: {} },
+      ],
+      read: async (): Promise<Buffer> => Buffer.alloc(0),
+      write: async (): Promise<void> => {},
+      subscribe: async (): Promise<Subscription> => ({ unsubscribe: (): void => {} }),
+      disconnect: async (): Promise<void> => {},
+    };
+    const clock = createFakeClock();
+    const manager = new ProxyConnectionManager(port, clock, netKey);
+
+    manager.start();
+    await clock.advance(0); // first connection: callback #0 captured
+    expect(manager.getState()).toEqual({ status: 'connected', peripheralId: 'A' });
+
+    const staleCallback = disconnectCallbacks[0]!;
+    staleCallback(); // a GENUINE disconnect: triggers migration
+    await clock.advance(0); // reconnects: callback #1 captured, a newer generation
+
+    expect(manager.getState()).toEqual({ status: 'connected', peripheralId: 'A' });
+    expect(disconnectCallbacks).toHaveLength(2);
+
+    staleCallback(); // the SAME, now-stale callback fires again -- a late/duplicate port event
+
+    expect(manager.getState()).toEqual({ status: 'connected', peripheralId: 'A' }); // unaffected
+  });
+
+  /**
+   * The sibling the review found and this report did not: `stop()` bumps
+   * the exact same epoch counter, and was equally unpinned. Without it, an
+   * in-flight attempt that happens to complete AFTER `stop()` was called
+   * would leave the manager believing it is connected.
+   */
+  test('stop() invalidates an in-flight attempt: completing after stop does not leave the manager believing it is connected', async () => {
+    const netKey = randomBytes(16);
+    const serviceData = Buffer.concat([Buffer.from([0x00]), k3(netKey)]);
+    let resolveConnect: (() => void) | null = null;
+    let disconnectCalls = 0;
+    const port: BluetoothPort = {
+      scan: async (): Promise<ScanResult[]> => [{ peripheralId: 'A', rssi: -50, proxyServiceData: serviceData }],
+      connect: (): Promise<unknown> =>
+        new Promise((resolve) => {
+          resolveConnect = (): void => resolve({});
+        }),
+      discover: async (): Promise<DiscoveredCharacteristic[]> => [
+        { serviceUuid: MESH_PROXY_SERVICE_UUID, characteristicUuid: MESH_PROXY_DATA_IN_UUID, handle: {} },
+        { serviceUuid: MESH_PROXY_SERVICE_UUID, characteristicUuid: MESH_PROXY_DATA_OUT_UUID, handle: {} },
+      ],
+      read: async (): Promise<Buffer> => Buffer.alloc(0),
+      write: async (): Promise<void> => {},
+      subscribe: async (): Promise<Subscription> => ({ unsubscribe: (): void => {} }),
+      disconnect: async (): Promise<void> => {
+        disconnectCalls += 1;
+      },
+    };
+    const clock = createFakeClock();
+    const manager = new ProxyConnectionManager(port, clock, netKey);
+
+    manager.start();
+    await clock.advance(0); // scan completes, connect() is called and left pending
+
+    manager.stop(); // epoch bumped while connect() is still in flight
+    expect(manager.getState()).toEqual({ status: 'unavailable', peripheralId: null });
+
+    resolveConnect!(); // let the now-stale attempt's connect() resolve
+    await new Promise((resolve) => setImmediate(resolve)); // flush its discover()/subscribe() continuation
+
+    expect(manager.getState()).toEqual({ status: 'unavailable', peripheralId: null }); // still -- not 'connected'
+    expect(disconnectCalls).toBe(1); // the now-unwanted connection was cleaned up, not left open
+  });
 });
 
 describe('write and notifications', () => {
@@ -290,7 +499,7 @@ describe('write and notifications', () => {
     expect(bluetooth.writesReceived).toEqual([]);
   });
 
-  test('write() forwards to the port when the connection accepts it', async () => {
+  test('write() forwards to the port when the connection accepts it, targeting the Data In characteristic specifically', async () => {
     const netKey = randomBytes(16);
     const { bluetooth, clock, manager } = setUp(netKey);
     bluetooth.addNode({ id: 'A', rssi: -50, networkKey: netKey });
@@ -302,6 +511,26 @@ describe('write and notifications', () => {
     expect(bluetooth.writesReceived).toHaveLength(1);
     expect(bluetooth.writesReceived[0]?.peripheralId).toBe('A');
     expect(bluetooth.writesReceived[0]?.data.toString('hex')).toBe('010203');
+    // Review finding: a prior version of this fixture/test could not tell
+    // "wrote to A" apart from "wrote to the wrong characteristic on A" --
+    // swapping the Data In handle for the Data Out handle in connection.ts
+    // passed this test unchanged. Pinning the characteristic, not just the
+    // peripheral, is what Table 7.15's Write-Without-Response/Notify split
+    // actually requires: writing commands into the NOTIFY characteristic
+    // does nothing on real hardware.
+    expect(bluetooth.writesReceived[0]?.characteristicUuid).toBe(MESH_PROXY_DATA_IN_UUID);
+  });
+
+  test('the scan duration the module requests is actually observed by the port, not silently ignored', async () => {
+    const netKey = randomBytes(16);
+    const { bluetooth, clock, manager } = setUp(netKey);
+    manager.start();
+    await clock.advance(0);
+
+    expect(bluetooth.scanDurationsRequested.length).toBeGreaterThan(0);
+    for (const duration of bluetooth.scanDurationsRequested) {
+      expect(duration).toBe(SCAN_DURATION_MS);
+    }
   });
 
   /**
@@ -446,6 +675,44 @@ describe('gaps found while writing this suite, beyond the brief\'s own list', ()
 });
 
 describe('stop', () => {
+  /**
+   * Review finding: `fakeBluetooth`'s own `disconnect()` already clears its
+   * notify callbacks, which would launder away a missing explicit
+   * `subscription.unsubscribe()` call in connection.ts's own `stop()` --
+   * the same reasoning behind the buffer-retention stub above. This stub's
+   * `disconnect()` deliberately does nothing on its own, so only
+   * connection.ts's own call can make the assertion pass.
+   */
+  test("stop() calls the active subscription's own unsubscribe(), not just the port's disconnect()", async () => {
+    const netKey = randomBytes(16);
+    const serviceData = Buffer.concat([Buffer.from([0x00]), k3(netKey)]);
+    let unsubscribeCalled = false;
+    const port: BluetoothPort = {
+      scan: async (): Promise<ScanResult[]> => [{ peripheralId: 'A', rssi: -50, proxyServiceData: serviceData }],
+      connect: async (): Promise<unknown> => ({}),
+      discover: async (): Promise<DiscoveredCharacteristic[]> => [
+        { serviceUuid: MESH_PROXY_SERVICE_UUID, characteristicUuid: MESH_PROXY_DATA_IN_UUID, handle: {} },
+        { serviceUuid: MESH_PROXY_SERVICE_UUID, characteristicUuid: MESH_PROXY_DATA_OUT_UUID, handle: {} },
+      ],
+      read: async (): Promise<Buffer> => Buffer.alloc(0),
+      write: async (): Promise<void> => {},
+      subscribe: async (): Promise<Subscription> => ({
+        unsubscribe: (): void => {
+          unsubscribeCalled = true;
+        },
+      }),
+      disconnect: async (): Promise<void> => {}, // deliberately does nothing on its own
+    };
+    const clock = createFakeClock();
+    const manager = new ProxyConnectionManager(port, clock, netKey);
+    manager.start();
+    await clock.advance(0);
+
+    manager.stop();
+
+    expect(unsubscribeCalled).toBe(true);
+  });
+
   test('stop() tears down an active connection and schedules no further attempts', async () => {
     const netKey = randomBytes(16);
     const { bluetooth, clock, manager } = setUp(netKey);
@@ -465,5 +732,60 @@ describe('stop', () => {
 
     await clock.advance(1_000_000);
     expect(bluetooth.scanCallCount()).toBe(1); // no further attempt was ever scheduled
+  });
+});
+
+/**
+ * Review finding: `FakeBluetoothPort` has configuration surface this
+ * task's own manager never exercises on its own (it never calls `read`,
+ * never calls `removeNode`/`setRssi` through any behaviour the manager
+ * triggers). Rather than leave them live but untested, each gets a direct,
+ * fixture-level smoke test here -- these are tests of the FIXTURE, not of
+ * `ProxyConnectionManager`, and are expected to matter once the traffic
+ * queue (reads a capability) and the pairing flow (dynamic signal
+ * strength during a pairing scan) actually call them through the manager
+ * or its successors.
+ */
+describe('fixture coverage: fakeBluetooth capabilities this task does not itself exercise through the manager', () => {
+  test('removeNode: a removed node no longer appears in scan results', async () => {
+    const bluetooth = new FakeBluetoothPort();
+    bluetooth.addNode({ id: 'A', rssi: -50, networkKey: randomBytes(16) });
+    expect(await bluetooth.scan(0)).toHaveLength(1);
+
+    bluetooth.removeNode('A');
+    expect(await bluetooth.scan(0)).toHaveLength(0);
+  });
+
+  test('setRssi: changes what subsequent scans report for that node', async () => {
+    const bluetooth = new FakeBluetoothPort();
+    bluetooth.addNode({ id: 'A', rssi: -70, networkKey: randomBytes(16) });
+    expect((await bluetooth.scan(0))[0]?.rssi).toBe(-70);
+
+    bluetooth.setRssi('A', -30);
+    expect((await bluetooth.scan(0))[0]?.rssi).toBe(-30);
+  });
+
+  test('read()/setReadValue(): a configured value is returned to a connected reader; an unconfigured one defaults to empty', async () => {
+    const bluetooth = new FakeBluetoothPort();
+    bluetooth.addNode({ id: 'A', rssi: -50, networkKey: randomBytes(16) });
+    const connection = await bluetooth.connect('A', () => {});
+    const characteristics = await bluetooth.discover(connection);
+    const dataIn = characteristics.find((c) => c.characteristicUuid === MESH_PROXY_DATA_IN_UUID)!;
+
+    expect((await bluetooth.read(dataIn.handle)).length).toBe(0); // unconfigured: empty, not an error
+
+    bluetooth.setReadValue('A', MESH_PROXY_DATA_IN_UUID, Buffer.from([0xaa, 0xbb]));
+    expect((await bluetooth.read(dataIn.handle)).toString('hex')).toBe('aabb');
+  });
+
+  test('read() rejects once the peripheral is no longer connected', async () => {
+    const bluetooth = new FakeBluetoothPort();
+    bluetooth.addNode({ id: 'A', rssi: -50, networkKey: randomBytes(16) });
+    const connection = await bluetooth.connect('A', () => {});
+    const characteristics = await bluetooth.discover(connection);
+    const dataIn = characteristics.find((c) => c.characteristicUuid === MESH_PROXY_DATA_IN_UUID)!;
+    await bluetooth.disconnect(connection);
+
+    await expect(bluetooth.read(dataIn.handle)).rejects.toThrow('is not connected');
   });
 });

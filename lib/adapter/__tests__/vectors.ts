@@ -30,11 +30,13 @@ export const NETWORK_ID_ADVERTISING_SAMPLE = {
   // this exact value from this exact NetKey.
   expectedNetworkId: '3ecaff672f673370',
   advLen: '0c',
-  // AD Type 0x16 = Service Data - 16-bit UUID (not itself spelled out as a
-  // hex byte in this section's own table rows, which show the UUID/Type/
-  // Network ID fields separately; reconstructed here from the complete
-  // "ADV Data" hex blob the section publishes last, which is the actual
-  // known-answer value this project's test asserts byte-for-byte).
+  // AD Type 0x16 = Service Data - 16-bit UUID. This IS spelled out as its
+  // own hex byte in the section's table: the row labelled "Adv (Service
+  // Data)" carries exactly "16", immediately above the nested "Mesh Proxy
+  // UUID"/"Type"/"Network ID" breakdown rows (re-confirmed against the raw
+  // HTML table cells directly, not the flattened text, after an earlier
+  // version of this comment wrongly claimed the opposite).
+  adType: '16',
   meshProxyServiceUuidLe: '2818', // 0x1828, little-endian on the air
   identificationType: '00', // Table 7.8: 0x00 = Network ID type
   // The complete advertising data blob the specification publishes:

@@ -233,8 +233,11 @@ function backoffDelayMs(failureStreak: number): number {
 
 // How long one scan window lasts. Not a specification value either; see the
 // backoff constants' comment above for why this module carries its own
-// engineering choices rather than the specification's.
-const SCAN_DURATION_MS = 4000;
+// engineering choices rather than the specification's. Exported so a test
+// can assert the port actually receives this value (review finding: the
+// fake previously accepted and discarded `durationMs` entirely, so this
+// constant was never observed by anything).
+export const SCAN_DURATION_MS = 4000;
 
 interface ActiveConnection {
   readonly connection: ConnectionHandle;
