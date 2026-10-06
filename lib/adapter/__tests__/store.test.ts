@@ -18,10 +18,12 @@ import { MAX_SEQ } from '../../mesh/packet/ranges';
  * reference the caller passed in. That second property matters here: a fake
  * that just aliased objects could hide a real bug (the store forgetting to
  * copy something) behind the test happening to reuse the same JS object for
- * what it wrote and what it later reads back.
+ * what it wrote and what it later reads back. `setCallCount` lets a test
+ * assert that a rejected write never reached the port at all.
  */
 class FakeSettingsPort implements SettingsPort {
   private readonly data = new Map<string, string>();
+  setCallCount = 0;
 
   get(key: string): unknown {
     const raw = this.data.get(key);
@@ -29,7 +31,32 @@ class FakeSettingsPort implements SettingsPort {
   }
 
   set(key: string, value: unknown): void {
+    this.setCallCount++;
     this.data.set(key, JSON.stringify(value));
+  }
+}
+
+/**
+ * The opposite fidelity choice from `FakeSettingsPort`: holds exactly the
+ * object reference it was given, with no serialization at all -- plausible
+ * for an in-process settings manager that keeps values in memory. Review
+ * found that `FakeSettingsPort`'s own JSON round-trip was, by itself,
+ * already deep-cloning everything `set`/`get` touched, which laundered
+ * away any need for this module's OWN defensive copies (`encodeNetworkState`/
+ * `decodeNetworkState`'s `JSON.parse(JSON.stringify(...))` of a node's
+ * composition): a test using only the JSON-serializing fake could not tell
+ * apart "the module copies" from "the fake copies for it." This fake makes
+ * that distinction observable.
+ */
+class AliasingSettingsPort implements SettingsPort {
+  private readonly data = new Map<string, unknown>();
+
+  get(key: string): unknown {
+    return this.data.has(key) ? this.data.get(key) : null;
+  }
+
+  set(key: string, value: unknown): void {
+    this.data.set(key, value);
   }
 }
 
@@ -52,6 +79,27 @@ function sampleNode(address: number): NodeEntry {
     composition: sampleComposition(),
   };
 }
+
+/**
+ * The empty state's expected shape, spelled out as literals rather than
+ * compared against the module's own `EMPTY_NETWORK_STATE` constant.
+ * Comparing a read result to that constant is tautological if the
+ * constant itself changed (e.g. a different starting IV index or first
+ * unicast address) -- it would still equal itself. These literals are
+ * what the design actually requires: no network exists yet, so every key
+ * and address is unknown (`null`), the IV index starts at 0, and the
+ * first address this store will ever offer is 0x0001.
+ */
+const EXPECTED_EMPTY_STATE = {
+  netKey: null,
+  netKeyIndex: null,
+  appKey: null,
+  appKeyIndex: null,
+  ivIndex: 0,
+  ourUnicastAddress: null,
+  nextUnicastAddress: 1,
+  nodes: [],
+};
 
 function sampleNetworkState(): NetworkState {
   return {
@@ -86,7 +134,7 @@ describe('NetworkStore persistence', () => {
     expect(() => {
       state = store.getState();
     }).not.toThrow();
-    expect(state).toEqual(EMPTY_NETWORK_STATE);
+    expect(state).toEqual(EXPECTED_EMPTY_STATE);
   });
 
   test('unreadable stored data yields the empty state rather than throwing', () => {
@@ -96,7 +144,7 @@ describe('NetworkStore persistence', () => {
     const store = new NetworkStore(settings);
 
     expect(() => store.getState()).not.toThrow();
-    expect(store.getState()).toEqual(EMPTY_NETWORK_STATE);
+    expect(store.getState()).toEqual(EXPECTED_EMPTY_STATE);
   });
 
   test('round-trips the empty state itself (all-null key material) without throwing', () => {
@@ -106,7 +154,7 @@ describe('NetworkStore persistence', () => {
     writer.setState(EMPTY_NETWORK_STATE);
 
     const reader = new NetworkStore(settings);
-    expect(reader.getState()).toEqual(EMPTY_NETWORK_STATE);
+    expect(reader.getState()).toEqual(EXPECTED_EMPTY_STATE);
   });
 
   test('setState rejects a key of the wrong length, naming the field and the length', () => {
@@ -153,6 +201,124 @@ describe('NetworkStore persistence', () => {
     const bad = corrupt(sampleNetworkState());
 
     expect(() => store.setState(bad)).toThrow(/16 bytes, got 10/);
+  });
+
+  // The same gap the review found in the length guards above: both key
+  // INDEX range guards (netKeyIndex/appKeyIndex, Section 4.3.1.1's 12-bit
+  // bound) and the node address range guard were already implemented but
+  // had no test of their own.
+  test.each([
+    ['netKeyIndex', (s: NetworkState): NetworkState => ({ ...s, netKeyIndex: 0x1000 })],
+    ['appKeyIndex', (s: NetworkState): NetworkState => ({ ...s, appKeyIndex: 0x1000 })],
+  ])('setState rejects an out-of-range %s', (fieldName, corrupt) => {
+    const settings = new FakeSettingsPort();
+    const store = new NetworkStore(settings);
+    const bad = corrupt(sampleNetworkState());
+
+    expect(() => store.setState(bad)).toThrow(new RegExp(fieldName));
+  });
+
+  test('setState rejects a node address outside the unicast range, naming the field', () => {
+    const settings = new FakeSettingsPort();
+    const store = new NetworkStore(settings);
+    const state = sampleNetworkState();
+    const bad: NetworkState = { ...state, nodes: [{ ...state.nodes[0]!, address: 0x8000 }, ...state.nodes.slice(1)] };
+
+    expect(() => store.setState(bad)).toThrow(/nodes\[0\]\.address/);
+  });
+
+  test('setState writes nothing at all when validation fails -- it validates before any write', () => {
+    const settings = new FakeSettingsPort();
+    const store = new NetworkStore(settings);
+    const callsBefore = settings.setCallCount;
+    const bad: NetworkState = { ...sampleNetworkState(), netKey: randomBytes(15) };
+
+    expect(() => store.setState(bad)).toThrow();
+
+    expect(settings.setCallCount).toBe(callsBefore);
+  });
+
+  test('malformed key hex in otherwise well-shaped stored data yields the empty state rather than throwing', () => {
+    // A different corruption path than "nodes is not an array" (the
+    // existing "unreadable stored data" test above): this value has the
+    // right shape and type at every field -- it only fails the hex-decode
+    // guard specifically.
+    const settings = new FakeSettingsPort();
+    settings.set('network', {
+      netKey: 'not-valid-hex-and-also-wrong-length',
+      netKeyIndex: null,
+      appKey: null,
+      appKeyIndex: null,
+      ivIndex: 0,
+      ourUnicastAddress: null,
+      nextUnicastAddress: 1,
+      nodes: [],
+    });
+    const store = new NetworkStore(settings);
+
+    expect(() => store.getState()).not.toThrow();
+    expect(store.getState()).toEqual(EXPECTED_EMPTY_STATE);
+  });
+
+  test('a stored nextUnicastAddress of 0 (the Unassigned address, never legal) is treated as corrupt, not accepted', () => {
+    // Decode must RANGE-check, not just type-check: 0 is a `number`, so a
+    // guard that only asked "is this a number" would let it through and
+    // later hand address 0 out of allocateUnicastAddress -- Table 3.5's
+    // Unassigned address, not a legal unicast one.
+    const settings = new FakeSettingsPort();
+    settings.set('network', {
+      netKey: null,
+      netKeyIndex: null,
+      appKey: null,
+      appKeyIndex: null,
+      ivIndex: 0,
+      ourUnicastAddress: null,
+      nextUnicastAddress: 0,
+      nodes: [],
+    });
+    const store = new NetworkStore(settings);
+
+    expect(store.getState()).toEqual(EXPECTED_EMPTY_STATE);
+  });
+
+  test('getState never returns the same object instance twice, even for the empty-state fallback', () => {
+    const settings = new FakeSettingsPort();
+    const store = new NetworkStore(settings);
+
+    const first = store.getState();
+    (first.nodes as NodeEntry[]).push(sampleNode(5)); // mutate what this call returned
+
+    const second = store.getState();
+    expect(second.nodes).toHaveLength(0);
+    expect(second).toEqual(EXPECTED_EMPTY_STATE);
+  });
+
+  test('encodeNetworkState deep-copies a node composition -- observable only with a fake that does not itself clone', () => {
+    const settings = new AliasingSettingsPort();
+    const store = new NetworkStore(settings);
+    const state = sampleNetworkState();
+
+    store.setState(state);
+    // Mutate the CALLER's own composition object after the call returns.
+    const original = state.nodes[0]!.composition as unknown as { elements: Array<{ loc: number }> };
+    original.elements[0]!.loc = 0xdead;
+
+    const readBack = store.getState();
+    expect((readBack.nodes[0]!.composition as unknown as { elements: Array<{ loc: number }> }).elements[0]!.loc).not.toBe(
+      0xdead,
+    );
+  });
+
+  test('decodeNetworkState deep-copies a node composition on the way out -- observable only with a fake that does not itself clone', () => {
+    const settings = new AliasingSettingsPort();
+    const store = new NetworkStore(settings);
+    store.setState(sampleNetworkState());
+
+    const first = store.getState();
+    (first.nodes[0]!.composition as unknown as { elements: Array<{ loc: number }> }).elements[0]!.loc = 0xdead;
+
+    const second = store.getState();
+    expect((second.nodes[0]!.composition as unknown as { elements: Array<{ loc: number }> }).elements[0]!.loc).not.toBe(0xdead);
   });
 
   test('setState does not mutate the caller-supplied state object', () => {
@@ -214,6 +380,53 @@ describe('NetworkStore.allocateUnicastAddress', () => {
 
     expect(store.allocateUnicastAddress()).toBe(0x7fff); // the last legal unicast address
     expect(() => store.allocateUnicastAddress()).toThrow(/no unicast addresses remain/);
+  });
+
+  /**
+   * THE critical finding from review: allocating an address must never
+   * convert "the stored network state is unreadable" into "the stored
+   * network state is gone." A naive read-empty-then-write-back allocator
+   * would overwrite the only remaining chance of recovering the network
+   * key, the application key and the node roster with a freshly empty
+   * state plus one allocated address -- the single most expensive failure
+   * this app can have, per the design's own accepted risk (losing these
+   * settings means factory-resetting every bulb by hand).
+   */
+  test('refuses to allocate when the stored network state is present but unreadable, and does not overwrite it', () => {
+    const settings = new FakeSettingsPort();
+    // Valid JSON, but not this module's shape -- the same kind of corruption
+    // as the persistence describe block's "unreadable stored data" case.
+    const corrupt = { unrelated: true, nodes: 'not-an-array' };
+    settings.set('network', corrupt);
+    const store = new NetworkStore(settings);
+
+    expect(() => store.allocateUnicastAddress()).toThrow(/unreadable/);
+
+    // The stored value must be EXACTLY what it was before the call -- not
+    // merely "still fails to decode by coincidence," but byte-for-byte the
+    // same object this test put there, proving nothing was written.
+    expect(settings.get('network')).toEqual(corrupt);
+  });
+
+  /**
+   * THE second critical finding: allocating an address is a read-modify-
+   * write of the WHOLE state, and nothing previously pinned that it
+   * preserves everything OTHER than the field it means to change. Task 6
+   * (pairing) does exactly "allocate an address, then separately write a
+   * new node entry" -- if allocation silently dropped the keys or the
+   * existing node roster, that task would have no test here to catch it.
+   */
+  test('allocating an address changes nothing else in the stored state', () => {
+    const settings = new FakeSettingsPort();
+    const store = new NetworkStore(settings);
+    const seeded = sampleNetworkState();
+    store.setState(seeded);
+
+    const address = store.allocateUnicastAddress();
+
+    expect(address).toBe(seeded.nextUnicastAddress);
+    const after = store.getState();
+    expect(after).toEqual({ ...seeded, nextUnicastAddress: seeded.nextUnicastAddress + 1 });
   });
 });
 

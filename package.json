@@ -7,7 +7,7 @@
   "license": "MIT",
   "scripts": {
     "test": "jest --ci",
-    "typecheck": "tsc --noEmit",
+    "typecheck": "tsc --noEmit -p tsconfig.engine.json",
     "build": "tsc",
     "validate": "homey app validate"
   },

@@ -119,16 +119,31 @@ const KEY_LENGTH = 16;
  *  a value this module ever chooses on its own. */
 const INITIAL_IV_INDEX = 0;
 
-export const EMPTY_NETWORK_STATE: NetworkState = Object.freeze({
-  netKey: null,
-  netKeyIndex: null,
-  appKey: null,
-  appKeyIndex: null,
-  ivIndex: INITIAL_IV_INDEX,
-  ourUnicastAddress: null,
-  nextUnicastAddress: MIN_UNICAST_ADDRESS,
-  nodes: [],
-});
+/**
+ * Builds a fresh, independent empty state object. Used everywhere this
+ * module needs to HAND OUT an empty state (`getState`'s absent/corrupt
+ * fallbacks): returning the shared `EMPTY_NETWORK_STATE` singleton itself
+ * would let a caller that mutates what it got back (e.g. pushing onto
+ * `.nodes`, which `readonly` only stops at compile time, not at runtime)
+ * poison every future call for the lifetime of the process. `EMPTY_NETWORK_STATE`
+ * remains exported, frozen, as a convenient literal for callers/tests to
+ * compare against or spread from — it is just never itself returned by any
+ * method below.
+ */
+function freshEmptyState(): NetworkState {
+  return {
+    netKey: null,
+    netKeyIndex: null,
+    appKey: null,
+    appKeyIndex: null,
+    ivIndex: INITIAL_IV_INDEX,
+    ourUnicastAddress: null,
+    nextUnicastAddress: MIN_UNICAST_ADDRESS,
+    nodes: [],
+  };
+}
+
+export const EMPTY_NETWORK_STATE: NetworkState = Object.freeze(freshEmptyState());
 
 const SETTINGS_KEY_NETWORK = 'network';
 const SETTINGS_KEY_SEQUENCE = 'sequence';
@@ -232,10 +247,16 @@ function hexToKeyBuffer(hex: string, field: string): Buffer {
 
 /**
  * The inverse of `encodeNetworkState`. Throws on anything that does not look
- * like our own wire shape; `NetworkStore#getState` below is this function's
- * only caller and turns that throw into the documented "missing/unreadable
- * data yields the empty state" behaviour, rather than letting a corrupt
- * settings value crash app startup.
+ * like our own wire shape, INCLUDING an out-of-range value that is the right
+ * JS type (e.g. a `nextUnicastAddress` of `0`, a `number` but the Unassigned
+ * address, never a legal unicast one) — the same fields `encodeNetworkState`
+ * range-checks, checked again here because a hand-edited or otherwise
+ * corrupted settings value does not go through `encodeNetworkState` on its
+ * way in. `NetworkStore#readStateForWrite` below is this function's only
+ * caller and turns that throw into "missing/unreadable data yields the
+ * empty state" (via `getState`) or "refuse to write" (via
+ * `allocateUnicastAddress`), rather than letting a corrupt settings value
+ * crash app startup or be silently accepted.
  */
 function decodeNetworkState(value: unknown): NetworkState {
   if (typeof value !== 'object' || value === null) {
@@ -254,6 +275,7 @@ function decodeNetworkState(value: unknown): NetworkState {
     if (typeof node.address !== 'number') {
       throw new Error(`stored network state field "nodes[${i}].address" is not a number`);
     }
+    assertRange(`nodes[${i}].address`, node.address, MIN_UNICAST_ADDRESS, MAX_UNICAST_ADDRESS);
     if (typeof node.deviceKey !== 'string') {
       throw new Error(`stored network state field "nodes[${i}].deviceKey" is not a string`);
     }
@@ -266,21 +288,38 @@ function decodeNetworkState(value: unknown): NetworkState {
 
   const netKey = v.netKey === null || v.netKey === undefined ? null : hexToKeyBuffer(v.netKey as string, 'netKey');
   const appKey = v.appKey === null || v.appKey === undefined ? null : hexToKeyBuffer(v.appKey as string, 'appKey');
+  const netKeyIndex = (v.netKeyIndex as number | null | undefined) ?? null;
+  const appKeyIndex = (v.appKeyIndex as number | null | undefined) ?? null;
+  const ourUnicastAddress = (v.ourUnicastAddress as number | null | undefined) ?? null;
 
+  if (netKeyIndex !== null) assertRange('netKeyIndex', netKeyIndex, 0, MAX_KEY_INDEX);
+  if (appKeyIndex !== null) assertRange('appKeyIndex', appKeyIndex, 0, MAX_KEY_INDEX);
+  if (ourUnicastAddress !== null) {
+    assertRange('ourUnicastAddress', ourUnicastAddress, MIN_UNICAST_ADDRESS, MAX_UNICAST_ADDRESS);
+  }
+
+  // Range-checked, not just type-checked (mirrors encodeNetworkState): a
+  // stored value that is a `number` but out of range -- e.g. a
+  // nextUnicastAddress of 0, the Unassigned address and never a legal
+  // unicast one -- is exactly as unsafe to hand to a caller as one of the
+  // wrong JS type, and must fail the same way (caught by the caller below,
+  // never silently accepted).
   if (typeof v.ivIndex !== 'number') {
     throw new Error('stored network state field "ivIndex" is not a number');
   }
+  assertRange('ivIndex', v.ivIndex, 0, 0xffffffff);
   if (typeof v.nextUnicastAddress !== 'number') {
     throw new Error('stored network state field "nextUnicastAddress" is not a number');
   }
+  assertRange('nextUnicastAddress', v.nextUnicastAddress, MIN_UNICAST_ADDRESS, MAX_UNICAST_ADDRESS + 1);
 
   return {
     netKey,
-    netKeyIndex: (v.netKeyIndex as number | null | undefined) ?? null,
+    netKeyIndex,
     appKey,
-    appKeyIndex: (v.appKeyIndex as number | null | undefined) ?? null,
+    appKeyIndex,
     ivIndex: v.ivIndex,
-    ourUnicastAddress: (v.ourUnicastAddress as number | null | undefined) ?? null,
+    ourUnicastAddress,
     nextUnicastAddress: v.nextUnicastAddress,
     nodes,
   };
@@ -339,27 +378,38 @@ export class NetworkStore {
   }
 
   /**
-   * Returns the current network state — a defined, empty `NetworkState`
-   * (see `EMPTY_NETWORK_STATE`) when nothing has been stored yet, or when
-   * what IS stored does not parse as this module's own shape. Never throws
-   * and never returns a cached object from an earlier call: every call
-   * decodes fresh from `settings.get`, so the only way two calls return
-   * `===`-identical nested values is if nothing was written in between AND
-   * nothing allocated via this same instance touched it either.
+   * The single read path both `getState` and `allocateUnicastAddress` build
+   * on. Distinguishes "nothing stored yet" from "something is stored but
+   * will not decode" — a distinction `getState` itself deliberately throws
+   * away (both read as the empty state, so a caller that only wants to READ
+   * never has to think about it), but which `allocateUnicastAddress` below
+   * cannot: it also WRITES, and overwriting a merely-unreadable value
+   * destroys the only remaining chance of recovering it (see that method's
+   * own comment). Returns a freshly built empty state (`freshEmptyState`),
+   * never the shared `EMPTY_NETWORK_STATE` singleton, for either case.
    */
-  getState(): NetworkState {
+  private readStateForWrite(): { state: NetworkState; corrupt: boolean } {
     const raw = this.settings.get(SETTINGS_KEY_NETWORK);
     if (raw === null || raw === undefined) {
-      return EMPTY_NETWORK_STATE;
+      return { state: freshEmptyState(), corrupt: false };
     }
     try {
-      return decodeNetworkState(raw);
+      return { state: decodeNetworkState(raw), corrupt: false };
     } catch {
-      // Corrupt settings data must never crash app startup (same rationale
-      // as the missing-key case above) — see store.test.ts's "garbage"
-      // case, which asserts this path specifically.
-      return EMPTY_NETWORK_STATE;
+      return { state: freshEmptyState(), corrupt: true };
     }
+  }
+
+  /**
+   * Returns the current network state — a defined, empty `NetworkState`
+   * when nothing has been stored yet, or when what IS stored does not parse
+   * as this module's own shape. Never throws, and never returns the same
+   * object instance across two calls (not even for the empty case — see
+   * `freshEmptyState`), so mutating what one call returned can never affect
+   * what a later call returns.
+   */
+  getState(): NetworkState {
+    return this.readStateForWrite().state;
   }
 
   /**
@@ -380,9 +430,43 @@ export class NetworkStore {
    * unicast range (Table 3.5, `MAX_UNICAST_ADDRESS`) is exhausted, which
    * three bulbs are nowhere near doing but a store must still say something
    * about rather than silently handing out an invalid address.
+   *
+   * REFUSES TO RUN when the stored network state is present but will not
+   * decode. `getState()` papers over that case as the empty state so a
+   * plain read never has to think about it — but this method does not just
+   * read, it writes the rest of that (empty) state straight back via
+   * `setState`, which would PERMANENTLY overwrite whatever was actually
+   * there. Per the design, losing the network/application keys and the
+   * node roster means physically factory-resetting every bulb; silently
+   * turning "unreadable" into "gone" would be the single most expensive
+   * failure this app can have, so this method would rather throw and leave
+   * the corrupt value exactly as it found it.
+   *
+   * CALLER HAZARD, worth a loud comment because nothing enforces it: this
+   * method does its own whole-state read-modify-write (read via
+   * `readStateForWrite`, write via `setState`). A caller that ALSO reads
+   * `getState()` before calling this and writes its own `setState()` after
+   * — e.g. "provision a node, then call this, then save the node entry" —
+   * will stomp this method's advance with its own stale copy of
+   * `nextUnicastAddress`, and the SAME address will be handed out again on
+   * the next call. Call this first and fold its result into your own
+   * single `setState`, or re-read state after calling it, never before.
+   *
+   * ALSO NOTE for whoever wires pairing (Task 6): this hands out exactly
+   * ONE address. A node with N elements occupies N consecutive unicast
+   * addresses (its primary element's address, then +1 per further
+   * element) — but composition data, which is what reveals N, is only read
+   * AFTER provisioning assigns the node's address. This method does not
+   * and cannot know N; the caller must advance `nextUnicastAddress` past
+   * the extra elements itself once it has read the composition.
    */
   allocateUnicastAddress(): number {
-    const state = this.getState();
+    const { state, corrupt } = this.readStateForWrite();
+    if (corrupt) {
+      throw new Error(
+        'cannot allocate a unicast address: the stored network state is present but unreadable; refusing to overwrite it (it may still be recoverable)',
+      );
+    }
     const address = state.nextUnicastAddress;
     if (address > MAX_UNICAST_ADDRESS) {
       throw new Error(
