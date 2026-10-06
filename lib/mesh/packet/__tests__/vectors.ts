@@ -9,7 +9,7 @@
  * format, Table 3.68 Application nonce format, Table 3.69 ASZMIC and Pad
  * field format, Table 3.70 Device nonce format, all in Section 3.9.5; Table
  * 3.25 Upper Transport Access PDU fields and Figure 3.17 in Section 3.6.2;
- * Table 3.15 Lower Transport PDU format, Table 3.17 Unsegmented Access
+ * Table 3.15 Lower Transport PDU format types, Table 3.17 Unsegmented Access
  * message format and Table 3.19 Unsegmented Control message format, all in
  * Section 3.5.2) and the worked examples below (Section 8.3 "Mesh message
  * sample data", messages #1, #2, #6, #16, #18, #20, #22, #23, #24) came from
@@ -41,6 +41,23 @@
  * bit set: `lowerTransport.ts`'s decoders must return null for exactly this
  * bit, and testing that against a fabricated byte would be the same kind of
  * unfalsifiable fixture this note exists to avoid.
+ *
+ * LOWER TRANSPORT REVIEW ROUND: a review of this task found that every
+ * access sample above has AKF=1 - so an encoder/decoder that silently
+ * ignored `akf` and always treated it as 1 would still pass every test
+ * (confirmed live by mutation; see `lowerTransport.test.ts`). Closed by
+ * transcribing Message #16's own "LowerTransportUnsegmentedAccessPDU" block
+ * (AKF=0, the DEVICE-key Config AppKey Status response already known as
+ * DEVICE_NONCE_SAMPLE_2) as `LOWER_TRANSPORT_SAMPLE_ACCESS_DEVICE_KEY`
+ * below - fetched the same way as everything else in this addition. The
+ * review also found four fixture fields (opcode on NETWORK_PDU_SAMPLE_1/2,
+ * akf/aid on NETWORK_PDU_SAMPLE_3/ODD_IV) that duplicated values already
+ * live in the LOWER_TRANSPORT_SAMPLE_* fixtures below with nothing reading
+ * either copy - closed not by deleting them but by cross-checking the two
+ * halves against each other in `lowerTransport.test.ts` (and, where a
+ * message has one, against its `UPPER_TRANSPORT_SAMPLE_*.aid` too), so a
+ * future edit to either copy that silently diverges from its sibling now
+ * fails a test instead of sitting unread.
  *
  * UPPER TRANSPORT ADDITION (same task that added `upperTransport.ts`): no
  * new message numbers were needed for the first three upper-transport
@@ -578,8 +595,8 @@ export const UPPER_TRANSPORT_SAMPLE_SZMIC = {
 
 /**
  * Lower Transport PDU sample data (Section 3.5.2; Table 3.15 "Lower
- * Transport PDU Format", Table 3.17 "Unsegmented Access message format",
- * Table 3.19 "Unsegmented Control message format"). Every sample below
+ * Transport PDU format types", Table 3.17 "Unsegmented Access message
+ * format", Table 3.19 "Unsegmented Control message format"). Every sample below
  * reuses a message already transcribed above for its nonce and/or
  * upper-transport row; what is new here is each message's own
  * "LowerTransportUnsegmentedAccessPDU"/"LowerTransportUnsegmentedControlPDU"
@@ -652,6 +669,32 @@ export const LOWER_TRANSPORT_SAMPLE_ACCESS_2 = {
 };
 
 /**
+ * Section 8.3.16 "Message #16": the same Config AppKey Status response as
+ * DEVICE_NONCE_SAMPLE_2 - a DEVICE-key Access message, so AKF=0 (not 1, as
+ * every other access sample above has it). This is the only AKF=0
+ * unsegmented access sample in this file, and without it nothing would
+ * notice an encoder/decoder that silently ignored `akf` in either direction
+ * (confirmed by mutation - see `lowerTransport.test.ts`): every other
+ * sample's published Header has bit 6 set, so a decoder hardcoded to
+ * report `akf: true` would still match every one of them.
+ *
+ * This message's own "LowerTransportUnsegmentedAccessPDU" block publishes
+ * SEG=00, AID=00 (not a derived AID - AKF=0 means no application key is
+ * involved, so this is a fixed placeholder, same reasoning as
+ * `UPPER_TRANSPORT_SAMPLE_DEVICE_KEY`'s own note), Header=00. The block's
+ * own row for this field is labelled "AFK" in the source document - the
+ * same transposition typo already noted in this file's header comment for
+ * DEVICE_NONCE_SAMPLE_1/_2 (it is the AKF field; the hex value is
+ * unaffected, only the row's English label is wrong).
+ */
+export const LOWER_TRANSPORT_SAMPLE_ACCESS_DEVICE_KEY = {
+  akf: false,
+  aid: 0x00,
+  upperTransportPdu: '89511bf1d1a81c11dcef',
+  expected: '0089511bf1d1a81c11dcef',
+};
+
+/**
  * Section 8.3.22 "Message #22": the same virtual-address vendor command as
  * UPPER_TRANSPORT_SAMPLE_VIRTUAL_SHORT_MIC - unsegmented, AKF=1, AID=0x26.
  * Not one of the NETWORK_PDU_SAMPLE_* above (those don't cover this
@@ -690,13 +733,35 @@ export const LOWER_TRANSPORT_SAMPLE_ACCESS_VIRTUAL_2 = {
  * "LowerTransportSegmentedAccessPDU" block publishes SEG=01, AKF=01, AID=26,
  * SZMIC=01, SeqZero=80d, SegO=00, SegN=01, Header=e6a03401 (4 octets, not 1
  * - a Segmented Access message's header carries more than SEG||AKF||AID,
- * which segmentation is a LATER task's job to decode), and
- * LowerTransportPDU=e6a03401c3c51d8e476b28e3aa5001f3.
+ * which segmentation is a LATER task's job to decode), `segment0`
+ * (`c3c51d8e476b28e3aa5001f3`, this message's single published segment),
+ * and `pdu` (Header||segment0, the complete on-the-wire
+ * LowerTransportPDU=e6a03401c3c51d8e476b28e3aa5001f3).
+ *
+ * An OBJECT, not a bare hex string, deliberately: the segmentation task
+ * will want these other fields (seqZero/segO/segN/szmic) anyway, and a
+ * later task adding them to a bare string would force a breaking shape
+ * change (and a vectors.ts/test.ts merge conflict) right when it is already
+ * busy implementing segmentation; recording them now, as inert data this
+ * task's own code does not read, costs nothing today. `aid` is cross-
+ * checked against `UPPER_TRANSPORT_SAMPLE_SZMIC.aid` and `segment0` against
+ * the first 12 octets of its `expected` below, in `lowerTransport.test.ts`.
  *
  * Not decoded for its content by this task - segmentation is explicitly out
- * of scope. Transcribed solely so `decodeUnsegmentedAccess`'s "SEG=1 returns
- * null" path is tested against genuine specification bytes with the bit
- * actually set, rather than an arbitrary fabricated byte nothing published
- * ever confirms is realistic.
+ * of scope. `pdu` exists solely so `decodeUnsegmentedAccess`/
+ * `decodeUnsegmentedControl`'s "SEG=1 returns null" path is tested against
+ * genuine specification bytes with the bit actually set, rather than an
+ * arbitrary fabricated byte nothing published ever confirms is realistic.
  */
-export const LOWER_TRANSPORT_SAMPLE_SEGMENTED = 'e6a03401c3c51d8e476b28e3aa5001f3';
+export const LOWER_TRANSPORT_SAMPLE_SEGMENTED = {
+  seg: true,
+  akf: true,
+  aid: 0x26,
+  szmic: true,
+  seqZero: 0x80d,
+  segO: 0x00,
+  segN: 0x01,
+  header: 'e6a03401',
+  segment0: 'c3c51d8e476b28e3aa5001f3',
+  pdu: 'e6a03401c3c51d8e476b28e3aa5001f3',
+};

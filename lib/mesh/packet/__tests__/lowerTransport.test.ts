@@ -10,9 +10,18 @@ import {
   LOWER_TRANSPORT_SAMPLE_CONTROL_2,
   LOWER_TRANSPORT_SAMPLE_ACCESS_1,
   LOWER_TRANSPORT_SAMPLE_ACCESS_2,
+  LOWER_TRANSPORT_SAMPLE_ACCESS_DEVICE_KEY,
   LOWER_TRANSPORT_SAMPLE_ACCESS_VIRTUAL_1,
   LOWER_TRANSPORT_SAMPLE_ACCESS_VIRTUAL_2,
   LOWER_TRANSPORT_SAMPLE_SEGMENTED,
+  NETWORK_PDU_SAMPLE_1,
+  NETWORK_PDU_SAMPLE_2,
+  NETWORK_PDU_SAMPLE_3,
+  NETWORK_PDU_SAMPLE_ODD_IV,
+  UPPER_TRANSPORT_SAMPLE_APPLICATION_KEY,
+  UPPER_TRANSPORT_SAMPLE_VIRTUAL_SHORT_MIC,
+  UPPER_TRANSPORT_SAMPLE_VIRTUAL_SHORT_MIC_SHARED_LABEL,
+  UPPER_TRANSPORT_SAMPLE_SZMIC,
 } from './vectors';
 
 describe('Unsegmented Access message (Section 3.5.2.1, Table 3.17)', () => {
@@ -60,6 +69,36 @@ describe('Unsegmented Access message (Section 3.5.2.1, Table 3.17)', () => {
       aid: LOWER_TRANSPORT_SAMPLE_ACCESS_2.aid,
       upperTransportPdu: hex(LOWER_TRANSPORT_SAMPLE_ACCESS_2.upperTransportPdu),
     });
+  });
+
+  // 8.3.16 "Message #16": the ONLY AKF=0 (device-key) sample in this file -
+  // every other access sample above has AKF=1. Without this sample, a
+  // decoder hardcoded to always report `akf: true` (or an encoder that
+  // always sets the AKF bit regardless of input) would pass every other
+  // test here, since every other published Header has bit 6 set. This gap
+  // was found by review and is deliberately closed this way: the mutation
+  // the review applied (encode ignores `akf`, decode reports it as always
+  // true) is re-run below and confirmed to now fail these two tests. AID=0
+  // is a fixed placeholder here, not a derived value (AKF=0 means no
+  // application key is involved - same reasoning as
+  // `UPPER_TRANSPORT_SAMPLE_DEVICE_KEY`'s own note in vectors.ts).
+  test('encodeUnsegmentedAccess matches the published Message #16 sample (AKF=0, device key)', () => {
+    const pdu = encodeUnsegmentedAccess({
+      akf: LOWER_TRANSPORT_SAMPLE_ACCESS_DEVICE_KEY.akf,
+      aid: LOWER_TRANSPORT_SAMPLE_ACCESS_DEVICE_KEY.aid,
+      upperTransportPdu: hex(LOWER_TRANSPORT_SAMPLE_ACCESS_DEVICE_KEY.upperTransportPdu),
+    });
+    expect(pdu.toString('hex')).toBe(LOWER_TRANSPORT_SAMPLE_ACCESS_DEVICE_KEY.expected);
+  });
+
+  test('decodeUnsegmentedAccess recovers the published Message #16 AKF=0/AID/payload', () => {
+    const decoded = decodeUnsegmentedAccess(hex(LOWER_TRANSPORT_SAMPLE_ACCESS_DEVICE_KEY.expected));
+    expect(decoded).toEqual({
+      akf: LOWER_TRANSPORT_SAMPLE_ACCESS_DEVICE_KEY.akf,
+      aid: LOWER_TRANSPORT_SAMPLE_ACCESS_DEVICE_KEY.aid,
+      upperTransportPdu: hex(LOWER_TRANSPORT_SAMPLE_ACCESS_DEVICE_KEY.upperTransportPdu),
+    });
+    expect(decoded?.akf).toBe(false); // the specific bit a hardcoded-true decoder would get wrong.
   });
 
   // 8.3.22 "Message #22": a virtual-address Access message - the lower
@@ -112,7 +151,7 @@ describe('Unsegmented Access message (Section 3.5.2.1, Table 3.17)', () => {
   // so this is real specification data with the bit actually on, not an
   // arbitrary fabricated byte.
   test('decodeUnsegmentedAccess returns null for the published Message #24 sample (SEG=1, segmented)', () => {
-    expect(decodeUnsegmentedAccess(hex(LOWER_TRANSPORT_SAMPLE_SEGMENTED))).toBeNull();
+    expect(decodeUnsegmentedAccess(hex(LOWER_TRANSPORT_SAMPLE_SEGMENTED.pdu))).toBeNull();
   });
 
   test('decodeUnsegmentedAccess returns null for an empty buffer rather than throwing', () => {
@@ -211,7 +250,7 @@ describe('Unsegmented Control message (Section 3.5.2.3, Table 3.19)', () => {
   // both decoders, and `decodeUnsegmentedControl` must reject it exactly as
   // `decodeUnsegmentedAccess` does.
   test('decodeUnsegmentedControl returns null for a PDU with SEG set', () => {
-    expect(decodeUnsegmentedControl(hex(LOWER_TRANSPORT_SAMPLE_SEGMENTED))).toBeNull();
+    expect(decodeUnsegmentedControl(hex(LOWER_TRANSPORT_SAMPLE_SEGMENTED.pdu))).toBeNull();
   });
 
   test('decodeUnsegmentedControl returns null for an empty buffer rather than throwing', () => {
@@ -253,5 +292,123 @@ describe('Unsegmented Control message (Section 3.5.2.3, Table 3.19)', () => {
   test('opcode 0x00 is not rejected - it round-trips like any other opcode here', () => {
     const pdu = encodeUnsegmentedControl({ opcode: 0x00, parameters: hex('aabb') });
     expect(decodeUnsegmentedControl(pdu)).toEqual({ opcode: 0x00, parameters: hex('aabb') });
+  });
+
+  // Finding (review): the encoder's opcode range is pinned by its own
+  // error-message test above ("rejects an out-of-range opcode"), but
+  // nothing exercised the DECODER's mask above six bits - narrowing it from
+  // 7 bits (0x7F) to 6 (0x3F) still passed every test here, since both
+  // published opcode samples (0x03, 0x04) fit in 6 bits, and so does 0x00.
+  // 0x7F is 2^7-1, the top of the 7-bit range Table 3.19 itself transcribes
+  // (not a value obtained by running this module's own code) - paired with
+  // the existing 0x00 round trip above (the bottom of that same range).
+  test('opcode 0x7F (top of the 7-bit range) round-trips, alongside the existing 0x00 (bottom) above', () => {
+    const pdu = encodeUnsegmentedControl({ opcode: 0x7f, parameters: hex('aabb') });
+    expect(decodeUnsegmentedControl(pdu)).toEqual({ opcode: 0x7f, parameters: hex('aabb') });
+  });
+});
+
+describe("decode returns a COPY, not a view onto the caller's buffer", () => {
+  // The network layer's own decoder slices a freshly-decrypted buffer, so
+  // it never aliases its input - this module is the first to hand back
+  // bytes sliced directly out of what the CALLER passed in, which is a real
+  // hazard with a reused BLE receive buffer: a later write to either one
+  // would otherwise silently reach through to the other.
+  test('decodeUnsegmentedAccess: writing to the input buffer after decoding does not change the decoded payload', () => {
+    const input = hex(LOWER_TRANSPORT_SAMPLE_ACCESS_1.expected);
+    const decoded = decodeUnsegmentedAccess(input);
+    const expectedPayload = hex(LOWER_TRANSPORT_SAMPLE_ACCESS_1.upperTransportPdu);
+    input.fill(0xff); // simulate the caller reusing/overwriting its receive buffer.
+    expect(decoded?.upperTransportPdu).toEqual(expectedPayload);
+  });
+
+  test('decodeUnsegmentedAccess: writing through the decoded payload does not corrupt the input buffer', () => {
+    const input = hex(LOWER_TRANSPORT_SAMPLE_ACCESS_1.expected);
+    const inputCopy = Buffer.from(input);
+    const decoded = decodeUnsegmentedAccess(input);
+    decoded?.upperTransportPdu.fill(0xff); // simulate a caller mutating what it got back.
+    expect(input).toEqual(inputCopy);
+  });
+
+  test('decodeUnsegmentedControl: writing to the input buffer after decoding does not change the decoded parameters', () => {
+    const input = hex(LOWER_TRANSPORT_SAMPLE_CONTROL_1.expected);
+    const decoded = decodeUnsegmentedControl(input);
+    const expectedParameters = hex(LOWER_TRANSPORT_SAMPLE_CONTROL_1.parameters);
+    input.fill(0xff);
+    expect(decoded?.parameters).toEqual(expectedParameters);
+  });
+
+  test('decodeUnsegmentedControl: writing through the decoded parameters does not corrupt the input buffer', () => {
+    const input = hex(LOWER_TRANSPORT_SAMPLE_CONTROL_1.expected);
+    const inputCopy = Buffer.from(input);
+    const decoded = decodeUnsegmentedControl(input);
+    decoded?.parameters.fill(0xff);
+    expect(input).toEqual(inputCopy);
+  });
+});
+
+// Finding (review): four fixture fields (opcode on NETWORK_PDU_SAMPLE_1/2,
+// akf/aid on NETWORK_PDU_SAMPLE_3/ODD_IV) duplicated values already live in
+// the LOWER_TRANSPORT_SAMPLE_* fixtures above with nothing reading either
+// copy - the same uncatchable-typo pattern this task's brief closed for the
+// fixtures it consumes directly, reopened beside them. Closed here by
+// cross-checking both copies against each other (and, where a message also
+// has an upper-transport `aid` fixture, against that too), so a future edit
+// that silently diverges one copy from its sibling fails a test instead of
+// sitting unread. Message #6's device-key sample has no `aid` at all (AKF=0
+// means none was derived - see vectors.ts) and Message #16's new device-key
+// fixture has no NETWORK_PDU_SAMPLE/UPPER_TRANSPORT_SAMPLE counterpart to
+// cross-check against, so neither appears below - there is nothing
+// duplicated to lock together for either one.
+describe('vectors.ts: duplicated fixture fields cross-check each other', () => {
+  test('Message #1: NETWORK_PDU_SAMPLE_1 and LOWER_TRANSPORT_SAMPLE_CONTROL_1 agree', () => {
+    expect(NETWORK_PDU_SAMPLE_1.opcode).toBe(LOWER_TRANSPORT_SAMPLE_CONTROL_1.opcode);
+    expect(NETWORK_PDU_SAMPLE_1.transportPdu).toBe(LOWER_TRANSPORT_SAMPLE_CONTROL_1.expected);
+  });
+
+  test('Message #2: NETWORK_PDU_SAMPLE_2 and LOWER_TRANSPORT_SAMPLE_CONTROL_2 agree', () => {
+    expect(NETWORK_PDU_SAMPLE_2.opcode).toBe(LOWER_TRANSPORT_SAMPLE_CONTROL_2.opcode);
+    expect(NETWORK_PDU_SAMPLE_2.transportPdu).toBe(LOWER_TRANSPORT_SAMPLE_CONTROL_2.expected);
+  });
+
+  test('Message #18: NETWORK_PDU_SAMPLE_3, UPPER_TRANSPORT_SAMPLE_APPLICATION_KEY and LOWER_TRANSPORT_SAMPLE_ACCESS_1 agree on AKF/AID', () => {
+    expect(NETWORK_PDU_SAMPLE_3.akf).toBe(LOWER_TRANSPORT_SAMPLE_ACCESS_1.akf);
+    expect(NETWORK_PDU_SAMPLE_3.aid).toBe(LOWER_TRANSPORT_SAMPLE_ACCESS_1.aid);
+    expect(NETWORK_PDU_SAMPLE_3.transportPdu).toBe(LOWER_TRANSPORT_SAMPLE_ACCESS_1.expected);
+    expect(UPPER_TRANSPORT_SAMPLE_APPLICATION_KEY.aid).toBe(LOWER_TRANSPORT_SAMPLE_ACCESS_1.aid);
+  });
+
+  test('Message #20: NETWORK_PDU_SAMPLE_ODD_IV and LOWER_TRANSPORT_SAMPLE_ACCESS_2 agree on AKF/AID/PDU', () => {
+    expect(NETWORK_PDU_SAMPLE_ODD_IV.akf).toBe(LOWER_TRANSPORT_SAMPLE_ACCESS_2.akf);
+    expect(NETWORK_PDU_SAMPLE_ODD_IV.aid).toBe(LOWER_TRANSPORT_SAMPLE_ACCESS_2.aid);
+    expect(NETWORK_PDU_SAMPLE_ODD_IV.transportPdu).toBe(LOWER_TRANSPORT_SAMPLE_ACCESS_2.expected);
+  });
+
+  test('Message #22: UPPER_TRANSPORT_SAMPLE_VIRTUAL_SHORT_MIC and LOWER_TRANSPORT_SAMPLE_ACCESS_VIRTUAL_1 agree on AID/payload', () => {
+    expect(UPPER_TRANSPORT_SAMPLE_VIRTUAL_SHORT_MIC.aid).toBe(LOWER_TRANSPORT_SAMPLE_ACCESS_VIRTUAL_1.aid);
+    expect(UPPER_TRANSPORT_SAMPLE_VIRTUAL_SHORT_MIC.expected).toBe(
+      LOWER_TRANSPORT_SAMPLE_ACCESS_VIRTUAL_1.upperTransportPdu,
+    );
+  });
+
+  test('Message #23: UPPER_TRANSPORT_SAMPLE_VIRTUAL_SHORT_MIC_SHARED_LABEL and LOWER_TRANSPORT_SAMPLE_ACCESS_VIRTUAL_2 agree on AID/payload', () => {
+    expect(UPPER_TRANSPORT_SAMPLE_VIRTUAL_SHORT_MIC_SHARED_LABEL.aid).toBe(
+      LOWER_TRANSPORT_SAMPLE_ACCESS_VIRTUAL_2.aid,
+    );
+    expect(UPPER_TRANSPORT_SAMPLE_VIRTUAL_SHORT_MIC_SHARED_LABEL.expected).toBe(
+      LOWER_TRANSPORT_SAMPLE_ACCESS_VIRTUAL_2.upperTransportPdu,
+    );
+  });
+
+  // Message #24 is segmented (not decoded by this task), but its `aid` and
+  // first-segment bytes are independently transcribed in two different
+  // sections of vectors.ts (the upper-transport sample and
+  // LOWER_TRANSPORT_SAMPLE_SEGMENTED) - cross-checked so they cannot
+  // silently drift apart even though neither is read by this task's code.
+  test('Message #24: UPPER_TRANSPORT_SAMPLE_SZMIC and LOWER_TRANSPORT_SAMPLE_SEGMENTED agree on AID, and segment0 is the first 12 octets of the full UpperTransportPDU', () => {
+    expect(UPPER_TRANSPORT_SAMPLE_SZMIC.aid).toBe(LOWER_TRANSPORT_SAMPLE_SEGMENTED.aid);
+    expect(hex(UPPER_TRANSPORT_SAMPLE_SZMIC.expected).subarray(0, 12)).toEqual(
+      hex(LOWER_TRANSPORT_SAMPLE_SEGMENTED.segment0),
+    );
   });
 });
