@@ -148,7 +148,7 @@ describe('decodeConfigStatus: Config AppKey Status (Table 4.122, Section 8.3.16 
     });
   });
 
-  test('a non-Success status (0x0d, "Cannot Bind") is named correctly - the published sample is always Success, so this is the one the brief warns a lazy decoder could fake', () => {
+  test('a non-Success status (0x0d, "Cannot Bind") is named correctly - the published sample is always Success, so this is the one this task\'s own dispatch instructions warned a lazy decoder could fake', () => {
     // Opcode (8003) || Status (0d) || NetKeyIndexAndAppKeyIndex (same packed bytes as Message #16).
     const pdu = hex('80030d' + '563412');
     const result = decodeConfigStatus(pdu);
@@ -407,6 +407,23 @@ describe('describeConfigStatus (Table 4.308)', () => {
       expect(describeConfigStatus(code)).toBe(name);
     },
   );
+
+  // The sweep above is driven by CONFIG_STATUS_CODES itself, so a row
+  // deleted from BOTH the fixture and the implementation's own map at once
+  // passes it silently (the fixture would just have one fewer entry to
+  // check, and the out-of-range tests below don't cover whatever used to
+  // be the table's last defined row). These two anchors do NOT read
+  // CONFIG_STATUS_CODES at all - they pin the fixture's own size, and the
+  // highest defined code's name, as literal, independent values - so the
+  // boundary between "defined" and "RFU" is held from below as well as
+  // from above (0x16/0xff).
+  test('the table defines exactly 22 status codes (0x00 through 0x15), independent of the fixture array', () => {
+    expect(CONFIG_STATUS_CODES).toHaveLength(22);
+  });
+
+  test('0x15, the highest defined code, names "Invalid Bearer" (hardcoded here, not read from CONFIG_STATUS_CODES, so a row deleted from both the map and the fixture cannot pass silently)', () => {
+    expect(describeConfigStatus(0x15)).toBe('Invalid Bearer');
+  });
 
   test('0x16, the first RFU code, names null', () => {
     expect(describeConfigStatus(0x16)).toBeNull();

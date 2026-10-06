@@ -328,8 +328,11 @@ export const CONFIG_KEY_INDEX_TOP_OF_RANGE_SAMPLE = {
  * above (Section 8.10.1's own published model list/vendor model), and
  * Status 0x0d ("Cannot Bind") is Table 4.308's own published row for the
  * one status code this exact message is most likely to return in practice
- * - deliberately NOT 0x00 "Success" (the brief's own warning: "any status
- * code whose published sample value happens to be success").
+ * - deliberately NOT 0x00 "Success" (this task's own dispatch instructions
+ * warned against exactly this gap: "any status code whose published sample
+ * value happens to be success" - that sentence is from the dispatch
+ * message, not from `task-5-brief.md`, which is why it won't turn up in a
+ * grep of the file tree).
  *
  * Byte-by-byte (Table 3.64 Company-Identifier-first; Section 3.1.1/3.7.1
  * little-endian throughout):

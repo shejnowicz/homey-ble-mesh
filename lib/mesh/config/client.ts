@@ -174,17 +174,21 @@ function assertConfigField(field: string, value: number, max: number): void {
 // value, not a separate packing convention layered on top of endianness
 // (`provisioning/machine.ts`'s module header works through why in detail,
 // for the same figures cited from Provisioning's side) - which is why
-// every message below uses it (Table 4.119/4.122's own field text:
-// "These two indexes shall be encoded as defined in Section 4.3.1.1";
-// Table 4.128/4.130's own field text: "The AppKeyIndex field shall be
-// encoded as defined in Section 4.3.1.1").
+// every message below uses it (Table 4.119/4.122's own field text: "These
+// two indexes shall be encoded as defined in Section 4.3.1.1 using NetKey
+// Index as first key index and AppKey Index as second key index" - the
+// clause that fixes which index goes in which half; Table 4.128/4.130's
+// own field text: "The AppKeyIndex field shall be encoded as defined in
+// Section 4.3.1.1").
 // ===========================================================================
 
 /**
  * Packs two 12-bit global key indexes into three octets (Figure 4.4).
  * VERIFIED against Section 8.3.6 "Message #6" (a Config AppKey Add):
  * NetKeyIndex=0x456, AppKeyIndex=0x123 (Table 4.119's own field text:
- * "NetKey Index as first key index and AppKey Index as second key index")
+ * "These two indexes shall be encoded as defined in Section 4.3.1.1 using
+ * NetKey Index as first key index and AppKey Index as second key index" -
+ * the clause that fixes which argument below is `first`)
  * publishes as `56 34 12` - exactly what this formula produces by hand:
  * octet0 = 0x456 & 0xff = 0x56; octet1 = ((0x456>>8)&0xf) | ((0x123&0xf)<<4)
  * = 0x4 | 0x30 = 0x34; octet2 = (0x123>>4)&0xff = 0x12.
@@ -386,8 +390,8 @@ export function encodeConfigAppKeyAdd(params: ConfigAppKeyAddParams): Buffer {
   const indexes = packTwoKeyIndexes(params.netKeyIndex, params.appKeyIndex);
   // Buffer.from(Buffer) copies - never retain a view into the caller's own
   // `appKey` buffer (the global constraint this project's earlier tasks
-  // left unmet in three places - see `provisioning/machine.ts`'s review
-  // addendum).
+  // left unmet in three places - see `composition.ts`'s own NO BUFFER
+  // ALIASING note).
   const parameters = Buffer.concat([indexes, Buffer.from(params.appKey)]);
   return encodeAccessMessage({ opcode: OPCODE_APPKEY_ADD, parameters });
 }
