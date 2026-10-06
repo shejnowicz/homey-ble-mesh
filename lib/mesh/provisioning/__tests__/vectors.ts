@@ -238,3 +238,62 @@ export const PDU_TYPE_SAMPLE_COMPLETE = {
   message: '08',
   fields: {},
 };
+
+/**
+ * Section 8.17.1 "BTM_ECDH_P256_CMAC_AES128_AES_CCM algorithm" - the full
+ * worked provisioning security-functions computation (Section 5.4.2.4
+ * "Authentication" and Section 5.4.2.5), fetched and extracted the same way
+ * as the rest of this file. This is the SAME worked exchange as both this
+ * file's `PDU_TYPE_SAMPLE_*` fixtures above and
+ * `crypto/__tests__/vectors.ts`'s `PROVISIONING_SAMPLE` - every value below
+ * that already exists in one of those two places is reused by reference in
+ * `crypto.test.ts` rather than copied here a second time:
+ *   - `provisionerPublicKeyX/Y`, `devicePublicKeyX/Y`, `expectedSharedSecret`
+ *     (= ECDHSecret), `sessionKey`, `sessionNonce` - all in
+ *     `crypto/__tests__/vectors.ts`'s `PROVISIONING_SAMPLE`.
+ *   - `randomProvisioner`/`confirmationProvisioner` - this file's own
+ *     `PDU_TYPE_SAMPLE_RANDOM_PROVISIONER.fields.random` /
+ *     `PDU_TYPE_SAMPLE_CONFIRMATION_PROVISIONER.fields.confirmation`.
+ *   - `randomDevice`/`confirmationDevice` - this file's own
+ *     `PDU_TYPE_SAMPLE_RANDOM_DEVICE.fields.random` /
+ *     `PDU_TYPE_SAMPLE_CONFIRMATION_DEVICE.fields.confirmation`.
+ *
+ * Only the values with no existing home in this repository are given below:
+ * the three Provisioning PDUs' published `ProvisioningInvite`/
+ * `ProvisioningCapabilities`/`ProvisioningStart` fields EXCLUDING their Type
+ * octet (Section 5.4.2.4.1 calls these "...PDUValue"; `PDU_TYPE_SAMPLE_INVITE`
+ * etc. above publish the Type-octet-INCLUDING wire `message` instead - cross-
+ * checked byte-for-byte: `PDU_TYPE_SAMPLE_INVITE.message` is `00` (Type) +
+ * `00`, `PDU_TYPE_SAMPLE_CAPABILITIES.message` is `01` (Type) +
+ * `0100010000000000000000`, `PDU_TYPE_SAMPLE_START.message` is `02` (Type) +
+ * `0000000000` - each Parameters-only tail below is identical to the
+ * corresponding Type-octet-stripped `message` tail), `authValue` (the
+ * No-OOB, all-zero 128-bit AuthValue Section 5.4.2.4.1 defines), the
+ * genuinely new `confirmationSalt`/`confirmationKey`/`provisioningSalt`
+ * intermediates, `sessionNonceFull` (the 16-octet k1 output SessionNonce is
+ * truncated FROM - published alongside `SessionNonce` itself, needed to
+ * pin which 13 of its 16 octets are kept), and `deviceKey`, the chain's
+ * final published value.
+ *
+ * ERRATA: see `lib/mesh/provisioning/crypto.ts`'s own module header for the
+ * Section 5.4.2.4.1 formula that misprints "ConfirmationProvisioner" a
+ * second time where it means "ConfirmationDevice" - this file only carries
+ * sample DATA, not the prose formulas, so that errata note lives with the
+ * code that had to resolve it.
+ */
+export const PROVISIONING_CRYPTO_SAMPLE = {
+  /** Table 5.18 Parameters (Type octet excluded): Attention Duration only. */
+  provisioningInvite: '00',
+  /** Table 5.19 Parameters (Type octet excluded), 11 octets. */
+  provisioningCapabilities: '0100010000000000000000',
+  /** Table 5.28 Parameters (Type octet excluded), 5 octets. */
+  provisioningStart: '0000000000',
+  /** Section 5.4.2.4.1: the No-OOB AuthValue, 128-bit all-zero. */
+  authValue: '00000000000000000000000000000000',
+  confirmationSalt: '5faabe187337c71cc6c973369dcaa79a',
+  confirmationKey: 'e31fe046c68ec339c425fc6629f0336f',
+  provisioningSalt: 'a21c7d45f201cf9489a2fb57145015b4',
+  /** The 16-octet k1(ECDHSecret, ProvisioningSalt, "prsn") output, before the 13-least-significant-octets truncation (Section 5.4.2.5). */
+  sessionNonceFull: 'c5e02eda7ddbe78b5f62b81d6847487e',
+  deviceKey: '0520adad5e0142aa3e325087b4ec16d8',
+};

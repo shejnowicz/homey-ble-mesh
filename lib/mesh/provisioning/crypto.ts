@@ -1,0 +1,200 @@
+import { aesCmac, s1 } from '../crypto/cmac';
+import { k1 } from '../crypto/derive';
+
+/**
+ * Provisioning's security functions (Mesh Protocol v1.1, Section 5.4.2.4
+ * "Authentication" and Section 5.4.2.5 "Generation of ProvisioningSalt,
+ * SessionKey, device key and nonce"), restricted to the
+ * BTM_ECDH_P256_CMAC_AES128_AES_CCM algorithm - the only one this project's
+ * `crypto/derive.ts` implements (there is no `k5`/`s2`, the key-derivation
+ * functions the other algorithm, BTM_ECDH_P256_HMAC_SHA256_AES_CCM, needs;
+ * this module's own `RANDOM_LENGTH`/`AUTH_VALUE_LENGTH` constants below are
+ * this algorithm's 128-bit sizes, not that algorithm's 256-bit ones).
+ *
+ * Every derivation here is built from `s1`/`k1`/`aesCmac` (`crypto/cmac.ts`,
+ * `crypto/derive.ts`) exactly as Section 5.4.2.4.1/5.4.2.5 states them, each
+ * exported as its own function and named after the specification's own name
+ * for it (ConfirmationSalt, ConfirmationKey, the confirmation value,
+ * ProvisioningSalt, SessionKey, SessionNonce, DevKey) - never collapsed into
+ * one end-to-end call, because a single function covering the whole chain
+ * would hide exactly the "two compensating mistakes" failure mode the
+ * published sample's per-step values exist to catch (see `__tests__/crypto.test.ts`).
+ *
+ * CONCATENATION ORDER (Section 5.4.2.4.1):
+ *
+ *   ConfirmationInputs = ProvisioningInvitePDUValue ||
+ *                         ProvisioningCapabilitiesPDUValue ||
+ *                         ProvisioningStartPDUValue ||
+ *                         PublicKeyProvisioner || PublicKeyDevice
+ *   ConfirmationSalt   = s1(ConfirmationInputs)
+ *   ConfirmationKey    = k1(ECDHSecret, ConfirmationSalt, "prck")
+ *
+ * ...and the confirmation value itself (Section 5.4.2.4.1 - the formula is
+ * textually identical for both sides, only the Random operand differs; see
+ * the ERRATA note below):
+ *
+ *   ConfirmationProvisioner = AES-CMAC_ConfirmationKey(RandomProvisioner || AuthValue)
+ *   ConfirmationDevice      = AES-CMAC_ConfirmationKey(RandomDevice      || AuthValue)
+ *
+ * ERRATA (Section 5.4.2.4.1, confirmed against the published sample data,
+ * Section 8.17.1): the document's own second formula is printed as
+ * "ConfirmationProvisioner=AES-CMAC_ConfirmationKey(RandomDevice || AuthValue)"
+ * - the SAME left-hand name as the first formula, which cannot be right
+ * since the sample's distinct `ConfirmationDeviceInput`/`ConfirmationDevice`
+ * rows confirm this second formula is the one producing ConfirmationDevice
+ * (from RandomDevice), not a second definition of ConfirmationProvisioner.
+ * Matched on the formula's own Random operand and the sample's row labels,
+ * not on the mis-copied left-hand name - the same "match on position and
+ * meaning" rule `provisioning/__tests__/vectors.ts` already documents for
+ * this same section's table-caption errata. `confirmationValue` below is the
+ * one function both sides share, taking whichever Random value the caller
+ * already knows is its own.
+ *
+ * Section 5.4.2.5 (ProvisioningSalt/SessionKey/SessionNonce):
+ *
+ *   ProvisioningSalt = s1(ConfirmationSalt || RandomProvisioner || RandomDevice)
+ *   SessionKey       = k1(ECDHSecret, ProvisioningSalt, "prsk")
+ *   SessionNonce     = the 13 LEAST SIGNIFICANT octets of
+ *                      k1(ECDHSecret, ProvisioningSalt, "prsn")
+ *
+ * "Least significant" means the rightmost (last) bytes of the 16-octet k1
+ * output, not the leftmost - confirmed directly against the sample: its
+ * published `SessionNonceFull` is `c5e02e` || `da7ddbe78b5f62b81d6847487e`,
+ * and the published `SessionNonce` is that second, 13-octet piece (the
+ * LAST 13 bytes), not the first. Section 3.8.2 ("Encryption function" /
+ * Figure 3.3's own big-endian "IN" presentation and `k2`'s identical
+ * low-order convention for NID in `derive.ts`) is the general mesh
+ * convention this follows: later field positions in a big-endian stream are
+ * the lower-order ones.
+ *
+ * Section 3.9.6.1 "Device key" (Figure 3.52):
+ *
+ *   DevKey = k1(ECDHSecret, ProvisioningSalt, "prdk")
+ *
+ * VALIDATION: every Buffer parameter below is a MESSAGE operand to
+ * `s1`/`aesCmac`, never the CMAC key - `createCipheriv('aes-128-ecb', ...)`
+ * only enforces a key's length (16 bytes), never a message's, so a
+ * wrong-length message operand would not throw on its own; it would instead
+ * silently fold into the hash and produce a different, still "plausible",
+ * wrong answer - the exact failure category this project's `assertBufferLength`-style
+ * guards (`pdu.ts`, `ecdh.ts`) exist to turn into a thrown error instead.
+ * `ecdhSecret` is likewise validated here even though `k1`'s own `n` operand
+ * accepts any length: Section 5.4.2.3 fixes ECDHSecret at 32 octets (the
+ * P-256 shared secret `ecdh.ts#sharedSecret` always returns), so a
+ * wrong-length one reaching this module is a caller bug, not a protocol
+ * variation to tolerate.
+ */
+
+const PRCK = Buffer.from('prck', 'ascii'); // Section 5.4.2.4.1: ConfirmationKey's k1 "P".
+const PRSK = Buffer.from('prsk', 'ascii'); // Section 5.4.2.5: SessionKey's k1 "P".
+const PRSN = Buffer.from('prsn', 'ascii'); // Section 5.4.2.5: SessionNonce's k1 "P".
+const PRDK = Buffer.from('prdk', 'ascii'); // Section 3.9.6.1: DevKey's k1 "P".
+
+/** Section 5.4.2.5: "The nonce shall be the 13 least significant octets of" SessionNonce's 16-octet k1 output. */
+const SESSION_NONCE_LENGTH = 13;
+
+/** Table 5.18: Provisioning Invite PDU Parameters (excluding the Type octet) - Attention Duration, 1 octet. */
+const INVITE_VALUE_LENGTH = 1;
+/** Table 5.19: Provisioning Capabilities PDU Parameters (excluding the Type octet) - 11 octets. */
+const CAPABILITIES_VALUE_LENGTH = 11;
+/** Table 5.28: Provisioning Start PDU Parameters (excluding the Type octet) - 5 octets. */
+const START_VALUE_LENGTH = 5;
+/** Table 5.36: Public Key X (32) || Public Key Y (32) - the same raw, prefix-less P-256 point `ecdh.ts` uses. */
+const PUBLIC_KEY_LENGTH = 64;
+/** Section 5.4.2.4.1: RandomProvisioner/RandomDevice under BTM_ECDH_P256_CMAC_AES128_AES_CCM - 128-bit. */
+const RANDOM_LENGTH = 16;
+/** Section 5.4.2.4.1: AuthValue under BTM_ECDH_P256_CMAC_AES128_AES_CCM - 128-bit. */
+const AUTH_VALUE_LENGTH = 16;
+/** Every `s1`/`aesCmac` output this module passes onward - 128 bits, the AES block size. */
+const SALT_OR_KEY_LENGTH = 16;
+/** Section 5.4.2.3: ECDHSecret, the raw P-256 shared secret `ecdh.ts#sharedSecret` returns. */
+const ECDH_SECRET_LENGTH = 32;
+
+function assertLength(field: string, value: Buffer, expected: number): void {
+  if (value.length !== expected) {
+    throw new Error(`provisioning crypto "${field}" must be ${expected} bytes, got ${value.length}`);
+  }
+}
+
+/**
+ * ConfirmationSalt = s1(ConfirmationInputs), where ConfirmationInputs is the
+ * concatenation - in this exact order - of the Invite, Capabilities and
+ * Start Provisioning PDUs' own Parameters (opcode excluded) and both sides'
+ * raw public keys. Reversing any part of this order changes the hash input
+ * and so the result; see the module header's CONCATENATION ORDER note.
+ */
+export function confirmationSalt(
+  provisioningInvitePduValue: Buffer,
+  provisioningCapabilitiesPduValue: Buffer,
+  provisioningStartPduValue: Buffer,
+  publicKeyProvisioner: Buffer,
+  publicKeyDevice: Buffer,
+): Buffer {
+  assertLength('provisioningInvitePduValue', provisioningInvitePduValue, INVITE_VALUE_LENGTH);
+  assertLength('provisioningCapabilitiesPduValue', provisioningCapabilitiesPduValue, CAPABILITIES_VALUE_LENGTH);
+  assertLength('provisioningStartPduValue', provisioningStartPduValue, START_VALUE_LENGTH);
+  assertLength('publicKeyProvisioner', publicKeyProvisioner, PUBLIC_KEY_LENGTH);
+  assertLength('publicKeyDevice', publicKeyDevice, PUBLIC_KEY_LENGTH);
+
+  const confirmationInputs = Buffer.concat([
+    provisioningInvitePduValue,
+    provisioningCapabilitiesPduValue,
+    provisioningStartPduValue,
+    publicKeyProvisioner,
+    publicKeyDevice,
+  ]);
+  return s1(confirmationInputs);
+}
+
+/** ConfirmationKey = k1(ECDHSecret, ConfirmationSalt, "prck"). */
+export function confirmationKey(ecdhSecret: Buffer, confirmationSaltValue: Buffer): Buffer {
+  assertLength('ecdhSecret', ecdhSecret, ECDH_SECRET_LENGTH);
+  assertLength('confirmationSaltValue', confirmationSaltValue, SALT_OR_KEY_LENGTH);
+  return k1(ecdhSecret, confirmationSaltValue, PRCK);
+}
+
+/**
+ * ConfirmationProvisioner/ConfirmationDevice = AES-CMAC_ConfirmationKey(Random
+ * || AuthValue) - the one formula both sides share (see the module header's
+ * ERRATA note); the caller passes RandomProvisioner for its own
+ * ConfirmationProvisioner, RandomDevice for ConfirmationDevice.
+ */
+export function confirmationValue(confirmationKeyValue: Buffer, random: Buffer, authValue: Buffer): Buffer {
+  assertLength('confirmationKeyValue', confirmationKeyValue, SALT_OR_KEY_LENGTH);
+  assertLength('random', random, RANDOM_LENGTH);
+  assertLength('authValue', authValue, AUTH_VALUE_LENGTH);
+  return aesCmac(confirmationKeyValue, Buffer.concat([random, authValue]));
+}
+
+/** ProvisioningSalt = s1(ConfirmationSalt || RandomProvisioner || RandomDevice). */
+export function provisioningSalt(confirmationSaltValue: Buffer, randomProvisioner: Buffer, randomDevice: Buffer): Buffer {
+  assertLength('confirmationSaltValue', confirmationSaltValue, SALT_OR_KEY_LENGTH);
+  assertLength('randomProvisioner', randomProvisioner, RANDOM_LENGTH);
+  assertLength('randomDevice', randomDevice, RANDOM_LENGTH);
+  return s1(Buffer.concat([confirmationSaltValue, randomProvisioner, randomDevice]));
+}
+
+/** SessionKey = k1(ECDHSecret, ProvisioningSalt, "prsk"). */
+export function sessionKey(ecdhSecret: Buffer, provisioningSaltValue: Buffer): Buffer {
+  assertLength('ecdhSecret', ecdhSecret, ECDH_SECRET_LENGTH);
+  assertLength('provisioningSaltValue', provisioningSaltValue, SALT_OR_KEY_LENGTH);
+  return k1(ecdhSecret, provisioningSaltValue, PRSK);
+}
+
+/**
+ * SessionNonce = the 13 least significant (i.e. last) octets of
+ * k1(ECDHSecret, ProvisioningSalt, "prsn").
+ */
+export function sessionNonce(ecdhSecret: Buffer, provisioningSaltValue: Buffer): Buffer {
+  assertLength('ecdhSecret', ecdhSecret, ECDH_SECRET_LENGTH);
+  assertLength('provisioningSaltValue', provisioningSaltValue, SALT_OR_KEY_LENGTH);
+  const full = k1(ecdhSecret, provisioningSaltValue, PRSN);
+  return full.subarray(full.length - SESSION_NONCE_LENGTH);
+}
+
+/** DevKey = k1(ECDHSecret, ProvisioningSalt, "prdk") (Section 3.9.6.1, Figure 3.52). */
+export function deviceKey(ecdhSecret: Buffer, provisioningSaltValue: Buffer): Buffer {
+  assertLength('ecdhSecret', ecdhSecret, ECDH_SECRET_LENGTH);
+  assertLength('provisioningSaltValue', provisioningSaltValue, SALT_OR_KEY_LENGTH);
+  return k1(ecdhSecret, provisioningSaltValue, PRDK);
+}
