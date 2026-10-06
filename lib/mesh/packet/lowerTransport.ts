@@ -1,11 +1,14 @@
 import { assertRange } from './ranges';
 
 /**
- * The lower transport layer's UNSEGMENTED PDUs (Mesh Protocol v1.1, Section
- * 3.5.2 "Lower Transport PDU"). Segmentation (Segmented Access/Control
- * messages) and segment acknowledgement are later tasks and are not built
- * here - this module only encodes/decodes a Lower Transport PDU that
- * already fits in a single Network PDU.
+ * The lower transport layer (Mesh Protocol v1.1, Section 3.5.2 "Lower
+ * Transport PDU"): the UNSEGMENTED PDUs (both encode and decode), plus
+ * splitting an Upper Transport Access PDU into Segmented Access messages
+ * and decoding a single received one back. REASSEMBLING a complete Upper
+ * Transport PDU from several received segments is the next task and is NOT
+ * built here (see that section's own note below) - nor is the Segmented
+ * Control message or the Segment Acknowledgment message, both later tasks
+ * too.
  *
  * Section 3.5.2 states the shared rule both formats below follow: "The most
  * significant bit of the first octet of the Lower Transport PDU is the SEG
@@ -26,19 +29,26 @@ import { assertRange } from './ranges';
  * CTL is a Network PDU field (already decoded by `./network` before this
  * module ever sees the bytes), so this module itself only ever has to tell
  * SEG apart - a caller already knows from CTL whether to call the access or
- * the control decoder. Both decoders below return `null`, not an error, when
- * SEG says the PDU is segmented: that is not malformed input, it is a
- * different message type for a later task's decoder to route to instead.
+ * the control decoder. `decodeUnsegmentedAccess` returns `null`, not an
+ * error, when SEG says the PDU is segmented: that is not malformed input,
+ * it is `decodeSegmentedAccess`'s job instead (both live in this same file
+ * now). `decodeUnsegmentedControl` still returns `null` for SEG=1 for the
+ * same reason, but its sibling (the Segmented Control message, Table 3.15's
+ * fourth row) is a later task's decoder to route to.
  *
  * The header bit/field constants just below (`SEG_BIT`, `AKF_BIT`,
  * `MAX_AID`, `MAX_OPCODE`) are hoisted to module scope, ahead of either
  * message format, because they are not unsegmented-specific: AKF/AID are
  * reused unchanged by the Segmented Access message (Table 3.18, Section
- * 3.5.2.2 - a later task), and the Opcode field/range is shared with the
- * Segment Acknowledgment message (Table 3.21, Section 3.5.2.3.1 - also a
- * later task, see that section's own note below). Only the two formats'
- * LENGTH bounds differ between segmented and unsegmented, so those stay
- * qualified ("unsegmented") and local to each section below.
+ * 3.5.2.2 - built further down in this same file), and the Opcode
+ * field/range is shared with the Segment Acknowledgment message (Table
+ * 3.21, Section 3.5.2.3.1 - still a later task, see that section's own note
+ * below). Only the two UNSEGMENTED formats' LENGTH bounds differ from their
+ * segmented siblings, so those two stay qualified ("unsegmented") and local
+ * to each section below; the Segmented Access message's own length-related
+ * constants are local to its own section for the same reason, just not
+ * qualified the same way since there is no risk of confusing them with an
+ * unsegmented bound of the same name.
  *
  * UNSEGMENTED ACCESS MESSAGE (Section 3.5.2.1, Table 3.17 "Unsegmented
  * Access message format"):
@@ -273,8 +283,205 @@ export function decodeUnsegmentedControl(pdu: Buffer): UnsegmentedControlPdu | n
 }
 
 // ===========================================================================
-// Segmented Access message (Section 3.5.2.2) and Segmented Control message
-// (Section 3.5.2.4), plus the Segment Acknowledgment message (Section
-// 3.5.2.3.1, opcode 0x00 of the control format above), are later tasks.
-// Append their code below this line, grouped the same way as above.
+// Segmented Access message (Section 3.5.2.2, Table 3.18)
+// ===========================================================================
+
+// Table 3.18's header is 4 octets (32 bits), not 1 like the unsegmented
+// formats above: SEG(1)+AKF(1)+AID(6) share the first octet (same bit
+// positions as the unsegmented formats, hence SEG_BIT/AKF_BIT/MAX_AID being
+// reused unchanged here - see the module header), and the remaining 3
+// octets carry SZMIC(1)+SeqZero(13)+SegO(5)+SegN(5) = 24 bits, MSB-first.
+const SEGMENTED_ACCESS_HEADER_LENGTH = 4;
+const MAX_SEQ_ZERO = 0x1fff; // 13 bits, bits 22-10 of the 32-bit header (Table 3.18).
+const MAX_SEG_NUMBER = 0x1f; // 5 bits, shared by SegO (bits 9-5) and SegN (bits 4-0) (Table 3.18).
+// Bit 23 of the 32-bit header, i.e. bit 7 of the header's SECOND octet -
+// the top bit of the 24-bit SZMIC||SeqZero||SegO||SegN value this module
+// builds/reads one octet at a time below.
+const SZMIC_BIT = 0x800000;
+
+// Table 3.18: "For all segments except the last segment, Segment m is
+// octet 12*m to 12*m+11" - every non-last segment is exactly 12 octets, and
+// no segment is ever 0 (the last segment is "octet 12*m through the end of
+// the message", i.e. 1 to 12 octets). SegN/SegO are 5 bits (0-31), so at
+// most 32 segments - Section 2.3.3 "Messages" states the resulting ceiling
+// directly: "The lower transport layer provides a SAR mechanism capable of
+// transporting up to 32 Access or Transport Control message segments. The
+// maximum Upper Transport Access PDU size when using a SAR is 384 octets."
+const MAX_SEGMENT_PAYLOAD_LENGTH = 12;
+const MAX_SEGMENTS = MAX_SEG_NUMBER + 1; // 32.
+const MAX_SEGMENTED_UPPER_TRANSPORT_PDU_LENGTH = MAX_SEGMENTS * MAX_SEGMENT_PAYLOAD_LENGTH; // 384.
+
+export interface SegmentedAccessInput {
+  /** Application Key Flag: false = device key, true = application key (Table 3.18). */
+  akf: boolean;
+  /** 6-bit application key identifier (Table 3.18); meaningless when `akf` is false. */
+  aid: number;
+  /** Size of the TransMIC field this Upper Transport Access PDU carries: false = 32-bit, true = 64-bit (Table 3.18). */
+  szmic: boolean;
+  /**
+   * 13-bit least significant bits of SeqAuth (Table 3.18), set by the upper
+   * transport layer; carried unchanged on every segment of the same
+   * message and taken on trust from the caller, the same trust boundary
+   * `upperTransport.ts`'s own `szmic` parameter already documents for
+   * ASZMIC (this module does not derive SeqAuth itself - that needs the IV
+   * Index and the original SEQ, neither of which this layer has).
+   */
+  seqZero: number;
+  /** The complete Upper Transport Access PDU to split into segments (1 to 384 octets - Section 2.3.3). */
+  upperTransportPdu: Buffer;
+}
+
+function assertSegmentedUpperTransportPduLength(upperTransportPdu: Buffer): void {
+  if (upperTransportPdu.length < 1 || upperTransportPdu.length > MAX_SEGMENTED_UPPER_TRANSPORT_PDU_LENGTH) {
+    throw new Error(
+      `lower transport field "upperTransportPdu" must be 1-${MAX_SEGMENTED_UPPER_TRANSPORT_PDU_LENGTH} bytes, got ${upperTransportPdu.length}`,
+    );
+  }
+}
+
+/**
+ * Builds one Segmented Access message's 4-octet header (Table 3.18),
+ * packing SEG=1, AKF, AID into the first octet (same layout as the
+ * unsegmented formats above) and SZMIC||SeqZero||SegO||SegN into the
+ * remaining three, MSB-first per the table's own field order. Kept as a
+ * 24-bit intermediate (`rest`) rather than a single 32-bit value: `SEG_BIT`
+ * would have to be shifted into bit 31, the sign bit of a JS 32-bit int,
+ * for no benefit - every field this function packs after the first octet
+ * fits comfortably under 2^24, so there is no sign-bit hazard to work
+ * around in the first place.
+ */
+function encodeSegmentedAccessHeader(fields: {
+  akf: boolean;
+  aid: number;
+  szmic: boolean;
+  seqZero: number;
+  segO: number;
+  segN: number;
+}): Buffer {
+  const firstByte = SEG_BIT | (fields.akf ? AKF_BIT : 0) | (fields.aid & MAX_AID);
+  const rest =
+    (fields.szmic ? SZMIC_BIT : 0) |
+    ((fields.seqZero & MAX_SEQ_ZERO) << 10) |
+    ((fields.segO & MAX_SEG_NUMBER) << 5) |
+    (fields.segN & MAX_SEG_NUMBER);
+  return Buffer.from([firstByte, (rest >>> 16) & 0xff, (rest >>> 8) & 0xff, rest & 0xff]);
+}
+
+/**
+ * Splits `input.upperTransportPdu` into Segmented Access messages (Table
+ * 3.18): one complete, ready-to-send Lower Transport PDU (4-octet header
+ * plus that segment's share of the payload) per segment, in SegO order
+ * from 0 to SegN inclusive - the same "encode produces the wire format"
+ * contract `encodeUnsegmentedAccess` above already follows, just one PDU
+ * per segment instead of one PDU for the whole message.
+ *
+ * SegN is derived from the payload length alone, per Table 3.18's own
+ * segment-size rule ("For all segments except the last segment, Segment m
+ * is octet 12*m to 12*m+11"): `ceil(length / 12) - 1`. A payload that is an
+ * exact multiple of 12 therefore produces exactly `length / 12` segments,
+ * none of them empty - there is no trailing empty segment for a multiple of
+ * the segment size, because the loop below stops at `segN`, not at some
+ * fixed count computed before knowing whether the last chunk is a full 12
+ * octets or a remainder.
+ */
+export function segmentAccessMessage(input: SegmentedAccessInput): Buffer[] {
+  assertLowerTransportField('aid', input.aid, MAX_AID);
+  assertLowerTransportField('seqZero', input.seqZero, MAX_SEQ_ZERO);
+  assertSegmentedUpperTransportPduLength(input.upperTransportPdu);
+
+  const segN = Math.ceil(input.upperTransportPdu.length / MAX_SEGMENT_PAYLOAD_LENGTH) - 1;
+  const segments: Buffer[] = [];
+  for (let segO = 0; segO <= segN; segO++) {
+    const start = segO * MAX_SEGMENT_PAYLOAD_LENGTH;
+    const end = Math.min(start + MAX_SEGMENT_PAYLOAD_LENGTH, input.upperTransportPdu.length);
+    const header = encodeSegmentedAccessHeader({
+      akf: input.akf,
+      aid: input.aid,
+      szmic: input.szmic,
+      seqZero: input.seqZero,
+      segO,
+      segN,
+    });
+    // Buffer.concat always copies into a freshly allocated buffer (it never
+    // shares memory with its inputs), so this segment does not alias
+    // `input.upperTransportPdu` even though the slice passed to it is a
+    // view, not a copy, on its own.
+    segments.push(Buffer.concat([header, input.upperTransportPdu.subarray(start, end)]));
+  }
+  return segments;
+}
+
+export interface SegmentedAccessPdu {
+  /** Application Key Flag: false = device key, true = application key (Table 3.18). */
+  akf: boolean;
+  /** 6-bit application key identifier (Table 3.18); meaningless when `akf` is false. */
+  aid: number;
+  /** Size of the TransMIC field this Upper Transport Access PDU carries: false = 32-bit, true = 64-bit (Table 3.18). */
+  szmic: boolean;
+  /** 13-bit least significant bits of SeqAuth (Table 3.18); the same value on every segment of one message. */
+  seqZero: number;
+  /** Zero-based segment number of this segment (Table 3.18). */
+  segO: number;
+  /** Zero-based number of the LAST segment of this message (Table 3.18); the same value on every segment of one message. */
+  segN: number;
+  /** This segment's share of the Upper Transport Access PDU (1 to 12 octets, Table 3.18). */
+  segment: Buffer;
+}
+
+/**
+ * Inverts `encodeSegmentedAccessHeader` plus the one segment it is attached
+ * to, decoding a SINGLE received Segmented Access message - reassembling
+ * the segments of one message back into a complete Upper Transport Access
+ * PDU is the next task's job (the module header's "Reassembly is the next
+ * task" note), not this function's.
+ *
+ * Returns `null`, not an error, in the same spirit as
+ * `decodeUnsegmentedAccess`/`decodeUnsegmentedControl` above - none of
+ * these are malformed input, they are "not decodable by this function":
+ *
+ * - SEG is clear: this is an Unsegmented Access message (Table 3.15),
+ *   decoded by `decodeUnsegmentedAccess` instead.
+ * - `pdu` has no room for a non-empty segment (at most the 4-octet header
+ *   and nothing else): Table 3.18's own Segment m field is never 0 octets
+ *   (minimum 8 bits), so no compliant sender produces this.
+ * - The recovered segment is longer than Table 3.18's own 12-octet bound:
+ *   same reasoning, from the other direction.
+ *
+ * Returns a COPY of the recovered segment, not a view onto `pdu` - the same
+ * reused-receive-buffer hazard `decodeUnsegmentedAccess`'s own JSDoc
+ * explains, and the same reason that decoder's own tests are mirrored for
+ * this one below.
+ */
+export function decodeSegmentedAccess(pdu: Buffer): SegmentedAccessPdu | null {
+  if (pdu.length <= SEGMENTED_ACCESS_HEADER_LENGTH) {
+    return null;
+  }
+  const firstByte = pdu[0] as number;
+  if ((firstByte & SEG_BIT) === 0) {
+    return null;
+  }
+
+  const segmentLength = pdu.length - SEGMENTED_ACCESS_HEADER_LENGTH;
+  if (segmentLength > MAX_SEGMENT_PAYLOAD_LENGTH) {
+    return null;
+  }
+
+  const rest = ((pdu[1] as number) << 16) | ((pdu[2] as number) << 8) | (pdu[3] as number);
+
+  return {
+    akf: (firstByte & AKF_BIT) !== 0,
+    aid: firstByte & MAX_AID,
+    szmic: (rest & SZMIC_BIT) !== 0,
+    seqZero: (rest >>> 10) & MAX_SEQ_ZERO,
+    segO: (rest >>> 5) & MAX_SEG_NUMBER,
+    segN: rest & MAX_SEG_NUMBER,
+    segment: Buffer.from(pdu.subarray(SEGMENTED_ACCESS_HEADER_LENGTH)),
+  };
+}
+
+// ===========================================================================
+// Segmented Control message (Section 3.5.2.4), and the Segment
+// Acknowledgment message (Section 3.5.2.3.1, opcode 0x00 of the
+// Unsegmented Control format above), are later tasks. Append their code
+// below this line, grouped the same way as above.
 // ===========================================================================

@@ -3,6 +3,8 @@ import {
   decodeUnsegmentedAccess,
   encodeUnsegmentedControl,
   decodeUnsegmentedControl,
+  segmentAccessMessage,
+  decodeSegmentedAccess,
 } from '../lowerTransport';
 import {
   hex,
@@ -14,6 +16,7 @@ import {
   LOWER_TRANSPORT_SAMPLE_ACCESS_VIRTUAL_1,
   LOWER_TRANSPORT_SAMPLE_ACCESS_VIRTUAL_2,
   LOWER_TRANSPORT_SAMPLE_SEGMENTED,
+  LOWER_TRANSPORT_SAMPLE_SEGMENTED_DEVICE_KEY,
   NETWORK_PDU_SAMPLE_1,
   NETWORK_PDU_SAMPLE_2,
   NETWORK_PDU_SAMPLE_3,
@@ -22,6 +25,7 @@ import {
   UPPER_TRANSPORT_SAMPLE_VIRTUAL_SHORT_MIC,
   UPPER_TRANSPORT_SAMPLE_VIRTUAL_SHORT_MIC_SHARED_LABEL,
   UPPER_TRANSPORT_SAMPLE_SZMIC,
+  UPPER_TRANSPORT_SAMPLE_DEVICE_KEY,
 } from './vectors';
 
 describe('Unsegmented Access message (Section 3.5.2.1, Table 3.17)', () => {
@@ -484,5 +488,305 @@ describe('LOWER_TRANSPORT_SAMPLE_SEGMENTED: every field cross-checks the PDU byt
 
   test('the 7 field widths above sum to exactly the header\'s own 32 bits', () => {
     expect(1 + 1 + 6 + 1 + 13 + 5 + 5).toBe(32);
+  });
+});
+
+describe('Segmented Access message (Section 3.5.2.2, Table 3.18)', () => {
+  // Message #24 (Section 8.3.24): the sample the module header above
+  // already proved bit-by-bit against LOWER_TRANSPORT_SAMPLE_SEGMENTED -
+  // this is that sample decoded "for real" instead of unpacked by hand.
+  // AKF=1, SZMIC=1 (the only 64-bit-TransMIC sample in this file), split
+  // 12+4 (an UNEVEN split - the second segment is NOT a full 12 octets).
+  test('segmentAccessMessage matches the published Message #24 segments, in order', () => {
+    const segments = segmentAccessMessage({
+      akf: LOWER_TRANSPORT_SAMPLE_SEGMENTED.akf,
+      aid: LOWER_TRANSPORT_SAMPLE_SEGMENTED.aid,
+      szmic: LOWER_TRANSPORT_SAMPLE_SEGMENTED.szmic,
+      seqZero: LOWER_TRANSPORT_SAMPLE_SEGMENTED.seqZero,
+      upperTransportPdu: hex(UPPER_TRANSPORT_SAMPLE_SZMIC.expected),
+    });
+    expect(segments).toEqual([
+      hex(LOWER_TRANSPORT_SAMPLE_SEGMENTED.pdu),
+      hex(LOWER_TRANSPORT_SAMPLE_SEGMENTED.pdu1),
+    ]);
+  });
+
+  test('decodeSegmentedAccess recovers the published Message #24 segment 0 (segO=0, segN=1)', () => {
+    const decoded = decodeSegmentedAccess(hex(LOWER_TRANSPORT_SAMPLE_SEGMENTED.pdu));
+    expect(decoded).toEqual({
+      akf: LOWER_TRANSPORT_SAMPLE_SEGMENTED.akf,
+      aid: LOWER_TRANSPORT_SAMPLE_SEGMENTED.aid,
+      szmic: LOWER_TRANSPORT_SAMPLE_SEGMENTED.szmic,
+      seqZero: LOWER_TRANSPORT_SAMPLE_SEGMENTED.seqZero,
+      segO: LOWER_TRANSPORT_SAMPLE_SEGMENTED.segO,
+      segN: LOWER_TRANSPORT_SAMPLE_SEGMENTED.segN,
+      segment: hex(LOWER_TRANSPORT_SAMPLE_SEGMENTED.segment0),
+    });
+  });
+
+  test('decodeSegmentedAccess recovers the published Message #24 segment 1 (segO=1, segN=1)', () => {
+    const decoded = decodeSegmentedAccess(hex(LOWER_TRANSPORT_SAMPLE_SEGMENTED.pdu1));
+    expect(decoded).toEqual({
+      akf: LOWER_TRANSPORT_SAMPLE_SEGMENTED.akf,
+      aid: LOWER_TRANSPORT_SAMPLE_SEGMENTED.aid,
+      szmic: LOWER_TRANSPORT_SAMPLE_SEGMENTED.szmic,
+      seqZero: LOWER_TRANSPORT_SAMPLE_SEGMENTED.seqZero,
+      segO: 1,
+      segN: LOWER_TRANSPORT_SAMPLE_SEGMENTED.segN,
+      segment: hex(LOWER_TRANSPORT_SAMPLE_SEGMENTED.segment1),
+    });
+  });
+
+  // Message #6 (Section 8.3.6): the other dimension Message #24 alone
+  // leaves untested - AKF=0 (device key) and SZMIC=0 (32-bit TransMIC),
+  // where every other sample above (including LOWER_TRANSPORT_SAMPLE_
+  // SEGMENTED) has both bits set to 1. Without this sample, a
+  // segmentAccessMessage/decodeSegmentedAccess pair that silently ignored
+  // AKF or SZMIC in either direction would still pass every test above -
+  // the same blind spot Message #16 already closed for the unsegmented
+  // case (see that test's own comment). Also an EVEN split (12+12, both
+  // segments a full 12 octets), unlike Message #24's 12+4.
+  test('segmentAccessMessage matches the published Message #6 segments, in order (AKF=0, SZMIC=0)', () => {
+    const segments = segmentAccessMessage({
+      akf: LOWER_TRANSPORT_SAMPLE_SEGMENTED_DEVICE_KEY.akf,
+      aid: LOWER_TRANSPORT_SAMPLE_SEGMENTED_DEVICE_KEY.aid,
+      szmic: LOWER_TRANSPORT_SAMPLE_SEGMENTED_DEVICE_KEY.szmic,
+      seqZero: LOWER_TRANSPORT_SAMPLE_SEGMENTED_DEVICE_KEY.seqZero,
+      upperTransportPdu: hex(UPPER_TRANSPORT_SAMPLE_DEVICE_KEY.expected),
+    });
+    expect(segments).toEqual([
+      hex(LOWER_TRANSPORT_SAMPLE_SEGMENTED_DEVICE_KEY.pdu0),
+      hex(LOWER_TRANSPORT_SAMPLE_SEGMENTED_DEVICE_KEY.pdu1),
+    ]);
+  });
+
+  test('decodeSegmentedAccess recovers the published Message #6 segment 0 (AKF=0, segO=0, segN=1)', () => {
+    const decoded = decodeSegmentedAccess(hex(LOWER_TRANSPORT_SAMPLE_SEGMENTED_DEVICE_KEY.pdu0));
+    expect(decoded).toEqual({
+      akf: LOWER_TRANSPORT_SAMPLE_SEGMENTED_DEVICE_KEY.akf,
+      aid: LOWER_TRANSPORT_SAMPLE_SEGMENTED_DEVICE_KEY.aid,
+      szmic: LOWER_TRANSPORT_SAMPLE_SEGMENTED_DEVICE_KEY.szmic,
+      seqZero: LOWER_TRANSPORT_SAMPLE_SEGMENTED_DEVICE_KEY.seqZero,
+      segO: 0,
+      segN: LOWER_TRANSPORT_SAMPLE_SEGMENTED_DEVICE_KEY.segN,
+      segment: hex(LOWER_TRANSPORT_SAMPLE_SEGMENTED_DEVICE_KEY.segment0),
+    });
+    expect(decoded?.akf).toBe(false); // the specific bit a hardcoded-true decoder would get wrong.
+  });
+
+  test('decodeSegmentedAccess recovers the published Message #6 segment 1 (AKF=0, segO=1, segN=1)', () => {
+    const decoded = decodeSegmentedAccess(hex(LOWER_TRANSPORT_SAMPLE_SEGMENTED_DEVICE_KEY.pdu1));
+    expect(decoded).toEqual({
+      akf: LOWER_TRANSPORT_SAMPLE_SEGMENTED_DEVICE_KEY.akf,
+      aid: LOWER_TRANSPORT_SAMPLE_SEGMENTED_DEVICE_KEY.aid,
+      szmic: LOWER_TRANSPORT_SAMPLE_SEGMENTED_DEVICE_KEY.szmic,
+      seqZero: LOWER_TRANSPORT_SAMPLE_SEGMENTED_DEVICE_KEY.seqZero,
+      segO: 1,
+      segN: LOWER_TRANSPORT_SAMPLE_SEGMENTED_DEVICE_KEY.segN,
+      segment: hex(LOWER_TRANSPORT_SAMPLE_SEGMENTED_DEVICE_KEY.segment1),
+    });
+  });
+
+  // Table 3.15: SEG=0 means an Unsegmented Access message - a different
+  // message type `decodeUnsegmentedAccess` handles, not an error. Reuses
+  // Message #18's genuine SEG=0 wire bytes, the same stance
+  // `decodeUnsegmentedAccess`'s own "SEG=1" test above takes in reverse.
+  test('decodeSegmentedAccess returns null for the published Message #18 sample (SEG=0, unsegmented)', () => {
+    expect(decodeSegmentedAccess(hex(LOWER_TRANSPORT_SAMPLE_ACCESS_1.expected))).toBeNull();
+  });
+
+  test('decodeSegmentedAccess returns null for an empty buffer rather than throwing', () => {
+    expect(decodeSegmentedAccess(Buffer.alloc(0))).toBeNull();
+  });
+
+  test('decodeSegmentedAccess returns null for a 4-octet buffer (header only, no segment octets)', () => {
+    // SEG=1, AKF=0, AID=0, rest all zero - a genuinely segmented-looking
+    // header, but with nothing after it: Table 3.18's Segment m field is
+    // never 0 octets (minimum 8 bits), so this cannot be a compliant
+    // sender's output.
+    expect(decodeSegmentedAccess(hex('80000000'))).toBeNull();
+  });
+
+  test('decodeSegmentedAccess returns null for a segment longer than 12 bytes', () => {
+    const pdu = Buffer.concat([hex(LOWER_TRANSPORT_SAMPLE_SEGMENTED.header), Buffer.alloc(13)]);
+    expect(decodeSegmentedAccess(pdu)).toBeNull();
+  });
+
+  describe('caller mistakes throw rather than being treated as a verification failure', () => {
+    test('segmentAccessMessage rejects an out-of-range aid', () => {
+      expect(() =>
+        segmentAccessMessage({ akf: true, aid: 0x40, szmic: false, seqZero: 0, upperTransportPdu: Buffer.alloc(1) }),
+      ).toThrow(/lower transport field "aid" must be an integer in \[0, 63\], got 64/);
+    });
+
+    test('segmentAccessMessage rejects an out-of-range seqZero', () => {
+      expect(() =>
+        segmentAccessMessage({
+          akf: true,
+          aid: 0,
+          szmic: false,
+          seqZero: 0x2000,
+          upperTransportPdu: Buffer.alloc(1),
+        }),
+      ).toThrow(/lower transport field "seqZero" must be an integer in \[0, 8191\], got 8192/);
+      expect(() =>
+        segmentAccessMessage({ akf: true, aid: 0, szmic: false, seqZero: 0x1fff, upperTransportPdu: Buffer.alloc(1) }),
+      ).not.toThrow();
+    });
+
+    test('segmentAccessMessage rejects an empty upperTransportPdu', () => {
+      expect(() =>
+        segmentAccessMessage({ akf: true, aid: 0, szmic: false, seqZero: 0, upperTransportPdu: Buffer.alloc(0) }),
+      ).toThrow(/lower transport field "upperTransportPdu" must be 1-384 bytes, got 0/);
+    });
+
+    // 384 = 32 segments x 12 octets (Section 2.3.3; SegN is 5 bits, 0-31).
+    test('segmentAccessMessage rejects an upperTransportPdu longer than 384 bytes', () => {
+      expect(() =>
+        segmentAccessMessage({ akf: true, aid: 0, szmic: false, seqZero: 0, upperTransportPdu: Buffer.alloc(385) }),
+      ).toThrow(/lower transport field "upperTransportPdu" must be 1-384 bytes, got 385/);
+      expect(() =>
+        segmentAccessMessage({ akf: true, aid: 0, szmic: false, seqZero: 0, upperTransportPdu: Buffer.alloc(384) }),
+      ).not.toThrow();
+    });
+  });
+
+  // The two boundary cases the brief asks for, derived from the segment
+  // size transcribed above (Table 3.18: 12 octets per non-last segment) -
+  // NOT from running this module's own code and recording what it printed.
+  describe('segment-count boundary cases (derived from the transcribed 12-octet segment size)', () => {
+    test('a payload one byte longer than one segment holds (13 bytes) produces two segments, the second carrying one byte', () => {
+      const segments = segmentAccessMessage({
+        akf: true,
+        aid: 0x01,
+        szmic: false,
+        seqZero: 0,
+        upperTransportPdu: Buffer.alloc(13, 0xaa),
+      });
+      // 4-octet header + 12-octet segment = 16; 4-octet header + 1-octet
+      // segment = 5 - buffer lengths alone, not decoded, so this does not
+      // depend on decodeSegmentedAccess being correct to tell the two
+      // segments' sizes apart.
+      expect(segments.map((segment) => segment.length)).toEqual([16, 5]);
+
+      const first = decodeSegmentedAccess(segments[0] as Buffer);
+      const second = decodeSegmentedAccess(segments[1] as Buffer);
+      expect(first).toMatchObject({ segO: 0, segN: 1 });
+      expect(first?.segment).toHaveLength(12);
+      expect(second).toMatchObject({ segO: 1, segN: 1 });
+      expect(second?.segment).toHaveLength(1);
+    });
+
+    test('a payload that exactly fills one segment (12 bytes) produces one segment, not two with an empty tail', () => {
+      const segments = segmentAccessMessage({
+        akf: true,
+        aid: 0x01,
+        szmic: false,
+        seqZero: 0,
+        upperTransportPdu: Buffer.alloc(12, 0xaa),
+      });
+      expect(segments).toHaveLength(1); // not 2 - the whole point of this test.
+      expect(segments.map((segment) => segment.length)).toEqual([16]); // 4-octet header + 12-octet segment.
+
+      const decoded = decodeSegmentedAccess(segments[0] as Buffer);
+      expect(decoded).toMatchObject({ segO: 0, segN: 0 });
+      expect(decoded?.segment).toHaveLength(12);
+    });
+  });
+});
+
+describe("decode returns a COPY, not a view onto the caller's buffer (Segmented Access)", () => {
+  // Same hazard, same reasoning as the identical describe block above for
+  // the unsegmented decoders - this is the segmented decoder's own version
+  // of those two tests.
+  test('decodeSegmentedAccess: writing to the input buffer after decoding does not change the decoded segment', () => {
+    const input = hex(LOWER_TRANSPORT_SAMPLE_SEGMENTED.pdu);
+    const decoded = decodeSegmentedAccess(input);
+    const expectedSegment = hex(LOWER_TRANSPORT_SAMPLE_SEGMENTED.segment0);
+    input.fill(0xff);
+    expect(decoded?.segment).toEqual(expectedSegment);
+  });
+
+  test('decodeSegmentedAccess: writing through the decoded segment does not corrupt the input buffer', () => {
+    const input = hex(LOWER_TRANSPORT_SAMPLE_SEGMENTED.pdu);
+    const inputCopy = Buffer.from(input);
+    const decoded = decodeSegmentedAccess(input);
+    expect(decoded).not.toBeNull();
+    decoded!.segment.fill(0xff);
+    expect(input).toEqual(inputCopy);
+  });
+});
+
+// Finding (this task's own review discipline, same as the describe block
+// above LOWER_TRANSPORT_SAMPLE_SEGMENTED's per-bit tests): every new field
+// this task added to vectors.ts must be read by a test somewhere, or it is
+// exactly the uncatchable-typo shape that block was closed for. `header1`
+// is the one field the describe block below (not the segment/segO/segN
+// round trips above) is for - cross-checked against its own PDU and against
+// `header` (its sibling) differing only in the SegO bits, per Table 3.18's
+// "Every Segmented Access message for the same Upper Transport Access PDU
+// shall have the same values for AKF, AID, SZMIC, SeqZero, and SegN fields"
+// rule (everything else must therefore match).
+describe('LOWER_TRANSPORT_SAMPLE_SEGMENTED: the second segment (header1/segment1/pdu1) cross-checks', () => {
+  test("pdu1 is header1's own bytes followed by segment1", () => {
+    const pdu1 = hex(LOWER_TRANSPORT_SAMPLE_SEGMENTED.pdu1);
+    expect(pdu1.subarray(0, 4)).toEqual(hex(LOWER_TRANSPORT_SAMPLE_SEGMENTED.header1));
+    expect(pdu1.subarray(4)).toEqual(hex(LOWER_TRANSPORT_SAMPLE_SEGMENTED.segment1));
+  });
+
+  test('header1 differs from header only in the SegO field (bits 9-5): same AKF/AID/SZMIC/SeqZero/SegN', () => {
+    const header = hex(LOWER_TRANSPORT_SAMPLE_SEGMENTED.header).readUInt32BE(0);
+    const header1 = hex(LOWER_TRANSPORT_SAMPLE_SEGMENTED.header1).readUInt32BE(0);
+    const SEG_O_MASK = 0x1f << 5;
+    expect(header1 & ~SEG_O_MASK).toBe(header & ~SEG_O_MASK);
+    expect((header1 >>> 5) & 0x1f).toBe(1); // this segment's own SegO.
+    expect((header >>> 5) & 0x1f).toBe(0); // the first segment's SegO, unaffected.
+  });
+
+  test('segment0 followed by segment1 reconstitutes the complete published UpperTransportPDU', () => {
+    expect(
+      Buffer.concat([hex(LOWER_TRANSPORT_SAMPLE_SEGMENTED.segment0), hex(LOWER_TRANSPORT_SAMPLE_SEGMENTED.segment1)]),
+    ).toEqual(hex(UPPER_TRANSPORT_SAMPLE_SZMIC.expected));
+  });
+});
+
+describe('LOWER_TRANSPORT_SAMPLE_SEGMENTED_DEVICE_KEY: every field cross-checks the PDU bytes (Table 3.18)', () => {
+  test('pdu0/pdu1 are header0/header1 followed by segment0/segment1', () => {
+    const pdu0 = hex(LOWER_TRANSPORT_SAMPLE_SEGMENTED_DEVICE_KEY.pdu0);
+    const pdu1 = hex(LOWER_TRANSPORT_SAMPLE_SEGMENTED_DEVICE_KEY.pdu1);
+    expect(pdu0.subarray(0, 4)).toEqual(hex(LOWER_TRANSPORT_SAMPLE_SEGMENTED_DEVICE_KEY.header0));
+    expect(pdu0.subarray(4)).toEqual(hex(LOWER_TRANSPORT_SAMPLE_SEGMENTED_DEVICE_KEY.segment0));
+    expect(pdu1.subarray(0, 4)).toEqual(hex(LOWER_TRANSPORT_SAMPLE_SEGMENTED_DEVICE_KEY.header1));
+    expect(pdu1.subarray(4)).toEqual(hex(LOWER_TRANSPORT_SAMPLE_SEGMENTED_DEVICE_KEY.segment1));
+  });
+
+  test('header0 bits match the transcribed fields (AKF=0, AID=0, SZMIC=0, SegO=0)', () => {
+    const headerInt = hex(LOWER_TRANSPORT_SAMPLE_SEGMENTED_DEVICE_KEY.header0).readUInt32BE(0);
+    expect((headerInt >>> 31) & 0x1).toBe(1); // SEG.
+    expect((headerInt >>> 30) & 0x1).toBe(LOWER_TRANSPORT_SAMPLE_SEGMENTED_DEVICE_KEY.akf ? 1 : 0);
+    expect((headerInt >>> 24) & 0x3f).toBe(LOWER_TRANSPORT_SAMPLE_SEGMENTED_DEVICE_KEY.aid);
+    expect((headerInt >>> 23) & 0x1).toBe(LOWER_TRANSPORT_SAMPLE_SEGMENTED_DEVICE_KEY.szmic ? 1 : 0);
+    expect((headerInt >>> 10) & 0x1fff).toBe(LOWER_TRANSPORT_SAMPLE_SEGMENTED_DEVICE_KEY.seqZero);
+    expect((headerInt >>> 5) & 0x1f).toBe(0); // SegO.
+    expect(headerInt & 0x1f).toBe(LOWER_TRANSPORT_SAMPLE_SEGMENTED_DEVICE_KEY.segN);
+  });
+
+  test('header1 bits match the transcribed fields (SegO=1, everything else identical to header0)', () => {
+    const headerInt = hex(LOWER_TRANSPORT_SAMPLE_SEGMENTED_DEVICE_KEY.header1).readUInt32BE(0);
+    expect((headerInt >>> 30) & 0x1).toBe(LOWER_TRANSPORT_SAMPLE_SEGMENTED_DEVICE_KEY.akf ? 1 : 0);
+    expect((headerInt >>> 24) & 0x3f).toBe(LOWER_TRANSPORT_SAMPLE_SEGMENTED_DEVICE_KEY.aid);
+    expect((headerInt >>> 23) & 0x1).toBe(LOWER_TRANSPORT_SAMPLE_SEGMENTED_DEVICE_KEY.szmic ? 1 : 0);
+    expect((headerInt >>> 10) & 0x1fff).toBe(LOWER_TRANSPORT_SAMPLE_SEGMENTED_DEVICE_KEY.seqZero);
+    expect((headerInt >>> 5) & 0x1f).toBe(1); // SegO.
+    expect(headerInt & 0x1f).toBe(LOWER_TRANSPORT_SAMPLE_SEGMENTED_DEVICE_KEY.segN);
+  });
+
+  test('segment0 followed by segment1 reconstitutes the complete published UpperTransportPDU', () => {
+    expect(
+      Buffer.concat([
+        hex(LOWER_TRANSPORT_SAMPLE_SEGMENTED_DEVICE_KEY.segment0),
+        hex(LOWER_TRANSPORT_SAMPLE_SEGMENTED_DEVICE_KEY.segment1),
+      ]),
+    ).toEqual(hex(UPPER_TRANSPORT_SAMPLE_DEVICE_KEY.expected));
   });
 });

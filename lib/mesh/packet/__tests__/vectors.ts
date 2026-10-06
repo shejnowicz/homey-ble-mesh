@@ -151,6 +151,38 @@
  * TRUST, for those two messages: the lower-transport block's own
  * "LowerTransportPDU" row and the NetworkPDU block's "TransportPDU" row.
  * DISTRUST: the "LowerTransportPDU" row inside those two NetworkPDU blocks.
+ *
+ * SEGMENTATION TASK ADDITION (`lowerTransport.ts`'s Segmented Access message
+ * support): fetched the same 9,945,160-byte v1.1 document independently for
+ * this task on 2026-10-06 (same URL, same markup-stripping method: `</td>`/
+ * `</tr>` converted to separators before stripping tags, entities
+ * unescaped). Section 3.5.2.2 "Segmented Access message", Table 3.18
+ * "Segmented Access message format", gives the header layout (SEG 1 bit,
+ * AKF 1, AID 6, SZMIC 1, SeqZero 13, SegO 5, SegN 5 - 32 bits/4 octets,
+ * packed MSB-first, matching the bit positions `lowerTransport.test.ts`'s
+ * existing per-bit block already proved against `LOWER_TRANSPORT_SAMPLE_
+ * SEGMENTED.header`) and the segment-size rule: "For all segments except
+ * the last segment, Segment m is octet 12*m to 12*m+11. In the last
+ * segment, Segment m is octet 12*m through the end of the message." - i.e.
+ * every non-last segment carries exactly 12 octets, so SegN (the zero-based
+ * last segment number) is `ceil(upperTransportPduLength / 12) - 1`. Section
+ * 2.3.3 "Messages" additionally states the overall ceiling this implies:
+ * "The lower transport layer provides a SAR mechanism capable of
+ * transporting up to 32 Access or Transport Control message segments. The
+ * maximum Upper Transport Access PDU size when using a SAR is 384 octets."
+ * (32 segments x 12 octets - consistent with SegO/SegN's own 5-bit width,
+ * 0-31).
+ *
+ * This task's new fixture data (both added to the EXISTING
+ * `LOWER_TRANSPORT_SAMPLE_SEGMENTED` object and the new
+ * `LOWER_TRANSPORT_SAMPLE_SEGMENTED_DEVICE_KEY` below) reuses Messages #24
+ * and #6, already transcribed above for their nonce/upper-transport rows -
+ * no new message numbers were needed. What is new is each message's SECOND
+ * "LowerTransportSegmentedAccessPDU" block (Section 8.3's per-message
+ * tables publish one such block per segment for a two-segment message) and,
+ * for Message #24, the Access-message block's own `Segment#0`/`Segment#1`
+ * rows - read independently for this task; see the module-scope comments on
+ * each constant for the exact rows and values found.
  */
 export const hex = (s: string): Buffer => Buffer.from(s.replace(/\s+/g, ''), 'hex');
 
@@ -755,6 +787,27 @@ export const LOWER_TRANSPORT_SAMPLE_ACCESS_VIRTUAL_2 = {
  * `decodeUnsegmentedControl`'s "SEG=1 returns null" path is tested against
  * genuine specification bytes with the bit actually set, rather than an
  * arbitrary fabricated byte nothing published ever confirms is realistic.
+ *
+ * SEGMENTATION TASK ADDITION: the second segment (SegO=1) of this same
+ * message, read from the SAME Section 8.3.24 block as everything above -
+ * fetched independently for this task (same URL, same 9,945,160-byte HTML,
+ * same markup-stripping method, 2026-10-06). The "Access message" block's
+ * own `Segment#1` row reads `1c01cea6` (the complete `UpperTransportPDU` row
+ * there, `c3c51d8e476b28e3aa5001f31c01cea6`, is `UPPER_TRANSPORT_SAMPLE_SZMIC
+ * .expected` above with `segment0` as its first 12 octets and `segment1` as
+ * the remaining 4 - cross-checked in `lowerTransport.test.ts`). The message's
+ * own SECOND "LowerTransportSegmentedAccessPDU" block (distinct from the one
+ * `header`/`pdu` above transcribe, which is the FIRST) publishes this
+ * segment's own CTL/TTL/SEQ/SRC/DST/SEG/AKF/AID/SZMIC/SeqZero/SegO/SegN/
+ * Header/Segment#1/LowerTransportPDU rows directly: SegO=01 (SegN still 01,
+ * same AKF/AID/SZMIC/SeqZero as segment 0, per Table 3.18's "Every Segmented
+ * Access message for the same Upper Transport Access PDU shall have the same
+ * values" rule), Header=e6a03421, Segment#1=1c01cea6,
+ * LowerTransportPDU=e6a034211c01cea6 - `header1`/`segment1`/`pdu1` below are
+ * that row triple, not derived from `header`/`segment0` by flipping a bit:
+ * `header1` is an independently transcribed wire value, cross-checked
+ * against `header`'s own bit layout (Table 3.18: only SegO should differ,
+ * 0->1) in `lowerTransport.test.ts`.
  */
 export const LOWER_TRANSPORT_SAMPLE_SEGMENTED = {
   seg: true,
@@ -767,4 +820,61 @@ export const LOWER_TRANSPORT_SAMPLE_SEGMENTED = {
   header: 'e6a03401',
   segment0: 'c3c51d8e476b28e3aa5001f3',
   pdu: 'e6a03401c3c51d8e476b28e3aa5001f3',
+  header1: 'e6a03421',
+  segment1: '1c01cea6',
+  pdu1: 'e6a034211c01cea6',
+};
+
+/**
+ * Section 8.3.6 "Message #6": the same Config AppKey Add REQUEST as
+ * DEVICE_NONCE_SAMPLE_1/UPPER_TRANSPORT_SAMPLE_DEVICE_KEY, but read for its
+ * OWN two "LowerTransportSegmentedAccessPDU" blocks (Section 8.3.6) - fetched
+ * independently for the segmentation task (same URL/HTML/method,
+ * 2026-10-06). Unlike LOWER_TRANSPORT_SAMPLE_SEGMENTED (Message #24), whose
+ * second segment's own CTL/SEQ/SegO block is published but whose first and
+ * second segment headers were cross-derived above, Message #6 publishes BOTH
+ * segments' complete blocks independently, each with its own Header and
+ * LowerTransportPDU row - chosen deliberately as this task's primary
+ * multi-segment sample because of that, and because it is DevKey (AKF=0,
+ * AID=0, SZMIC=0), the one combination this file's segmented sample above
+ * does not cover (same AKF=0 gap already closed for the unsegmented case by
+ * LOWER_TRANSPORT_SAMPLE_ACCESS_DEVICE_KEY, for the same reason: every other
+ * segmented sample here has AKF=1/SZMIC=1, so a decoder that silently
+ * ignored either bit would still pass without this).
+ *
+ * Segment #0's own block: CTL=00, TTL=04, SEQ=3129ab, SRC=0003, DST=1201,
+ * SEG=01, AKF=00, AID=00, SZMIC=00, SeqZero=9ab, SegO=00, SegN=01,
+ * Header=8026ac01, Segment#0=ee9dddfd2169326d23f3afdf,
+ * LowerTransportPDU=8026ac01ee9dddfd2169326d23f3afdf.
+ *
+ * Segment #1's own block: CTL=00, TTL=04, SEQ=3129ac, SRC=0003, DST=1201,
+ * SEG=01, AKF=00, AID=00, SZMIC=00, SegO=01, SegN=01, Header=8026ac21,
+ * Segment#1=cfdc18c52fdef772e0e17308,
+ * LowerTransportPDU=8026ac21cfdc18c52fdef772e0e17308. Its own "SeqZero" row
+ * reads 3129ab, but that is the block's own SEQ value bleeding into the
+ * wrong row - not this task's errata to resolve, but checked directly before
+ * transcribing: Header 8026ac21, decoded bit-for-bit per Table 3.18, reads
+ * SeqZero 0x9ab (2475) - the SAME value segment 0's row (correctly) reads,
+ * exactly as Table 3.18 requires ("Every Segmented Access message for the
+ * same Upper Transport Access PDU shall have the same values for ... SeqZero
+ * ... fields"). `seqZero` below is that authenticated, bit-decoded value
+ * (0x9ab), not the mis-copied row text.
+ *
+ * `upperTransportPdu` is UPPER_TRANSPORT_SAMPLE_DEVICE_KEY.expected
+ * (ee9dddfd2169326d23f3afdfcfdc18c52fdef772e0e17308, already transcribed
+ * above) - cross-checked in `lowerTransport.test.ts` against
+ * segment0||segment1 here.
+ */
+export const LOWER_TRANSPORT_SAMPLE_SEGMENTED_DEVICE_KEY = {
+  akf: false,
+  aid: 0x00,
+  szmic: false,
+  seqZero: 0x9ab,
+  segN: 0x01,
+  header0: '8026ac01',
+  segment0: 'ee9dddfd2169326d23f3afdf',
+  pdu0: '8026ac01ee9dddfd2169326d23f3afdf',
+  header1: '8026ac21',
+  segment1: 'cfdc18c52fdef772e0e17308',
+  pdu1: '8026ac21cfdc18c52fdef772e0e17308',
 };
