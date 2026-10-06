@@ -62,18 +62,40 @@ import { CompositionData } from '../mesh/config/composition';
  * `pdftotext -layout` (which lines up the two-column table) and plain
  * `pdftotext` with no layout flag (which still pairs every identifier
  * immediately before the name it belongs to, one per line) - both agree on
- * all four pairs, in both the by-value and the by-name table:
+ * all four pairs, in both the by-value and the by-name table. Page numbers
+ * below were read off by walking the extracted text in document order
+ * against each page's own footer line ("Bluetooth SIG Proprietary ... Page
+ * N of 446") - content printed before a page's footer is that page's own
+ * content, content after it belongs to page N+1 - not guessed from a
+ * remembered skim:
  *   - Generic OnOff Server   = 0x1000 (by-value table, Page 139 of 446;
- *     by-name table, Page 141).
- *   - Light Lightness Server = 0x1300 (Page 140; Page 142).
+ *     by-name table, Page 142).
+ *   - Light Lightness Server = 0x1300 (Page 140; Page 143).
  *   - Light CTL Server       = 0x1303 (Page 140; Page 142).
- *   - Light HSL Server       = 0x1307 (Page 140; Page 142).
+ *   - Light HSL Server       = 0x1307 (Page 141; Page 143).
  * NOT to be confused with 0x1003 ("Generic Level Client", a neighbouring
  * but entirely different model) - the one published Composition Data Page
  * 0 sample this project already transcribed in
  * `mesh/config/__tests__/vectors.ts` happens to report 0x1003 among its SIG
  * Models, which is why this distinction is called out explicitly here
  * rather than left to be noticed by accident.
+ *
+ * SIBLING MODELS - NOT TO BE CONFUSED WITH THE SERVER MODEL EITHER. Each of
+ * the four families above has at least one adjacent model one or two
+ * values away that relates to the very same lamp but is NOT the Server
+ * model this table matches on - a Setup Server (the model a config client
+ * binds to for factory-reset-style administrative access, Mesh Model
+ * specification Section 6.1 "Introduction") or a Client (the model a
+ * controller - not the lamp - implements). Declaring only the sibling must
+ * never grant the Server row's capability; `__tests__/capabilities.test.ts`
+ * pins this per family, with each sibling transcribed from the same two
+ * Assigned Numbers tables as the four Server values above, independently
+ * of this file:
+ *   - Generic OnOff Client   = 0x1001 (by-value Page 139; by-name Page
+ *     142) - Generic OnOff has no Setup Server variant.
+ *   - Light Lightness Setup Server = 0x1301 (Page 140; Page 143).
+ *   - Light CTL Setup Server       = 0x1304 (Page 140; Page 142).
+ *   - Light HSL Setup Server       = 0x1308 (Page 141; Page 143).
  *
  * ELEMENT ATTRIBUTION: a capability is recorded with the `elementIndex` of
  * the `CompositionData.elements` entry that declared its model - a plain

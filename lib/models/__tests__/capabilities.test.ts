@@ -26,6 +26,20 @@ const CONFIGURATION_SERVER = 0x0000; // Assigned Numbers, same two tables.
 const GENERIC_LEVEL_CLIENT = 0x1003;
 
 /**
+ * One adjacent sibling per Server model family above - the Setup Server or
+ * Client variant that relates to the very same lamp but is NOT the Server
+ * model the design's table matches on. Transcribed from the same two
+ * Assigned Numbers tables, independently of `capabilities.ts` (see that
+ * module's own SIBLING MODELS note) - not guessed from the family's own
+ * numbering pattern, because the families are not uniformly spaced
+ * (Generic OnOff has no Setup Server at all; the others do).
+ */
+const GENERIC_ONOFF_CLIENT = 0x1001; // Generic OnOff's only sibling - no Setup Server exists for it.
+const LIGHT_LIGHTNESS_SETUP_SERVER = 0x1301;
+const LIGHT_CTL_SETUP_SERVER = 0x1304;
+const LIGHT_HSL_SETUP_SERVER = 0x1308;
+
+/**
  * Builds a `CompositionData` object directly, in the shape
  * `composition.ts#parseCompositionData` returns - never a hand-built wire
  * buffer pushed through the parser. The parser is already proven against
@@ -147,6 +161,34 @@ describe('mapCompositionToCapabilities', () => {
 
     test('Generic Level Client (0x1003) only - adjacent-looking to, but not, Light CTL Server (0x1303)', () => {
       const result = mapCompositionToCapabilities(composition([element([GENERIC_LEVEL_CLIENT])]));
+      expect(result).toEqual([]);
+    });
+  });
+
+  describe('a node declaring only a family sibling (Setup Server/Client) gets no capability for that family', () => {
+    // Each sibling is a real, adjacent, same-family model that genuinely
+    // relates to the same lamp (a config client binds to the Setup Server;
+    // a controller implements the Client) - exactly the shape of model an
+    // implementation might later be "helpfully" widened to also accept.
+    // Declaring ONLY the sibling (never the Server itself) must still
+    // yield no capability for that row.
+    test('Generic OnOff Client (0x1001) only - not Generic OnOff Server - gets no onoff', () => {
+      const result = mapCompositionToCapabilities(composition([element([GENERIC_ONOFF_CLIENT])]));
+      expect(result).toEqual([]);
+    });
+
+    test('Light Lightness Setup Server (0x1301) only - not Light Lightness Server - gets no dim', () => {
+      const result = mapCompositionToCapabilities(composition([element([LIGHT_LIGHTNESS_SETUP_SERVER])]));
+      expect(result).toEqual([]);
+    });
+
+    test('Light CTL Setup Server (0x1304) only - not Light CTL Server - gets no light_temperature', () => {
+      const result = mapCompositionToCapabilities(composition([element([LIGHT_CTL_SETUP_SERVER])]));
+      expect(result).toEqual([]);
+    });
+
+    test('Light HSL Setup Server (0x1308) only - not Light HSL Server - gets no light_hue/light_saturation', () => {
+      const result = mapCompositionToCapabilities(composition([element([LIGHT_HSL_SETUP_SERVER])]));
       expect(result).toEqual([]);
     });
   });
