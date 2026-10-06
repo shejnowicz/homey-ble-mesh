@@ -313,14 +313,26 @@ const MAX_SEG_NUMBER = 0x1f; // 5 bits, shared by SegO (bits 9-5) and SegN (bits
 // builds/reads one octet at a time below.
 const SZMIC_BIT = 0x800000;
 
-// Table 3.18: "For all segments except the last segment, Segment m is
-// octet 12*m to 12*m+11" - every non-last segment is exactly 12 octets, and
-// no segment is ever 0 (the last segment is "octet 12*m through the end of
-// the message", i.e. 1 to 12 octets). SegN/SegO are 5 bits (0-31), so at
-// most 32 segments - Section 2.3.3 "Messages" states the resulting ceiling
-// directly: "The lower transport layer provides a SAR mechanism capable of
-// transporting up to 32 Access or Transport Control message segments. The
-// maximum Upper Transport Access PDU size when using a SAR is 384 octets."
+// Table 3.18's Segment m row gives the field's width as "8 to 96" bits,
+// i.e. 1 to 12 octets, and Section 3.5.2.2 then fixes WHICH of those two
+// ends applies to which segment, verbatim: "The Segment m field, with the
+// segment number m, shall be set to the subset of octets from the Upper
+// Transport Access PDU. For all segments except the last segment, Segment m
+// is octet 12*m to 12*m+11. In the last segment, Segment m is octet 12*m
+// through the end of the message."
+//
+// So 12 is BOTH the per-segment maximum (any segment) AND the EXACT size of
+// every non-last segment (SegO != SegN); only the last segment may be
+// shorter, and no segment is ever 0 octets. `MAX_SEGMENT_PAYLOAD_LENGTH` is
+// used in both senses below - as the upper bound in `decodeSegmentedAccess`
+// and as the required size for a non-last segment - because the
+// specification states one number for both, not two that happen to agree.
+//
+// SegN/SegO are 5 bits (0-31), so at most 32 segments - Section 2.3.3
+// "Messages" states the resulting ceiling directly: "The lower transport
+// layer provides a SAR mechanism capable of transporting up to 32 Access or
+// Transport Control message segments. The maximum Upper Transport Access
+// PDU size when using a SAR is 384 octets."
 const MAX_SEGMENT_PAYLOAD_LENGTH = 12;
 const MAX_SEGMENTS = MAX_SEG_NUMBER + 1; // 32.
 const MAX_SEGMENTED_UPPER_TRANSPORT_PDU_LENGTH = MAX_SEGMENTS * MAX_SEGMENT_PAYLOAD_LENGTH; // 384.
@@ -460,6 +472,24 @@ export interface SegmentedAccessPdu {
  *   (minimum 8 bits), so no compliant sender produces this.
  * - The recovered segment is longer than Table 3.18's own 12-octet bound:
  *   same reasoning, from the other direction.
+ * - The recovered segment belongs to a NON-LAST segment (SegO != SegN) and
+ *   is not exactly `MAX_SEGMENT_PAYLOAD_LENGTH` octets. Section 3.5.2.2
+ *   does not merely cap a segment's size, it FIXES it for every segment but
+ *   the last ("For all segments except the last segment, Segment m is octet
+ *   12*m to 12*m+11. In the last segment, Segment m is octet 12*m through
+ *   the end of the message"), so a short non-last segment is as
+ *   non-conforming as an over-long one - and, like SegO>SegN above, it is
+ *   decidable from this ONE segment alone: SegO and SegN come from the same
+ *   four header octets, and the payload length is this same PDU's own.
+ *   Reassembly cannot be the place for it: the FIRST segment of a new
+ *   message arrives with no established SegN to compare against, so a check
+ *   there would either skip that segment entirely or fall back on the
+ *   segment's own header - which is exactly what this check already reads.
+ *   Left unchecked, two short segments claiming SegN=1 reassemble into a
+ *   PDU far shorter than any conforming two-segment message; the upper
+ *   transport MIC then rejects it, but the genuine segments arriving
+ *   afterwards look like duplicates, so an in-flight reassembly is poisoned
+ *   by traffic a single-segment check could have dropped.
  * - The recovered SegO is greater than the recovered SegN: Table 3.18
  *   defines SegO as "the segment number (zero-based) of the segment m of
  *   this Upper Transport PDU" and SegN as "the last segment number
@@ -493,6 +523,13 @@ export function decodeSegmentedAccess(pdu: Buffer): SegmentedAccessPdu | null {
   const segO = (rest >>> 5) & MAX_SEG_NUMBER;
   const segN = rest & MAX_SEG_NUMBER;
   if (segO > segN) {
+    return null;
+  }
+  // Section 3.5.2.2: every segment except the last is octet 12*m to 12*m+11
+  // of the Upper Transport Access PDU - exactly MAX_SEGMENT_PAYLOAD_LENGTH
+  // octets, not merely at most that many. Only the last segment (SegO ===
+  // SegN) may be shorter; it runs "through the end of the message".
+  if (segO !== segN && segmentLength !== MAX_SEGMENT_PAYLOAD_LENGTH) {
     return null;
   }
 

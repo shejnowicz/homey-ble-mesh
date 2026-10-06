@@ -354,6 +354,69 @@ describe('caller mistakes throw rather than being treated as a verification fail
     ).toThrow(/upper transport field "dst" must not be a virtual address/);
   });
 
+  // Fix wave (Important 2): the virtual address range's own edges were
+  // undefended. Every published virtual-address sample sits well INSIDE the
+  // range and every non-virtual test well OUTSIDE it, so moving either
+  // bound by one left all 296 tests green - and a misclassified edge is not
+  // cosmetic: an application-key message whose virtual destination is
+  // wrongly judged non-virtual is accepted with NO Label UUID and encrypted
+  // with NO additional data, producing exactly the unauthenticatable PDU
+  // the previous round added `assertLabelUuidRules` to prevent.
+  //
+  // Range transcribed afresh for this round from Section 3.4.2.3 "Virtual
+  // address", last sentence before Figure 3.7: "A virtual address can have
+  // any value from 0x8000 to 0xBFFF as shown in Figure 3.7 below." Table
+  // 3.5 "16-bit address allocations" corroborates it independently, giving
+  // the Virtual Address row as the bit pattern 0b10xxxxxxxxxxxxxx - the
+  // same span written as bit 15 set and bit 14 clear.
+  //
+  // Each case asserts what the RANGE implies about behaviour, never the
+  // text of the error - those messages print the bounds themselves, so a
+  // test matching on them could not falsify a moved bound.
+  describe('the virtual address range edges (Section 3.4.2.3: 0x8000 to 0xBFFF)', () => {
+    const insideTheRange: Array<[string, number]> = [
+      ['0x8000, the first virtual address', 0x8000],
+      ['0xbfff, the last virtual address', 0xbfff],
+    ];
+    const outsideTheRange: Array<[string, number]> = [
+      ['0x7fff, the address immediately below the range', 0x7fff],
+      ['0xc000, the address immediately above the range', 0xc000],
+    ];
+
+    test.each(insideTheRange)('%s is virtual: a labelUuid is required, and supplying one is accepted', (_name, dst) => {
+      expect(() => encryptUpperTransport({ ...valid, dst })).toThrow(
+        /upper transport field "labelUuid" is required/,
+      );
+      expect(() =>
+        encryptUpperTransport({ ...valid, dst, labelUuid: hex(UPPER_TRANSPORT_SAMPLE_SZMIC.labelUuid) }),
+      ).not.toThrow();
+    });
+
+    test.each(outsideTheRange)(
+      '%s is NOT virtual: no labelUuid is required, and supplying one is rejected',
+      (_name, dst) => {
+        expect(() => encryptUpperTransport({ ...valid, dst })).not.toThrow();
+        expect(() =>
+          encryptUpperTransport({ ...valid, dst, labelUuid: hex(UPPER_TRANSPORT_SAMPLE_SZMIC.labelUuid) }),
+        ).toThrow(/upper transport field "labelUuid" must not be set/);
+      },
+    );
+
+    // The device-key guard reads the same two bounds, so it needs its own
+    // edge cases or half the range could move undetected on that path.
+    test.each(insideTheRange)('%s is refused outright for a device-key message', (_name, dst) => {
+      expect(() =>
+        encryptUpperTransport({ ...valid, keyKind: 'device', key: hex(UPPER_TRANSPORT_SAMPLE_DEVICE_KEY.key), dst }),
+      ).toThrow(/upper transport field "dst" must not be a virtual address/);
+    });
+
+    test.each(outsideTheRange)('%s is accepted for a device-key message', (_name, dst) => {
+      expect(() =>
+        encryptUpperTransport({ ...valid, keyKind: 'device', key: hex(UPPER_TRANSPORT_SAMPLE_DEVICE_KEY.key), dst }),
+      ).not.toThrow();
+    });
+  });
+
   // Section 3.6.2.1: an Access message paired with a 64-bit TransMIC is
   // bounded at 376 octets, four less than the 380-octet bound for a 32-bit
   // one - both share one 384-octet ceiling on the whole Upper Transport
@@ -401,8 +464,27 @@ test('decryptUpperTransport returns null (not an exception) for a PDU encrypted 
 // A lower transport layer handing up a truncated/corrupted reassembly must
 // be dropped quietly, not thrown on - the same "truncated foreign packet"
 // case `ccmDecrypt`'s own MESH_MIC_LENGTHS check already documents.
-test('decryptUpperTransport rejects a truncated PDU rather than throwing', () => {
-  const truncated = hex(UPPER_TRANSPORT_SAMPLE_APPLICATION_KEY.expected).subarray(0, 2);
+//
+// Three rows, because a short PDU takes one of THREE different paths
+// through the ciphertext/tag split (fix wave, Minor finding): `subarray(0,
+// length - micLength)` does not clamp a negative end to zero - it takes it
+// relative to the buffer's own length, and only that result is clamped.
+//
+//   2 octets, 32-bit MIC: end = 2-4 = -2 -> 2 + (-2) = 0, so an EMPTY
+//     ciphertext and a 2-octet tag; dropped by MESH_MIC_LENGTHS.
+//   3 octets, 32-bit MIC: end = -1 -> 3 + (-1) = 2, so a NON-EMPTY 2-octet
+//     ciphertext and a 1-octet tag; also dropped by MESH_MIC_LENGTHS, but
+//     only this row makes the non-empty split observable at all.
+//   4 octets, 64-bit MIC: end = -4 -> 0, so an empty ciphertext and a
+//     4-octet tag - which IS a mesh MIC length, so this one PASSES the
+//     length gate and is rejected by AES-CCM itself instead. The sole
+//     short-PDU case that reaches any crypto; see the function's comment.
+test.each([
+  ['2 octets with a 32-bit MIC (ciphertext empty, dropped on tag length)', 2, false],
+  ['3 octets with a 32-bit MIC (ciphertext NON-empty, dropped on tag length)', 3, false],
+  ['4 octets with a 64-bit MIC (tag length is legal, rejected by AES-CCM itself)', 4, true],
+])('decryptUpperTransport rejects a truncated PDU of %s rather than throwing', (_name, length, szmic) => {
+  const truncated = hex(UPPER_TRANSPORT_SAMPLE_APPLICATION_KEY.expected).subarray(0, length);
   const decode = (): unknown =>
     decryptUpperTransport({
       upperTransportPdu: truncated,
@@ -412,7 +494,7 @@ test('decryptUpperTransport rejects a truncated PDU rather than throwing', () =>
       src: UPPER_TRANSPORT_SAMPLE_APPLICATION_KEY.src,
       dst: UPPER_TRANSPORT_SAMPLE_APPLICATION_KEY.dst,
       ivIndex: UPPER_TRANSPORT_SAMPLE_APPLICATION_KEY.ivIndex,
-      szmic: UPPER_TRANSPORT_SAMPLE_APPLICATION_KEY.szmic,
+      szmic,
     });
   expect(decode).not.toThrow();
   expect(decode()).toBeNull();

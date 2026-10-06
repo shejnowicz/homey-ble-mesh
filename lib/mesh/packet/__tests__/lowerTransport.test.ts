@@ -632,6 +632,52 @@ describe('Segmented Access message (Section 3.5.2.2, Table 3.18)', () => {
     expect(decodeSegmentedAccess(pdu)).toBeNull();
   });
 
+  // Fix wave (Important 3): this decoder enforced only the per-segment
+  // MAXIMUM (12 octets) and a minimum of one, but Section 3.5.2.2 FIXES the
+  // size of every segment except the last. Transcribed for this round from
+  // Section 3.5.2.2, verbatim: "The Segment m field, with the segment number
+  // m, shall be set to the subset of octets from the Upper Transport Access
+  // PDU. For all segments except the last segment, Segment m is octet 12*m
+  // to 12*m+11. In the last segment, Segment m is octet 12*m through the end
+  // of the message." Table 3.18's own Segment m row gives the width as "8 to
+  // 96" bits, which is the 1-12 octet span that sentence then allocates.
+  //
+  // Headers below are hand-built from Table 3.18's bit widths, NOT produced
+  // by segmentAccessMessage - which cannot build a short non-last segment at
+  // all, that being the whole point. First octet SEG=1, AKF=0, AID=0 ->
+  // 0x80. Remaining 3 octets: SZMIC=0, SeqZero=0, then (SegO<<5)|SegN in the
+  // last one - SegO=0/SegN=1 -> 0x01, SegO=1/SegN=1 -> 0x21, SegO=0/SegN=0
+  // -> 0x00.
+  describe('the fixed non-last segment size (Section 3.5.2.2: every segment but the last is exactly 12 octets)', () => {
+    test('a NON-LAST segment (segO=0, segN=1) carrying fewer than 12 octets is rejected', () => {
+      const shortNonLast = Buffer.concat([hex('80000001'), Buffer.alloc(11, 0xaa)]);
+      expect(decodeSegmentedAccess(shortNonLast)).toBeNull();
+    });
+
+    test('a NON-LAST segment carrying a single octet is rejected too (the old minimum-of-one was all that applied)', () => {
+      const oneOctetNonLast = Buffer.concat([hex('80000001'), Buffer.from([0xaa])]);
+      expect(decodeSegmentedAccess(oneOctetNonLast)).toBeNull();
+    });
+
+    test('the SAME non-last header with a full 12-octet segment decodes - isolating the length as the only reason above', () => {
+      const fullNonLast = Buffer.concat([hex('80000001'), Buffer.alloc(12, 0xaa)]);
+      expect(decodeSegmentedAccess(fullNonLast)).toMatchObject({ segO: 0, segN: 1 });
+      expect(decodeSegmentedAccess(fullNonLast)?.segment).toHaveLength(12);
+    });
+
+    test('the LAST segment (segO=1, segN=1) may be shorter than 12 octets - the rule is "except the last segment"', () => {
+      const shortLast = Buffer.concat([hex('80000021'), Buffer.alloc(11, 0xaa)]);
+      expect(decodeSegmentedAccess(shortLast)).toMatchObject({ segO: 1, segN: 1 });
+      expect(decodeSegmentedAccess(shortLast)?.segment).toHaveLength(11);
+    });
+
+    test('a single-segment message (segO=0, segN=0) IS its own last segment, so one octet is legal', () => {
+      const singleShort = Buffer.concat([hex('80000000'), Buffer.from([0xaa])]);
+      expect(decodeSegmentedAccess(singleShort)).toMatchObject({ segO: 0, segN: 0 });
+      expect(decodeSegmentedAccess(singleShort)?.segment).toHaveLength(1);
+    });
+  });
+
   describe('caller mistakes throw rather than being treated as a verification failure', () => {
     test('segmentAccessMessage rejects an out-of-range aid', () => {
       expect(() =>
@@ -1107,7 +1153,7 @@ describe('Segment Acknowledgment message: blockAckFrom (./reassembly) feeds enco
   // reassembly of Message #24's own first segment (acceptSegment), not a
   // hand-built ReassemblyState object.
   test('after only segment 0 of Message #24, blockAckFrom sets exactly bit 0 - and that bit lands on the wire where Table 3.21 puts it', () => {
-    const afterSegment0 = acceptSegment(null, SRC_24, hex(LOWER_TRANSPORT_SAMPLE_SEGMENTED.pdu));
+    const afterSegment0 = acceptSegment(undefined, SRC_24, hex(LOWER_TRANSPORT_SAMPLE_SEGMENTED.pdu));
     if (afterSegment0.kind !== 'incomplete') throw new Error('expected incomplete after only segment 0');
 
     const blockAck = blockAckFrom(afterSegment0.state);
@@ -1130,7 +1176,7 @@ describe('Segment Acknowledgment message: blockAckFrom (./reassembly) feeds enco
   // this would also catch an implementation that stopped one segment short
   // or set a bit past segN.
   test('after a complete reassembly of Message #24, blockAckFrom sets exactly segN+1 bits, and round-trips through encodeSegmentAck/decodeSegmentAck', () => {
-    const afterSegment0 = acceptSegment(null, SRC_24, hex(LOWER_TRANSPORT_SAMPLE_SEGMENTED.pdu));
+    const afterSegment0 = acceptSegment(undefined, SRC_24, hex(LOWER_TRANSPORT_SAMPLE_SEGMENTED.pdu));
     if (afterSegment0.kind !== 'incomplete') throw new Error('expected incomplete after only segment 0');
     const complete = acceptSegment(afterSegment0.state, SRC_24, hex(LOWER_TRANSPORT_SAMPLE_SEGMENTED.pdu1));
     if (complete.kind !== 'complete') throw new Error('expected complete after both segments');
@@ -1178,7 +1224,7 @@ describe('Segment Acknowledgment message: blockAckFrom (./reassembly) feeds enco
     });
     expect(segments).toHaveLength(4); // sanity: this really is a 4-segment fixture, not 2 or 3.
 
-    const afterSeg0 = acceptSegment(null, SRC_24, segments[0] as Buffer);
+    const afterSeg0 = acceptSegment(undefined, SRC_24, segments[0] as Buffer);
     if (afterSeg0.kind !== 'incomplete') throw new Error('expected incomplete after only segment 0');
     const afterSeg2 = acceptSegment(afterSeg0.state, SRC_24, segments[2] as Buffer);
     if (afterSeg2.kind !== 'incomplete') throw new Error('expected incomplete after segments 0 and 2 (1 and 3 still missing)');

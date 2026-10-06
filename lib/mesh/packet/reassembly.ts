@@ -20,9 +20,12 @@ import { assertRange, MAX_ADDRESS } from './ranges';
  * and completion test, SegO as the slot, and AKF/AID/SZMIC, now cross-
  * checked against the values the first segment established and carried
  * forward in `ReassemblyState` itself. That decoder already rejects a
- * segment whose own SegO exceeds its own SegN (Table 3.18's own
- * invariant), so by the time a decoded segment reaches the logic below,
- * SegO<=SegN already holds for THAT segment in isolation - what this
+ * segment whose own SegO exceeds its own SegN, and a NON-LAST segment
+ * (SegO != SegN) whose payload is not exactly the fixed segment size
+ * (both Table 3.18's own invariants, both decidable from one segment's
+ * four header octets plus its own payload length), so by the time a
+ * decoded segment reaches the logic below, SegO<=SegN and the segment-size
+ * rule already hold for THAT segment in isolation - what this
  * module still has to guard against is a segment that is internally
  * consistent but does not belong to the reassembly already in progress
  * (wrong source, wrong SeqZero, a SegN that disagrees with the one the
@@ -40,6 +43,31 @@ import { assertRange, MAX_ADDRESS } from './ranges';
  * NOT this module's job - that belongs to the adapter layer, not the mesh
  * core (see `lib/__tests__/import-boundary.test.ts`: this module performs
  * no I/O and must stay that way).
+ *
+ * ONE NULLISH CONVENTION - `undefined` - ACROSS THE WHOLE MODULE. "No
+ * reassembly in progress" is spelled `undefined` everywhere it can occur:
+ * as `acceptSegment`'s `state` argument, and as the `'ignored'` result
+ * variant's own `state`. `undefined` rather than `null` for one concrete
+ * reason - the storage this header recommends just above is a `Map` keyed
+ * by source address, and `Map.prototype.get` returns `undefined` for a key
+ * it does not hold, which is exactly the first segment of every new
+ * message: the single most frequent call this function ever receives. So
+ * the recommended usage is literally
+ *
+ *     const inFlight = new Map<number, ReassemblyState>();
+ *     const result = acceptSegment(inFlight.get(src), src, pdu);
+ *
+ * with no `?? null` adapter wedged in between, and this module's own output
+ * feeds straight back into its own input: every result variant's `state`
+ * has precisely the type `acceptSegment`'s first parameter accepts. An
+ * earlier version of this module ACCEPTED `ReassemblyState | null` while
+ * REPORTING `ReassemblyState | undefined`, which made both of those a type
+ * error and, if forced through anyway, a raw `TypeError` while reading a
+ * property of `undefined` on that commonest call of all - inverting this
+ * module's own "a caller's programming error throws, ordinary foreign
+ * traffic returns a result" line for a reason that had nothing to do with
+ * either. `__tests__/reassembly.test.ts` now EXERCISES the `Map` pattern
+ * above rather than this header merely describing it.
  *
  * `ReassemblyState` IS NOT JSON-ROUND-TRIPPABLE, AND MUST NOT CONTAIN
  * ARRAY HOLES. It must be handed back to `acceptSegment`/`blockAckFrom`
@@ -108,6 +136,12 @@ export interface ReassemblyState {
 export type ReassemblyResult =
   | { kind: 'incomplete'; state: ReassemblyState }
   | { kind: 'complete'; state: ReassemblyState; upperTransportPdu: Buffer; akf: boolean; aid: number; szmic: boolean }
+  /**
+   * `state` is `undefined` - never `null` - when there was no reassembly in
+   * progress to report back, matching the type `acceptSegment` accepts for
+   * its own `state` argument exactly (see the module header's "one nullish
+   * convention" note), so an `'ignored'` result can be fed straight back in.
+   */
   | { kind: 'ignored'; state: ReassemblyState | undefined; reason: string };
 
 function allSegmentsReceived(segments: ReadonlyArray<Buffer | undefined>): boolean {
@@ -152,14 +186,18 @@ function finish(state: ReassemblyState): ReassemblyResult {
 /**
  * Feeds one received Segmented Access message (`pdu`, the on-the-wire
  * Lower Transport PDU - 4-octet header plus that segment's payload, Table
- * 3.18) into a reassembly, starting a new one when `state` is `null`.
+ * 3.18) into a reassembly, starting a new one when `state` is `undefined`
+ * (the module header's "one nullish convention" note: `undefined`, never
+ * `null`, so both `inFlight.get(src)` on a `Map` the caller keeps and this
+ * function's own `'ignored'` result can be passed straight back in).
  * `src` is the sending node's address (Network PDU SRC field), supplied
  * separately because the Segmented Access message format itself carries no
  * address.
  *
  * WHEN `pdu` DOES NOT DECODE AS A SEGMENTED ACCESS MESSAGE (SEG clear, too
- * short for a non-empty segment, or an internally inconsistent SegO/SegN
- * pair), THIS IS ORDINARY FOREIGN TRAFFIC, NOT A CALLER MISTAKE - it is
+ * short for a non-empty segment, a NON-LAST segment that is not exactly the
+ * fixed segment size, or an internally inconsistent SegO/SegN pair), THIS
+ * IS ORDINARY FOREIGN TRAFFIC, NOT A CALLER MISTAKE - it is
  * `'ignored'`, exactly like every other condition this function reports
  * through `ReassemblyResult`, never thrown. `decodeSegmentedAccess`'s own
  * documentation already makes this point about its `null` return value -
@@ -179,7 +217,8 @@ function finish(state: ReassemblyState): ReassemblyResult {
  * unparseable PDU must not discard real, already-collected segments. If no
  * reassembly was in progress, there is no `ReassemblyState` to hand back,
  * hence `ReassemblyResult`'s `'ignored'` variant allows `state` to be
- * `undefined`.
+ * `undefined` - the same `undefined` this parameter itself accepts, so the
+ * result needs no translation before being passed back in.
  *
  * The only thing this function still throws for is an out-of-range `src` -
  * that one stays a thrown `Error` (via `assertRange`) because it is a
@@ -188,7 +227,7 @@ function finish(state: ReassemblyState): ReassemblyResult {
  * distinction `upperTransport.ts` draws for its own `src`/`dst`
  * parameters.
  *
- * Checks run in this order once `state` is non-null, each one independent
+ * Checks run in this order once `state` is defined, each one independent
  * of the others so every `'ignored'` case has its own, specific `reason`:
  *
  * 1. `src` must match `state.src` - otherwise this segment belongs to a
@@ -218,20 +257,21 @@ function finish(state: ReassemblyState): ReassemblyResult {
  * Only once all five hold is the segment stored, in a FRESH array (the
  * passed-in `state`/`state.segments` are never mutated).
  */
-export function acceptSegment(state: ReassemblyState | null, src: number, pdu: Buffer): ReassemblyResult {
+export function acceptSegment(state: ReassemblyState | undefined, src: number, pdu: Buffer): ReassemblyResult {
   assertRange('reassembly field "src"', src, MAX_ADDRESS);
 
   const decoded = decodeSegmentedAccess(pdu);
   if (decoded === null) {
     return {
       kind: 'ignored',
-      state: state ?? undefined,
-      reason: 'pdu does not decode as a Segmented Access message (SEG clear, too short for a non-empty segment, or SegO>SegN)',
+      state,
+      reason:
+        'pdu does not decode as a Segmented Access message (SEG clear, too short for a non-empty segment, a non-last segment that is not exactly the fixed segment size, or SegO>SegN)',
     };
   }
   const { akf, aid, szmic, seqZero, segO, segN, segment } = decoded;
 
-  if (state === null) {
+  if (state === undefined) {
     const segments: Array<Buffer | undefined> = new Array(segN + 1).fill(undefined);
     segments[segO] = segment;
     return finish({ src, seqZero, segN, akf, aid, szmic, segments });

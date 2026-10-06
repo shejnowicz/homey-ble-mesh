@@ -280,10 +280,34 @@ export function decryptUpperTransport(
 
   const nonce = buildNonce(input);
   const micLength = input.szmic ? TRANS_MIC_LENGTH_LONG : TRANS_MIC_LENGTH_SHORT;
-  // `subarray` clamps rather than throwing on a PDU shorter than micLength
-  // (verified directly), leaving a tag of some other length for
-  // `ccmDecrypt`'s own MESH_MIC_LENGTHS check to drop quietly - the same
-  // "truncated foreign packet" case that check is already built for.
+  // On a PDU SHORTER than micLength the end index below goes negative, and
+  // `subarray` does NOT clamp a negative end to zero: it takes it relative
+  // to the buffer's own length (`length + end`, and only THAT result is
+  // clamped at 0). So a 3-octet PDU with a 4-octet MIC splits into a
+  // 2-octet ciphertext and a 1-octet tag, not an empty ciphertext and a
+  // 3-octet tag - measured directly, not reasoned about. Generally, for a
+  // PDU of length L < micLength the ciphertext is max(0, 2L - micLength)
+  // octets and the tag is the remaining min(L, micLength - L).
+  //
+  // Nothing throws for ANY short length, and the result is always `null`
+  // (enumerated exhaustively over both MIC sizes and every L below them),
+  // but by two different routes - which the old comment collapsed into one:
+  //
+  // - For 11 of the 12 short cases the tag comes out at some length mesh
+  //   never uses (0, 1, 2, 3 or 6 octets), so `ccmDecrypt`'s own
+  //   MESH_MIC_LENGTHS check drops it before any crypto runs - the
+  //   "truncated foreign packet" case that check is built for.
+  // - The ONE exception is szmic=true with a 4-octet PDU: 4 + (4-8) = 0, so
+  //   the ciphertext is empty and the TAG is 4 octets, which IS a mesh MIC
+  //   length. That one passes the length gate, reaches AES-CCM, and is
+  //   rejected there as an authentication failure instead. Same `null`,
+  //   different mechanism - and no way for a 4-octet PDU to authenticate
+  //   under a nonce built for a 64-bit MIC, so this is not a soft spot.
+  //
+  // The OUTCOME the original comment claimed was right and is tested; the
+  // mechanism it named was not. A comment that misdescribes a mechanism is
+  // a trap for whoever relies on it next, which is why this one now states
+  // what was measured rather than what was assumed.
   const ciphertext = input.upperTransportPdu.subarray(0, input.upperTransportPdu.length - micLength);
   const tag = input.upperTransportPdu.subarray(ciphertext.length);
   return ccmDecrypt(input.key, nonce, ciphertext, tag, input.labelUuid);
