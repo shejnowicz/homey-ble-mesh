@@ -679,9 +679,12 @@ export const LOWER_TRANSPORT_SAMPLE_ACCESS_2 = {
  * report `akf: true` would still match every one of them.
  *
  * This message's own "LowerTransportUnsegmentedAccessPDU" block publishes
- * SEG=00, AID=00 (not a derived AID - AKF=0 means no application key is
- * involved, so this is a fixed placeholder, same reasoning as
- * `UPPER_TRANSPORT_SAMPLE_DEVICE_KEY`'s own note), Header=00. The block's
+ * SEG=00, AID=00, Header=00. AID=00 is not a derived value here - Section
+ * 3.6.4.1 "Transmitting an Upper Transport PDU" states the rule normatively:
+ * "If the device key is used, then the AKF field shall be set to 0 and the
+ * AID field shall be set to 0b000000." (the same section already cited in
+ * this module's own header for how AKF/AID get set in general; see also
+ * `UPPER_TRANSPORT_SAMPLE_DEVICE_KEY`'s note on the same point). The block's
  * own row for this field is labelled "AFK" in the source document - the
  * same transposition typo already noted in this file's header comment for
  * DEVICE_NONCE_SAMPLE_1/_2 (it is the AKF field; the hex value is

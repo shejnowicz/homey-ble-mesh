@@ -326,7 +326,13 @@ describe("decode returns a COPY, not a view onto the caller's buffer", () => {
     const input = hex(LOWER_TRANSPORT_SAMPLE_ACCESS_1.expected);
     const inputCopy = Buffer.from(input);
     const decoded = decodeUnsegmentedAccess(input);
-    decoded?.upperTransportPdu.fill(0xff); // simulate a caller mutating what it got back.
+    // Asserted (not optional-chained) before the write: `decoded?.x.fill()`
+    // would silently skip the write - and this test would then pass
+    // vacuously - if decode ever returned null here, which is exactly the
+    // failure mode a review caught live (this test's sibling above failed
+    // under a mutation while this one passed silently, for that reason).
+    expect(decoded).not.toBeNull();
+    decoded!.upperTransportPdu.fill(0xff); // simulate a caller mutating what it got back.
     expect(input).toEqual(inputCopy);
   });
 
@@ -342,7 +348,10 @@ describe("decode returns a COPY, not a view onto the caller's buffer", () => {
     const input = hex(LOWER_TRANSPORT_SAMPLE_CONTROL_1.expected);
     const inputCopy = Buffer.from(input);
     const decoded = decodeUnsegmentedControl(input);
-    decoded?.parameters.fill(0xff);
+    // Same reasoning as the access-side test above: assert non-null before
+    // writing, or a null decode makes this test pass vacuously.
+    expect(decoded).not.toBeNull();
+    decoded!.parameters.fill(0xff);
     expect(input).toEqual(inputCopy);
   });
 });
@@ -410,5 +419,70 @@ describe('vectors.ts: duplicated fixture fields cross-check each other', () => {
     expect(hex(UPPER_TRANSPORT_SAMPLE_SZMIC.expected).subarray(0, 12)).toEqual(
       hex(LOWER_TRANSPORT_SAMPLE_SEGMENTED.segment0),
     );
+  });
+});
+
+// Finding (second review round): converting LOWER_TRANSPORT_SAMPLE_SEGMENTED
+// from a bare hex string into an object (so the segmentation task would not
+// have to do it later) added ten fields, of which only three - `pdu`,
+// `aid`, `segment0` - were read anywhere above. The other seven, including
+// `header` (which duplicates the PDU's own leading 4 octets inside the SAME
+// object literal), were exactly the uncatchable-typo shape Finding 2 closed
+// elsewhere in this file - reopened one object down. Confirmed by the
+// reviewer: a one-digit typo in any of seg/akf/aid/szmic/seqZero/segO/segN
+// left all 173 tests green.
+//
+// Closed by making every field load-bearing: `header`/`segment0` are
+// asserted against the corresponding slice of the full `pdu`, and the
+// remaining six fields are recovered by unpacking `header` bit by bit per
+// Section 3.5.2.2, Table 3.18 "Segmented Access message format" - the
+// widths below (SEG 1, AKF 1, AID 6, SZMIC 1, SeqZero 13, SegO 5, SegN 5,
+// packed MSB-first into 32 bits) are transcribed from that table, not
+// copied from `lowerTransport.ts`'s own (unsegmented) header layout, which
+// is a different, 1-octet format. The segmentation task will decode this
+// exact sample for real; this is what stops it inheriting unverified data.
+describe('LOWER_TRANSPORT_SAMPLE_SEGMENTED: every field cross-checks the PDU bytes (Table 3.18)', () => {
+  const pdu = hex(LOWER_TRANSPORT_SAMPLE_SEGMENTED.pdu);
+  const header = hex(LOWER_TRANSPORT_SAMPLE_SEGMENTED.header);
+  const headerInt = header.readUInt32BE(0);
+
+  test("header is the PDU's own first 4 octets, and segment0 is the rest", () => {
+    expect(header).toHaveLength(4);
+    expect(pdu.subarray(0, 4)).toEqual(header);
+    expect(pdu.subarray(4)).toEqual(hex(LOWER_TRANSPORT_SAMPLE_SEGMENTED.segment0));
+  });
+
+  // Table 3.18's 7 fields (1+1+6+1+13+5+5 = 32 bits) packed MSB-first, so
+  // field N's bit range is found by subtracting cumulative widths from 31.
+  test('bit 31 (SEG, width 1) matches the transcribed seg flag', () => {
+    expect((headerInt >>> 31) & 0x1).toBe(LOWER_TRANSPORT_SAMPLE_SEGMENTED.seg ? 1 : 0);
+  });
+
+  test('bit 30 (AKF, width 1) matches the transcribed akf flag', () => {
+    expect((headerInt >>> 30) & 0x1).toBe(LOWER_TRANSPORT_SAMPLE_SEGMENTED.akf ? 1 : 0);
+  });
+
+  test('bits 29-24 (AID, width 6) match the transcribed aid', () => {
+    expect((headerInt >>> 24) & 0x3f).toBe(LOWER_TRANSPORT_SAMPLE_SEGMENTED.aid);
+  });
+
+  test('bit 23 (SZMIC, width 1) matches the transcribed szmic flag', () => {
+    expect((headerInt >>> 23) & 0x1).toBe(LOWER_TRANSPORT_SAMPLE_SEGMENTED.szmic ? 1 : 0);
+  });
+
+  test('bits 22-10 (SeqZero, width 13) match the transcribed seqZero', () => {
+    expect((headerInt >>> 10) & 0x1fff).toBe(LOWER_TRANSPORT_SAMPLE_SEGMENTED.seqZero);
+  });
+
+  test('bits 9-5 (SegO, width 5) match the transcribed segO', () => {
+    expect((headerInt >>> 5) & 0x1f).toBe(LOWER_TRANSPORT_SAMPLE_SEGMENTED.segO);
+  });
+
+  test('bits 4-0 (SegN, width 5) match the transcribed segN', () => {
+    expect(headerInt & 0x1f).toBe(LOWER_TRANSPORT_SAMPLE_SEGMENTED.segN);
+  });
+
+  test('the 7 field widths above sum to exactly the header\'s own 32 bits', () => {
+    expect(1 + 1 + 6 + 1 + 13 + 5 + 5).toBe(32);
   });
 });
