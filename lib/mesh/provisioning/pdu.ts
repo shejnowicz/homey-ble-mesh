@@ -65,7 +65,7 @@ import { assertRange } from '../packet/ranges';
  * carry the OOB/Public-Key/Algorithm negotiation fields even when OOB itself
  * is unused, because a real Provisionee announces its own OOB capabilities
  * in its Capabilities PDU regardless of what WE intend to use, and we must
- * decode what it says rather than assume a shape - "if one demands an
+ * decode what it says rather than assume a shape - "[I]f one demands an
  * out-of-band code, the wizard says so", which requires actually reading
  * that field.
  *

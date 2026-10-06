@@ -152,7 +152,7 @@
  * other nullish state for this module to be consistent with (no
  * caller-held "previous state" is threaded through a function here, unlike
  * `packet/reassembly.ts`'s `ReassemblyState` or
- * `provisioning/machine.ts`'s `ProvisioningState`), so the "a module's
+ * `provisioning/machine.ts`'s `ProvisioningState`), so the "[A] module's
  * nullish convention must be consistent" rule applies trivially: `null`
  * in, `null` out, with nothing to round-trip.
  *
