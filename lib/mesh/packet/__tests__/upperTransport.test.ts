@@ -1,9 +1,14 @@
+import { ccmEncrypt } from '../../crypto/ccm';
+import { s1, aesCmac } from '../../crypto/cmac';
+import { applicationNonce } from '../nonce';
 import { encryptUpperTransport, decryptUpperTransport } from '../upperTransport';
 import {
   hex,
   UPPER_TRANSPORT_SAMPLE_APPLICATION_KEY,
   UPPER_TRANSPORT_SAMPLE_DEVICE_KEY,
   UPPER_TRANSPORT_SAMPLE_SZMIC,
+  UPPER_TRANSPORT_SAMPLE_VIRTUAL_SHORT_MIC,
+  UPPER_TRANSPORT_SAMPLE_VIRTUAL_SHORT_MIC_SHARED_LABEL,
 } from './vectors';
 
 // 8.3.18 "Message #18": an unsegmented Access message encrypted with an
@@ -113,22 +118,117 @@ test('decryptUpperTransport recovers the published Message #24 access payload (S
   expect(payload).toEqual(hex(UPPER_TRANSPORT_SAMPLE_SZMIC.accessPayload));
 });
 
-// The Label UUID is not part of the plaintext, only additional data - so
-// omitting it must not merely produce a WRONG tag, it must fail to verify
-// at all against the published PDU, and decrypting without it must not
-// accidentally recover the correct plaintext either.
-test('decryptUpperTransport fails the published Message #24 PDU without the Label UUID', () => {
-  const payload = decryptUpperTransport({
-    upperTransportPdu: hex(UPPER_TRANSPORT_SAMPLE_SZMIC.expected),
-    key: hex(UPPER_TRANSPORT_SAMPLE_SZMIC.key),
-    keyKind: UPPER_TRANSPORT_SAMPLE_SZMIC.keyKind,
-    seq: UPPER_TRANSPORT_SAMPLE_SZMIC.seq,
-    src: UPPER_TRANSPORT_SAMPLE_SZMIC.src,
-    dst: UPPER_TRANSPORT_SAMPLE_SZMIC.dst,
-    ivIndex: UPPER_TRANSPORT_SAMPLE_SZMIC.ivIndex,
-    szmic: UPPER_TRANSPORT_SAMPLE_SZMIC.szmic,
+// The Label UUID is required (not merely useful) whenever `dst` is a virtual
+// address - Finding 2 of this task's review: omitting it used to return the
+// WRONG bytes silently (a PDU authenticating against no additional data,
+// which nothing on the real network could ever verify), rather than being
+// rejected as the caller mistake it is. Asserts the module's own message,
+// not a bare `toThrow()` - see the equivalent encrypt-side test below.
+test('decryptUpperTransport rejects the published Message #24 virtual destination with no Label UUID', () => {
+  expect(() =>
+    decryptUpperTransport({
+      upperTransportPdu: hex(UPPER_TRANSPORT_SAMPLE_SZMIC.expected),
+      key: hex(UPPER_TRANSPORT_SAMPLE_SZMIC.key),
+      keyKind: UPPER_TRANSPORT_SAMPLE_SZMIC.keyKind,
+      seq: UPPER_TRANSPORT_SAMPLE_SZMIC.seq,
+      src: UPPER_TRANSPORT_SAMPLE_SZMIC.src,
+      dst: UPPER_TRANSPORT_SAMPLE_SZMIC.dst,
+      ivIndex: UPPER_TRANSPORT_SAMPLE_SZMIC.ivIndex,
+      szmic: UPPER_TRANSPORT_SAMPLE_SZMIC.szmic,
+    }),
+  ).toThrow(/upper transport field "labelUuid" is required when "dst" is a virtual address/);
+});
+
+// 8.3.22 "Message #22": SZMIC=0 (32-bit TransMIC) AND a virtual address
+// together, with a Label UUID/destination pair that is NOT shared with
+// Message #24 - closes the gap a first review found: until this sample
+// existed, Message #24 was simultaneously the suite's only SZMIC=1 sample
+// and its only virtual-address sample, so the two dimensions never moved
+// independently (confirmed live: making the Label UUID conditional on
+// `szmic` at both call sites left all 124 tests passing). See the mutation
+// re-run below.
+test('encryptUpperTransport matches the published Message #22 sample (virtual address, 32-bit TransMIC)', () => {
+  const pdu = encryptUpperTransport({
+    accessPayload: hex(UPPER_TRANSPORT_SAMPLE_VIRTUAL_SHORT_MIC.accessPayload),
+    key: hex(UPPER_TRANSPORT_SAMPLE_VIRTUAL_SHORT_MIC.key),
+    keyKind: UPPER_TRANSPORT_SAMPLE_VIRTUAL_SHORT_MIC.keyKind,
+    seq: UPPER_TRANSPORT_SAMPLE_VIRTUAL_SHORT_MIC.seq,
+    src: UPPER_TRANSPORT_SAMPLE_VIRTUAL_SHORT_MIC.src,
+    dst: UPPER_TRANSPORT_SAMPLE_VIRTUAL_SHORT_MIC.dst,
+    ivIndex: UPPER_TRANSPORT_SAMPLE_VIRTUAL_SHORT_MIC.ivIndex,
+    szmic: UPPER_TRANSPORT_SAMPLE_VIRTUAL_SHORT_MIC.szmic,
+    labelUuid: hex(UPPER_TRANSPORT_SAMPLE_VIRTUAL_SHORT_MIC.labelUuid),
   });
-  expect(payload).toBeNull();
+  expect(pdu.toString('hex')).toBe(UPPER_TRANSPORT_SAMPLE_VIRTUAL_SHORT_MIC.expected);
+  expect(pdu).toEqual(hex(UPPER_TRANSPORT_SAMPLE_VIRTUAL_SHORT_MIC.expected));
+});
+
+test('decryptUpperTransport recovers the published Message #22 access payload (virtual address, 32-bit TransMIC)', () => {
+  const payload = decryptUpperTransport({
+    upperTransportPdu: hex(UPPER_TRANSPORT_SAMPLE_VIRTUAL_SHORT_MIC.expected),
+    key: hex(UPPER_TRANSPORT_SAMPLE_VIRTUAL_SHORT_MIC.key),
+    keyKind: UPPER_TRANSPORT_SAMPLE_VIRTUAL_SHORT_MIC.keyKind,
+    seq: UPPER_TRANSPORT_SAMPLE_VIRTUAL_SHORT_MIC.seq,
+    src: UPPER_TRANSPORT_SAMPLE_VIRTUAL_SHORT_MIC.src,
+    dst: UPPER_TRANSPORT_SAMPLE_VIRTUAL_SHORT_MIC.dst,
+    ivIndex: UPPER_TRANSPORT_SAMPLE_VIRTUAL_SHORT_MIC.ivIndex,
+    szmic: UPPER_TRANSPORT_SAMPLE_VIRTUAL_SHORT_MIC.szmic,
+    labelUuid: hex(UPPER_TRANSPORT_SAMPLE_VIRTUAL_SHORT_MIC.labelUuid),
+  });
+  expect(payload).toEqual(hex(UPPER_TRANSPORT_SAMPLE_VIRTUAL_SHORT_MIC.accessPayload));
+});
+
+// 8.3.23 "Message #23": SZMIC=0, but the SAME Label UUID/destination as
+// Message #24 (SZMIC=1) - the most direct isolation of the SZMIC dimension
+// from the virtual-address one, since everything but SEQ/SZMIC/TransMIC
+// length is identical between the two messages.
+test('encryptUpperTransport matches the published Message #23 sample (same virtual address as #24, 32-bit TransMIC)', () => {
+  const pdu = encryptUpperTransport({
+    accessPayload: hex(UPPER_TRANSPORT_SAMPLE_VIRTUAL_SHORT_MIC_SHARED_LABEL.accessPayload),
+    key: hex(UPPER_TRANSPORT_SAMPLE_VIRTUAL_SHORT_MIC_SHARED_LABEL.key),
+    keyKind: UPPER_TRANSPORT_SAMPLE_VIRTUAL_SHORT_MIC_SHARED_LABEL.keyKind,
+    seq: UPPER_TRANSPORT_SAMPLE_VIRTUAL_SHORT_MIC_SHARED_LABEL.seq,
+    src: UPPER_TRANSPORT_SAMPLE_VIRTUAL_SHORT_MIC_SHARED_LABEL.src,
+    dst: UPPER_TRANSPORT_SAMPLE_VIRTUAL_SHORT_MIC_SHARED_LABEL.dst,
+    ivIndex: UPPER_TRANSPORT_SAMPLE_VIRTUAL_SHORT_MIC_SHARED_LABEL.ivIndex,
+    szmic: UPPER_TRANSPORT_SAMPLE_VIRTUAL_SHORT_MIC_SHARED_LABEL.szmic,
+    labelUuid: hex(UPPER_TRANSPORT_SAMPLE_VIRTUAL_SHORT_MIC_SHARED_LABEL.labelUuid),
+  });
+  expect(pdu.toString('hex')).toBe(UPPER_TRANSPORT_SAMPLE_VIRTUAL_SHORT_MIC_SHARED_LABEL.expected);
+  expect(pdu).toEqual(hex(UPPER_TRANSPORT_SAMPLE_VIRTUAL_SHORT_MIC_SHARED_LABEL.expected));
+});
+
+test('decryptUpperTransport recovers the published Message #23 access payload (same virtual address as #24, 32-bit TransMIC)', () => {
+  const payload = decryptUpperTransport({
+    upperTransportPdu: hex(UPPER_TRANSPORT_SAMPLE_VIRTUAL_SHORT_MIC_SHARED_LABEL.expected),
+    key: hex(UPPER_TRANSPORT_SAMPLE_VIRTUAL_SHORT_MIC_SHARED_LABEL.key),
+    keyKind: UPPER_TRANSPORT_SAMPLE_VIRTUAL_SHORT_MIC_SHARED_LABEL.keyKind,
+    seq: UPPER_TRANSPORT_SAMPLE_VIRTUAL_SHORT_MIC_SHARED_LABEL.seq,
+    src: UPPER_TRANSPORT_SAMPLE_VIRTUAL_SHORT_MIC_SHARED_LABEL.src,
+    dst: UPPER_TRANSPORT_SAMPLE_VIRTUAL_SHORT_MIC_SHARED_LABEL.dst,
+    ivIndex: UPPER_TRANSPORT_SAMPLE_VIRTUAL_SHORT_MIC_SHARED_LABEL.ivIndex,
+    szmic: UPPER_TRANSPORT_SAMPLE_VIRTUAL_SHORT_MIC_SHARED_LABEL.szmic,
+    labelUuid: hex(UPPER_TRANSPORT_SAMPLE_VIRTUAL_SHORT_MIC_SHARED_LABEL.labelUuid),
+  });
+  expect(payload).toEqual(hex(UPPER_TRANSPORT_SAMPLE_VIRTUAL_SHORT_MIC_SHARED_LABEL.accessPayload));
+});
+
+// Section 3.4.2.3's own formula - SALT=s1("vtad"), hash=AES-CMAC_SALT(Label
+// UUID) mod 2^14, virtual address = 0x8000 | hash - run here with this
+// project's own (already known-answer-tested) `s1`/`aesCmac`, to derive
+// Message #24's published destination (0x9736) from its published Label
+// UUID. This makes the fixture prove its own provenance: a fabricated or
+// transposed Label UUID would not hash to the published destination.
+test("Message #24's published Label UUID hashes to its own published virtual destination (Section 3.4.2.3)", () => {
+  const salt = s1(Buffer.from('vtad', 'ascii'));
+  const hash = aesCmac(salt, hex(UPPER_TRANSPORT_SAMPLE_SZMIC.labelUuid));
+  // "mod 2^14" of a big-endian integer depends only on its low 14 bits,
+  // which live entirely within the last two octets of the 16-octet CMAC
+  // output - so reading those two octets and masking to 14 bits is exactly
+  // "mod 2^14", not an approximation of it.
+  const low14 = (hash.readUInt16BE(14) as number) & 0x3fff;
+  const virtualAddress = 0x8000 | low14; // bit 15 set, bit 14 clear (Figure 3.7).
+  expect(virtualAddress).toBe(UPPER_TRANSPORT_SAMPLE_SZMIC.dst);
 });
 
 describe('caller mistakes throw rather than being treated as a verification failure', () => {
@@ -205,10 +305,53 @@ describe('caller mistakes throw rather than being treated as a verification fail
     ).toThrow(/upper transport field "labelUuid"/);
   });
 
+  // dst is overridden to a virtual address here so this actually exercises
+  // the LENGTH check - against `valid`'s own non-virtual dst (0xffff), a
+  // wrong-length labelUuid would instead be rejected for being set on a
+  // non-virtual destination at all, which is a different guard (covered by
+  // its own test below) and would prove nothing about length specifically.
   test('encryptUpperTransport rejects a labelUuid that is not 128 bits', () => {
-    expect(() => encryptUpperTransport({ ...valid, labelUuid: Buffer.alloc(15) })).toThrow(
-      /upper transport field "labelUuid"/,
-    );
+    expect(() =>
+      encryptUpperTransport({
+        ...valid,
+        dst: UPPER_TRANSPORT_SAMPLE_SZMIC.dst,
+        labelUuid: Buffer.alloc(15),
+      }),
+    ).toThrow(/upper transport field "labelUuid" must be 16 bytes/);
+  });
+
+  // Finding 2 (review): a virtual destination with no Label UUID used to be
+  // accepted silently and produce a PDU authenticating against nothing - now
+  // rejected as the caller mistake it is, for an application-key message.
+  test('encryptUpperTransport rejects a virtual destination with no labelUuid', () => {
+    expect(() =>
+      encryptUpperTransport({ ...valid, dst: UPPER_TRANSPORT_SAMPLE_SZMIC.dst }),
+    ).toThrow(/upper transport field "labelUuid" is required when "dst" is a virtual address/);
+  });
+
+  // The other direction: a labelUuid supplied for a destination OUTSIDE the
+  // virtual address range (0x8000-0xBFFF, Section 3.4.2.3) is also rejected,
+  // not silently accepted as extra, unused additional data.
+  test('encryptUpperTransport rejects a labelUuid for a non-virtual destination', () => {
+    expect(() =>
+      encryptUpperTransport({ ...valid, labelUuid: hex(UPPER_TRANSPORT_SAMPLE_SZMIC.labelUuid) }),
+    ).toThrow(/upper transport field "labelUuid" must not be set when "dst" is not a virtual address/);
+  });
+
+  // A device-key message never uses a virtual address at all (Section
+  // 3.9.7.1 defines only the unicast case for DevKey) - this is the same
+  // rule as "rejects a labelUuid on a device-key message" above, but caught
+  // one step earlier: here the caller never supplied a labelUuid, so a
+  // weaker guard that checked only "labelUuid present" would miss it.
+  test('encryptUpperTransport rejects a virtual destination on a device-key message even with no labelUuid', () => {
+    expect(() =>
+      encryptUpperTransport({
+        ...valid,
+        keyKind: 'device',
+        key: hex(UPPER_TRANSPORT_SAMPLE_DEVICE_KEY.key),
+        dst: UPPER_TRANSPORT_SAMPLE_SZMIC.dst,
+      }),
+    ).toThrow(/upper transport field "dst" must not be a virtual address/);
   });
 
   // Section 3.6.2.1: an Access message paired with a 64-bit TransMIC is
@@ -273,4 +416,40 @@ test('decryptUpperTransport rejects a truncated PDU rather than throwing', () =>
     });
   expect(decode).not.toThrow();
   expect(decode()).toBeNull();
+});
+
+// `encryptUpperTransport` refuses a zero-octet access payload (Section
+// 3.6.2.1's "a single octet"), but `decryptUpperTransport` does not re-apply
+// that minimum to what it recovers - a receiver's job is to accept whatever
+// authenticates, not re-validate a sender's choices (see the function's own
+// JSDoc). This builds a genuinely authenticated zero-length Upper Transport
+// Access PDU directly over `ccmEncrypt`/`applicationNonce` - both already
+// known-answer-tested elsewhere - deliberately bypassing
+// `encryptUpperTransport`'s own guard, the same way `network.test.ts`'s
+// `buildAuthenticatedPdu` bypasses `encodeNetworkPdu`'s length guard to
+// reach a case the guarded function cannot produce itself.
+test('decryptUpperTransport returns an empty buffer (not null) for an authenticated zero-length payload', () => {
+  const sample = UPPER_TRANSPORT_SAMPLE_APPLICATION_KEY;
+  const nonce = applicationNonce({
+    aszmic: sample.szmic,
+    seq: sample.seq,
+    src: sample.src,
+    dst: sample.dst,
+    ivIndex: sample.ivIndex,
+  });
+  const { ciphertext, tag } = ccmEncrypt(hex(sample.key), nonce, Buffer.alloc(0), 4);
+  expect(ciphertext).toHaveLength(0);
+
+  const payload = decryptUpperTransport({
+    upperTransportPdu: Buffer.concat([ciphertext, tag]),
+    key: hex(sample.key),
+    keyKind: sample.keyKind,
+    seq: sample.seq,
+    src: sample.src,
+    dst: sample.dst,
+    ivIndex: sample.ivIndex,
+    szmic: sample.szmic,
+  });
+  expect(payload).not.toBeNull();
+  expect(payload).toHaveLength(0);
 });

@@ -74,6 +74,18 @@ import { assertRange, MAX_SEQ, MAX_ADDRESS, MAX_IV_INDEX } from './ranges';
  * takes exactly one candidate per call and leaves that iteration to whatever
  * calls it, same as it leaves segmentation and reassembly to the lower
  * transport layer.
+ *
+ * A first review of this task found two more gaps, both closed below:
+ * (1) Message #24 was simultaneously the only SZMIC=1 sample AND the only
+ * virtual-address sample, so nothing exercised the two independently - a
+ * live mutation (applying `labelUuid` only when `szmic` was set, at both
+ * `ccmEncrypt`/`ccmDecrypt` call sites) passed the whole suite. Closed by
+ * transcribing Messages #22 and #23 (also virtual-address, but SZMIC=0) -
+ * see `vectors.ts`. (2) `dst` falling in the virtual address range with no
+ * `labelUuid` was accepted silently, producing a PDU that authenticates
+ * against nothing - closed by `isVirtualAddress`/`assertLabelUuidRules`
+ * below, which transcribes the range itself (0x8000-0xBFFF) rather than
+ * only checking a UUID's width once supplied.
  */
 
 export type UpperTransportKeyKind = 'application' | 'device';
@@ -96,17 +108,26 @@ export interface UpperTransportInput {
   /** Segmented-message long-MIC flag: false selects the 32-bit TransMIC, true the 64-bit one. */
   szmic: boolean;
   /**
-   * The 128-bit Label UUID `dst` was hashed from, required as AES-CCM
-   * additional data whenever the destination is a virtual address and
-   * `keyKind` is `'application'` (Section 3.9.7.1, Section 3.4.2.3). Omit
-   * for a unicast or group destination. Must be omitted when `keyKind` is
-   * `'device'` - see the module header.
+   * The 128-bit Label UUID `dst` was hashed from. REQUIRED as AES-CCM
+   * additional data whenever `dst` falls in the virtual address range
+   * (0x8000-0xBFFF, Section 3.4.2.3) and `keyKind` is `'application'` -
+   * enforced below, not merely documented: a virtual `dst` with no
+   * `labelUuid` throws, rather than silently producing a PDU nothing can
+   * authenticate. Must be omitted for a unicast or group `dst`, and must be
+   * omitted entirely when `keyKind` is `'device'` - see the module header.
    */
   labelUuid?: Buffer;
 }
 
 const KEY_LENGTH = 16; // 128-bit AppKey/DevKey.
 const LABEL_UUID_LENGTH = 16; // 128-bit Label UUID (Section 3.4.2.3).
+
+// Section 3.4.2.3 "Virtual address": "A virtual address can have any value
+// from 0x8000 to 0xBFFF" (bit 15 set, bit 14 clear, Figure 3.7). This is the
+// range `labelUuid` is required for (application key) or forbidden outside
+// of (any key).
+const MIN_VIRTUAL_ADDRESS = 0x8000;
+const MAX_VIRTUAL_ADDRESS = 0xbfff;
 
 const TRANS_MIC_LENGTH_SHORT = 4; // 32 bits (Section 3.6.2.2).
 const TRANS_MIC_LENGTH_LONG = 8; // 64 bits (Section 3.6.2.2; Segmented Access messages only).
@@ -130,17 +151,49 @@ function assertKeyLength(key: Buffer): void {
   }
 }
 
-function assertLabelUuid(keyKind: UpperTransportKeyKind, labelUuid: Buffer | undefined): void {
-  if (labelUuid === undefined) {
+function isVirtualAddress(dst: number): boolean {
+  return dst >= MIN_VIRTUAL_ADDRESS && dst <= MAX_VIRTUAL_ADDRESS;
+}
+
+/**
+ * Enforces the pairing between `dst`, `keyKind` and `labelUuid` (Sections
+ * 3.4.2.3, 3.9.7.1): a device-key message never uses a virtual address at
+ * all and so never carries a `labelUuid`; an application-key message MUST
+ * carry one when `dst` is virtual (otherwise the produced/expected PDU
+ * authenticates against the wrong additional data - see the module header's
+ * account of Message #24) and MUST NOT carry one otherwise.
+ */
+function assertLabelUuidRules(keyKind: UpperTransportKeyKind, dst: number, labelUuid: Buffer | undefined): void {
+  if (keyKind === 'device') {
+    if (labelUuid !== undefined) {
+      throw new Error(
+        'upper transport field "labelUuid" must not be set for a device-key message (Section 3.9.7.1 defines only the unicast destination for DevKey)',
+      );
+    }
+    if (isVirtualAddress(dst)) {
+      throw new Error(
+        `upper transport field "dst" must not be a virtual address (0x${MIN_VIRTUAL_ADDRESS.toString(16)}-0x${MAX_VIRTUAL_ADDRESS.toString(16)}, Section 3.4.2.3) for a device-key message (Section 3.9.7.1 defines only the unicast destination for DevKey)`,
+      );
+    }
     return;
   }
-  if (keyKind === 'device') {
-    throw new Error(
-      'upper transport field "labelUuid" must not be set for a device-key message (Section 3.9.7.1 defines only the unicast destination for DevKey)',
-    );
+
+  if (isVirtualAddress(dst)) {
+    if (labelUuid === undefined) {
+      throw new Error(
+        `upper transport field "labelUuid" is required when "dst" is a virtual address (0x${MIN_VIRTUAL_ADDRESS.toString(16)}-0x${MAX_VIRTUAL_ADDRESS.toString(16)}, Section 3.4.2.3)`,
+      );
+    }
+    if (labelUuid.length !== LABEL_UUID_LENGTH) {
+      throw new Error(`upper transport field "labelUuid" must be ${LABEL_UUID_LENGTH} bytes, got ${labelUuid.length}`);
+    }
+    return;
   }
-  if (labelUuid.length !== LABEL_UUID_LENGTH) {
-    throw new Error(`upper transport field "labelUuid" must be ${LABEL_UUID_LENGTH} bytes, got ${labelUuid.length}`);
+
+  if (labelUuid !== undefined) {
+    throw new Error(
+      `upper transport field "labelUuid" must not be set when "dst" is not a virtual address (0x${MIN_VIRTUAL_ADDRESS.toString(16)}-0x${MAX_VIRTUAL_ADDRESS.toString(16)}, Section 3.4.2.3)`,
+    );
   }
 }
 
@@ -183,7 +236,7 @@ function assertCommonFields(input: {
   assertUpperTransportField('src', input.src, MAX_ADDRESS);
   assertUpperTransportField('dst', input.dst, MAX_ADDRESS);
   assertUpperTransportField('ivIndex', input.ivIndex, MAX_IV_INDEX);
-  assertLabelUuid(input.keyKind, input.labelUuid);
+  assertLabelUuidRules(input.keyKind, input.dst, input.labelUuid);
 }
 
 /**
@@ -209,6 +262,16 @@ export function encryptUpperTransport(input: UpperTransportInput): Buffer {
  * found") - so it is returned, not thrown, exactly as `ccmDecrypt` and
  * `decodeNetworkPdu` already distinguish that from a caller's own mistake
  * (wrong key width, an out-of-range field), which throws.
+ *
+ * Deliberately asymmetric with `encryptUpperTransport` in one respect: it
+ * does NOT re-apply Section 3.6.2.1's minimum access-payload length (one
+ * octet) to the recovered plaintext. `encryptUpperTransport` refuses to
+ * ever produce a zero-length Access message, but a receiver's job is to
+ * accept whatever successfully authenticates, not to second-guess a sender
+ * - the specification places that minimum on what is sent, not on what a
+ * receiver is allowed to accept. In practice this never fires against a
+ * compliant sender, since nothing produced by `encryptUpperTransport` is
+ * zero-length.
  */
 export function decryptUpperTransport(
   input: Omit<UpperTransportInput, 'accessPayload'> & { upperTransportPdu: Buffer },
