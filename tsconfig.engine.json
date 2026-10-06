@@ -8,10 +8,8 @@
     "esModuleInterop": true,
     "forceConsistentCasingInFileNames": true,
     "skipLibCheck": true,
-    "outDir": "./.homeybuild",
-    "rootDir": ".",
-    "types": ["node"]
+    "outDir": "build",
+    "types": ["node", "jest"]
   },
-  "include": ["app.ts", "lib/**/*.ts", "drivers/**/*.ts"],
-  "exclude": ["node_modules", ".homeybuild", "lib/**/__tests__/**"]
+  "include": ["lib/**/*.ts"]
 }
