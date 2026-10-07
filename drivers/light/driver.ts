@@ -30,30 +30,36 @@
 //   not fire for a real unexpected drop, which `pairing.ts` already handles
 //   safely (an unanswered `channel.next()` leaves the pairing attempt
 //   stuck rather than corrupting anything — the user can always retry).
-// - Service/characteristic UUIDs are translated from this project's
+// - Service/characteristic UUIDs are translated between this project's
 //   numeric convention (`lib/adapter/connection.ts`'s own `0x1828`-style
-//   constants) to Homey's own hex-string convention (`BleAdvertisement`/
-//   `BleService`/`BleCharacteristic`'s `uuid: string`) via plain
-//   `parseInt(uuid, 16)` (`parseUuid` below) — Homey's own documentation
-//   gives no other shape for these strings, but this has not been
-//   exercised against a real GATT stack's exact string casing/padding.
+//   constants) and Homey's own hex-string convention (`BleAdvertisement`/
+//   `BleService`/`BleCharacteristic`'s `uuid: string`) via `./pairing.ts`'s
+//   own `parseBleUuid`/`bleUuidString` — moved there, under the typecheck/
+//   jest gate, after a review found three real bugs in this file's own
+//   earlier naive `parseInt(uuid, 16)` (see that module's own header for
+//   what they were and why they were real, not merely untested).
 import Homey from 'homey';
 import type { BleAdvertisement, BlePeripheral, BleCharacteristic } from 'homey';
 
 import { NetworkStore, type SettingsPort } from '../../lib/adapter/store';
-import type {
-  BluetoothPort,
-  CharacteristicHandle,
-  ConnectionHandle,
-  DiscoveredCharacteristic,
-  ScanResult,
-  ServiceDataEntry,
-  Subscription,
+import {
+  MESH_PROVISIONING_SERVICE_UUID,
+  MESH_PROXY_SERVICE_UUID,
+  type BluetoothPort,
+  type CharacteristicHandle,
+  type ConnectionHandle,
+  type DiscoveredCharacteristic,
+  type ScanResult,
+  type ServiceDataEntry,
+  type Subscription,
 } from '../../lib/adapter/connection';
 import {
   pairNode,
   scanForUnprovisionedNodes,
   createNodeCryptoRandomSource,
+  createRealClock,
+  parseBleUuid,
+  bleUuidString,
   type PairingDeps,
   type PairingOutcome,
   type UnprovisionedNodeCandidate,
@@ -76,9 +82,11 @@ const DISCONNECT_EVENT = 'disconnect';
 type DriverHomey = InstanceType<typeof Homey.Driver>['homey'];
 type BleManager = DriverHomey['ble'];
 
-function parseUuid(uuid: string): number {
-  return parseInt(uuid, 16);
-}
+/** The only two services this app ever needs to find — passed to
+ *  `ManagerBLE.discover()` as its own `serviceFilter` (review finding: the
+ *  earlier version of this port ignored that parameter entirely and asked
+ *  Homey for every advertisement it could see). */
+const SCAN_SERVICE_FILTER = [bleUuidString(MESH_PROVISIONING_SERVICE_UUID), bleUuidString(MESH_PROXY_SERVICE_UUID)];
 
 /** Wraps one `BlePeripheral`'s discovered characteristics so `discover()`
  *  only has to flatten `BleService[]` once per connection. */
@@ -86,18 +94,38 @@ interface HomeyCharacteristicHandle {
   readonly characteristic: BleCharacteristic;
 }
 
+/** `parseBleUuid` throws for anything that is not one of this project's own
+ *  16-bit short UUIDs (by design — see `pairing.ts`'s own module header).
+ *  A REAL peripheral's `discoverAllServicesAndCharacteristics()` has no
+ *  filter of its own and routinely returns entirely unrelated services
+ *  (Device Information, Battery, GAP/GATT housekeeping, vendor-specific
+ *  128-bit UUIDs) alongside the Mesh ones — so a throw here must mean
+ *  "not one of ours, skip it", never "crash the whole discover() call".
+ *  `null` lets both call sites below filter the one entry out instead of
+ *  letting one unrelated service take down pairing entirely. */
+function tryParseBleUuid(uuid: string): number | null {
+  try {
+    return parseBleUuid(uuid);
+  } catch {
+    return null;
+  }
+}
+
 class HomeyBluetoothPort implements BluetoothPort {
   constructor(private readonly ble: BleManager) {}
 
   async scan(_durationMs: number): Promise<ScanResult[]> {
     // See this file's own header: Homey's discover() has no duration
-    // parameter, so `_durationMs` cannot be honoured exactly.
-    const advertisements = await this.ble.discover();
+    // parameter, so `_durationMs` cannot be honoured exactly. The service
+    // filter, by contrast, WAS previously ignored despite being available —
+    // see SCAN_SERVICE_FILTER's own comment.
+    const advertisements = await this.ble.discover(SCAN_SERVICE_FILTER);
     return advertisements.map((advertisement: BleAdvertisement) => {
-      const serviceData: ServiceDataEntry[] = advertisement.serviceData.map((entry) => ({
-        serviceUuid: parseUuid(entry.uuid),
-        data: entry.data,
-      }));
+      const serviceData: ServiceDataEntry[] = [];
+      for (const entry of advertisement.serviceData) {
+        const serviceUuid = tryParseBleUuid(entry.uuid);
+        if (serviceUuid !== null) serviceData.push({ serviceUuid, data: entry.data });
+      }
       return { peripheralId: advertisement.uuid, rssi: advertisement.rssi, serviceData };
     });
   }
@@ -114,10 +142,13 @@ class HomeyBluetoothPort implements BluetoothPort {
     const services = await peripheral.discoverAllServicesAndCharacteristics();
     const result: DiscoveredCharacteristic[] = [];
     for (const service of services) {
-      const serviceUuid = parseUuid(service.uuid);
+      const serviceUuid = tryParseBleUuid(service.uuid);
+      if (serviceUuid === null) continue; // not one of ours — see tryParseBleUuid's own comment
       for (const characteristic of service.characteristics) {
+        const characteristicUuid = tryParseBleUuid(characteristic.uuid);
+        if (characteristicUuid === null) continue;
         const handle: HomeyCharacteristicHandle = { characteristic };
-        result.push({ serviceUuid, characteristicUuid: parseUuid(characteristic.uuid), handle });
+        result.push({ serviceUuid, characteristicUuid, handle });
       }
     }
     return result;
@@ -169,7 +200,7 @@ class LightDriver extends Homey.Driver {
   async onPair(session: Parameters<InstanceType<typeof Homey.Driver>['onPair']>[0]): Promise<void> {
     const bluetooth = new HomeyBluetoothPort(this.homey.ble);
     const store = new NetworkStore(settingsPort(this.homey));
-    const deps: PairingDeps = { bluetooth, store, random: createNodeCryptoRandomSource() };
+    const deps: PairingDeps = { bluetooth, store, random: createNodeCryptoRandomSource(), clock: createRealClock() };
 
     session.setHandler('list_devices', async (): Promise<UnprovisionedNodeCandidate[]> => {
       return scanForUnprovisionedNodes(bluetooth);

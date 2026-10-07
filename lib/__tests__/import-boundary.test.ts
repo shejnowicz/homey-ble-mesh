@@ -102,3 +102,25 @@ describe('the specifier check itself rejects what it must', () => {
     expect(isAllowed(specifier)).toBe(true);
   });
 });
+
+/**
+ * A DIFFERENT, narrower rule for ONE file outside both policed roots above —
+ * review finding (smaller item): `drivers/light/pairing.ts` is deliberately
+ * pure orchestration with no `homey` import (its own module header: "the
+ * ONE file in drivers/light that imports homey" is `driver.ts`, not this
+ * one), and nothing previously checked that mechanically. A mutation adding
+ * `import Homey from 'homey'` to pairing.ts still typechecks cleanly
+ * (`@types/homey` resolves fine) and only fails once ts-jest actually tries
+ * to RUN the test file with no real `homey` package installed — i.e. the
+ * TYPE system alone cannot catch this regression, only a test can. This is
+ * a DENY-list, not the ALLOW-list the two policed roots above use:
+ * `pairing.ts` legitimately imports many relative modules (and could
+ * legitimately import other node builtins later), so the only thing worth
+ * asserting here is the one specifier it must never contain.
+ */
+test('drivers/light/pairing.ts never imports homey', () => {
+  const file = join(__dirname, '..', '..', 'drivers', 'light', 'pairing.ts');
+  const source = readFileSync(file, 'utf8');
+  const specifiers = extractSpecifiers(source);
+  expect(specifiers).not.toContain('homey');
+});

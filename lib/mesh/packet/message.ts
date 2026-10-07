@@ -1,13 +1,13 @@
-import { encodeNetworkPdu, decodeNetworkPdu } from '../mesh/packet/network';
+import { encodeNetworkPdu, decodeNetworkPdu } from './network';
 import {
   encodeUnsegmentedAccess,
   decodeUnsegmentedAccess,
   segmentAccessMessage,
   decodeSegmentedAccess,
-} from '../mesh/packet/lowerTransport';
-import { encryptUpperTransport, decryptUpperTransport, type UpperTransportKeyKind } from '../mesh/packet/upperTransport';
-import { acceptSegment, type ReassemblyState } from '../mesh/packet/reassembly';
-import { decodeAccessMessage, type AccessMessage } from '../mesh/packet/access';
+} from './lowerTransport';
+import { encryptUpperTransport, decryptUpperTransport, type UpperTransportKeyKind } from './upperTransport';
+import { acceptSegment, type ReassemblyState } from './reassembly';
+import { decodeAccessMessage, type AccessMessage } from './access';
 
 // Table 3.18 "Segmented Access message format": SeqZero is 13 bits — the
 // same bound `lowerTransport.ts` already enforces internally as
@@ -33,15 +33,20 @@ const MAX_SEQ_ZERO_MASK = 0x1fff;
  * the first time anything in this codebase bridges `reassembly.ts`'s
  * per-segment output back into `upperTransport.ts`'s decryption.
  *
- * This is lib/adapter, not lib/mesh: it performs no I/O itself (every
- * function here is a pure transformation of bytes already in hand, same as
- * every module it is built from), but it is glue code specific to how this
- * project drives the stack, not part of the published standard's own layer
- * boundaries — so it lives next to connection.ts/queue.ts/store.ts rather
- * than under lib/mesh (which the import-boundary test does not police this
- * directory for, but the project's own layering keeps pure protocol/
- * provenance code in lib/mesh and project-specific composition here
- * regardless).
+ * THIS IS lib/mesh, NOT lib/adapter (moved here on review — originally
+ * placed under lib/adapter on the reasoning that it is "project-specific
+ * glue, not part of the published standard's own layer boundaries"; that
+ * reasoning was wrong. This module performs no I/O, imports only sibling
+ * packet-layer modules, and composing the network/lower-transport/upper-
+ * transport/reassembly/access layers into "one logical message, on or off
+ * the wire" IS the standard's own layering, not a project convention
+ * layered on top of it — `lib/mesh/config/client.ts` already does exactly
+ * this kind of composition (Access-layer messages built from
+ * `packet/access.ts`) one layer down. Living under `lib/adapter` left it
+ * OUTSIDE `lib/__tests__/import-boundary.test.ts`'s policing, and meant a
+ * future `lib/mesh`-side consumer would have had to import "backwards",
+ * from the pure core into the Homey-facing adapter tree. Both are fixed by
+ * this move.
  *
  * SEQUENCE NUMBERS AND SeqAuth. Table 3.18 "Segmented Access message
  * format": each segment of one message is sent with its OWN Network PDU

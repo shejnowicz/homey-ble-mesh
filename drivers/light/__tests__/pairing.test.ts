@@ -1,13 +1,26 @@
 import {
   pairNode,
   scanForUnprovisionedNodes,
+  connectForProvisioning,
+  parseBleUuid,
+  bleUuidString,
+  DEFAULT_PAIRING_STEP_TIMEOUT_MS,
   type PairingDeps,
   type ProvisioningRandomSource,
 } from '../pairing';
 import { NetworkStore, type SettingsPort } from '../../../lib/adapter/store';
 import { FakeBluetoothPort, type AutoResponder } from '../../../lib/adapter/__tests__/fakeBluetooth';
-import { MESH_PROVISIONING_SERVICE_UUID } from '../../../lib/adapter/connection';
-import { encodeMeshMessage } from '../../../lib/adapter/meshMessage';
+import { createFakeClock, type FakeClock } from '../../../lib/adapter/__tests__/fakeClock';
+import {
+  MESH_PROVISIONING_SERVICE_UUID,
+  MESH_PROVISIONING_DATA_IN_UUID,
+  MESH_PROVISIONING_DATA_OUT_UUID,
+  type BluetoothPort,
+  type ScanResult,
+  type DiscoveredCharacteristic,
+  type Subscription,
+} from '../../../lib/adapter/connection';
+import { encodeMeshMessage, acceptIncomingPdu, type MeshReceiveState, type MeshReceiveContext } from '../../../lib/mesh/packet/message';
 import { encodeProvisioningPdu, type ProvisioningCapabilities } from '../../../lib/mesh/provisioning/pdu';
 import type { EphemeralKeyPair } from '../../../lib/mesh/provisioning/machine';
 import { decodeNetworkPdu } from '../../../lib/mesh/packet/network';
@@ -148,16 +161,42 @@ class FixedRandomSource implements ProvisioningRandomSource {
   }
 }
 
+/**
+ * Polls `predicate` once per real macrotask turn until it is true (or gives
+ * up after `maxIterations`, failing loudly rather than hanging) — used only
+ * to know WHEN it is safe to call `FakeClock#advance` against an un-awaited
+ * `pairNode(...)` promise that is expected to genuinely stall on the fake
+ * clock. This is NOT the same hazard this plan's own lesson warns about (a
+ * fake too fast to lose a race): every OTHER wait in this whole test file
+ * resolves instantly via the synchronous auto-responder, so advancing the
+ * clock before its own timer is armed would needlessly risk firing an
+ * EARLIER step's own (momentarily pending, about to be cleared) timeout
+ * instead of the one this test means to trigger. Polling on OBSERVABLE
+ * STATE (`predicate`) rather than a fixed number of microtask flushes is
+ * what makes this safe regardless of exactly how many ticks the chain
+ * ahead of it takes.
+ */
+async function waitUntil(predicate: () => boolean, maxIterations = 1000): Promise<void> {
+  for (let i = 0; i < maxIterations && !predicate(); i++) {
+    await new Promise<void>((resolve) => setImmediate(resolve));
+  }
+  if (!predicate()) {
+    throw new Error('waitUntil: condition never became true');
+  }
+}
+
 function setUp(randomQueue: readonly Buffer[] = [TEST_NET_KEY, TEST_APP_KEY, KAT_RANDOM_PROVISIONER, KAT_RANDOM_PROVISIONER]): {
   bluetooth: FakeBluetoothPort;
   store: NetworkStore;
   random: FixedRandomSource;
+  clock: FakeClock;
   deps: PairingDeps;
 } {
   const bluetooth = new FakeBluetoothPort();
   const store = new NetworkStore(new FakeSettingsPort());
   const random = new FixedRandomSource(randomQueue, KAT_EPHEMERAL_KEY_PAIR);
-  return { bluetooth, store, random, deps: { bluetooth, store, random } };
+  const clock = createFakeClock();
+  return { bluetooth, store, random, clock, deps: { bluetooth, store, random, clock } };
 }
 
 function addUnprovisionedNode(bluetooth: FakeBluetoothPort, id: string, rssi: number): void {
@@ -218,6 +257,10 @@ interface ConfigResponderOptions {
    *  Default 0x00 (Success); overridden to test the
    *  node-refuses-Model-App-Bind path. */
   readonly modelAppStatus?: number;
+  /** When true, a Config Node Reset request gets NO reply at all (modelling
+   *  a node that is unreachable for the reset too) — default false
+   *  (replies with Node Reset Status and returns to the unowned state). */
+  readonly failReset?: boolean;
 }
 
 function installConfigResponder(
@@ -244,21 +287,45 @@ function installConfigResponder(
   const compositionAccessPayload =
     options.compositionAccessPayload ?? Buffer.concat([Buffer.from([0x02, 0x00]), hex(COMPOSITION_DATA_PAGE0_SAMPLE.message)]);
 
-  let count = 0;
-  const responder: AutoResponder = () => {
-    count += 1;
-    if (count === 1) {
+  // OPCODE-DRIVEN, NOT POSITION-COUNTED (fixed after a review-round bug):
+  // an earlier version of this responder keyed its replies on "the Nth
+  // write", which breaks the moment a failure short-circuits the exchange
+  // — e.g. a refused AppKey Add means the NEXT write is a Config Node
+  // Reset, not the Model App Bind position-counting assumed. Decoding every
+  // write with the real `acceptIncomingPdu` (the same reassembly machinery
+  // `pairing.ts` itself uses) and dispatching on the resulting OPCODE is
+  // correct regardless of which step failed or how many writes preceded it
+  // — and for free, correctly reassembles AppKey Add's two segments before
+  // ever looking at its opcode.
+  let driverRequestState: MeshReceiveState | undefined;
+  const driverRequestContext: MeshReceiveContext = {
+    key: KAT_DEVICE_KEY,
+    keyKind: 'device',
+    netKey: TEST_NET_KEY,
+    ivIndex: 0,
+    expectedSrc: ourAddress,
+  };
+
+  const responder: AutoResponder = (data) => {
+    const result = acceptIncomingPdu(driverRequestState, driverRequestContext, data);
+    if (result.kind !== 'complete') {
+      driverRequestState = result.state;
+      return undefined; // mid-segmented-request (AppKey Add's first segment) — no reply yet
+    }
+    driverRequestState = undefined;
+
+    if (result.message.opcode === 0x8008) {
       // Config Composition Data Get -> Config Composition Data Status.
       return sendAsNode(compositionAccessPayload);
     }
-    if (count === 3) {
-      // Config AppKey Add (2 writes, segmented) -> Config AppKey Status.
-      // NetKeyIndex=AppKeyIndex=0 (packed bytes are all-zero regardless of
-      // packing scheme when both indexes are zero).
+    if (result.message.opcode === 0x00) {
+      // Config AppKey Add -> Config AppKey Status. NetKeyIndex=AppKeyIndex=0
+      // (packed bytes are all-zero regardless of packing scheme when both
+      // indexes are zero).
       const status = options.appKeyStatus ?? 0x00;
       return sendAsNode(Buffer.from([0x80, 0x03, status, 0x00, 0x00, 0x00]));
     }
-    if (count === 4) {
+    if (result.message.opcode === 0x803d) {
       // Config Model App Bind (Generic OnOff Server, element 0) -> Config
       // Model App Status.
       const status = options.modelAppStatus ?? 0x00;
@@ -267,6 +334,17 @@ function installConfigResponder(
       const modelIdLe = Buffer.alloc(2);
       modelIdLe.writeUInt16LE(0x1000, 0);
       return sendAsNode(Buffer.concat([Buffer.from([0x80, 0x3e, status]), elementAddressLe, Buffer.from([0x00, 0x00]), modelIdLe]));
+    }
+    if (result.message.opcode === 0x8049) {
+      // Config Node Reset — review finding (HIGH): pairing.ts now sends one
+      // on every configuration-phase failure, over this same still-open
+      // session, so a test exercising one of those failures must answer it
+      // (or `sendConfigRequest`'s own wait for Node Reset Status hangs) and
+      // model the node's real response: it returns to the unowned state
+      // and is scannable again.
+      if (options.failReset) return undefined; // modelling a node unreachable for the reset too
+      bluetooth.reconfigureAsUnprovisioned(peripheralId, UNPROVISIONED_SERVICE_DATA);
+      return sendAsNode(Buffer.from([0x80, 0x4a])); // Config Node Reset Status — no parameters.
     }
     return undefined;
   };
@@ -500,6 +578,71 @@ describe('a node that fails provisioning', () => {
 });
 
 // ===========================================================================
+// A silent node — review finding (HIGH): nothing in this module bounded a
+// wait for a reply, so this used to hang the returned promise forever. "Test
+// it with a responder that returns nothing" (the review's own words).
+// ===========================================================================
+
+describe('a silent node', () => {
+  test('one that never answers Provisioning Invite fails with a message naming the stall, instead of hanging forever', async () => {
+    const { bluetooth, store, clock, deps } = setUp();
+    addUnprovisionedNode(bluetooth, 'silent', -50);
+    bluetooth.setAutoResponder('silent', () => undefined); // never replies to anything
+
+    const outcomePromise = pairNode(deps, 'silent');
+    // Invite is the very first write; its own withTimeout is armed as soon
+    // as that write lands.
+    await waitUntil(() => bluetooth.writesReceived.length >= 1 && clock.pendingCount() >= 1);
+    await clock.advance(DEFAULT_PAIRING_STEP_TIMEOUT_MS);
+    const outcome = await outcomePromise;
+
+    expect(outcome.kind).toBe('failed');
+    if (outcome.kind !== 'failed') return;
+    expect(outcome.message).toContain('provisioning stalled');
+    expect(outcome.message).toContain(`${DEFAULT_PAIRING_STEP_TIMEOUT_MS}ms`);
+    expect(store.getState().nodes).toHaveLength(0);
+  });
+
+  test('one that answers provisioning but goes silent during configuration fails the same way, naming the stall', async () => {
+    const { bluetooth, store, clock, deps } = setUp();
+    addUnprovisionedNode(bluetooth, 'silent-config', -50);
+    installProvisioningResponder(bluetooth, 'silent-config', {
+      onComplete: () => {
+        bluetooth.reconfigureAsProvisioned('silent-config', TEST_NET_KEY);
+        bluetooth.setAutoResponder('silent-config', () => undefined); // silent from here on
+      },
+    });
+
+    const outcomePromise = pairNode(deps, 'silent-config');
+    let settled = false;
+    void outcomePromise.then(
+      () => {
+        settled = true;
+      },
+      () => {
+        settled = true;
+      },
+    );
+    // The node stays silent for the REST of the attempt — both the
+    // original Composition Data Get wait AND the failWithReset-triggered
+    // Node Reset wait that follows it stall — so this advances the clock
+    // in a loop, once per pending timer, until the promise actually
+    // settles, rather than assuming exactly one stall occurs.
+    for (let i = 0; i < 5 && !settled; i++) {
+      await waitUntil(() => clock.pendingCount() >= 1 || settled);
+      if (settled) break;
+      await clock.advance(DEFAULT_PAIRING_STEP_TIMEOUT_MS);
+    }
+    const outcome = await outcomePromise;
+
+    expect(outcome.kind).toBe('failed');
+    if (outcome.kind !== 'failed') return;
+    expect(outcome.message).toContain('configuration exchange stalled');
+    expect(store.getState().nodes).toHaveLength(0);
+  });
+});
+
+// ===========================================================================
 // Composition data that does not parse.
 // ===========================================================================
 
@@ -522,6 +665,15 @@ describe('composition data that does not parse', () => {
     // address this attempt burned is never reused (see pairing.ts's own
     // module header) — but nothing claims to have paired successfully.
     expect(store.getState().nodes).toHaveLength(0);
+    // THE HALF THAT ACTUALLY MATTERS (review finding, HIGH): a failure
+    // after provisioning succeeded must not orphan the node. The message
+    // says the node was reset...
+    expect(outcome.message).toContain('the node has been reset and can be paired again');
+    // ...and it is provably true, not merely asserted: the SAME peripheral
+    // is scannable as an unprovisioned node again, exactly as it was before
+    // this attempt ever started.
+    const candidates = await scanForUnprovisionedNodes(bluetooth);
+    expect(candidates.map((c) => c.peripheralId)).toContain('bad-composition');
   });
 });
 
@@ -531,6 +683,31 @@ describe('composition data that does not parse', () => {
 // is a different, equally real failure mode from a reply that fails to
 // parse at all, and nothing above exercises it).
 // ===========================================================================
+
+describe('a multi-element node whose configuration fails', () => {
+  test('still reserves its extra elements\' addresses — review finding (MEDIUM): the same root cause as the orphaning finding, since the node occupies those addresses the moment it is provisioned, independent of whether configuration ever completes', async () => {
+    const twoElementComposition = Buffer.from([
+      0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // header, all zero
+      0x00, 0x00, 0x01, 0x00, 0x00, 0x10, // element 0: sigModels=[0x1000]
+      0x00, 0x00, 0x00, 0x00, // element 1: no models
+    ]);
+    const { bluetooth, store, deps } = setUp();
+    addUnprovisionedNode(bluetooth, 'multi-element-fails', -50);
+    installSuccessfulNodeBehaviour(bluetooth, 'multi-element-fails', 1, 2, {
+      compositionAccessPayload: Buffer.concat([Buffer.from([0x02, 0x00]), twoElementComposition]),
+      appKeyStatus: 0x05, // refused — configuration never reaches "ok"
+    });
+
+    const outcome = await pairNode(deps, 'multi-element-fails');
+
+    expect(outcome.kind).toBe('failed');
+    expect(store.getState().nodes).toHaveLength(0); // no device — configuration never completed
+    // THE DISCRIMINATING ASSERTION: nextUnicastAddress is 4 (3, from the
+    // ordinary +1 advance, PLUS 1 more for the second element), not 3 — the
+    // extra element's address was reserved despite the failure.
+    expect(store.getState().nextUnicastAddress).toBe(4);
+  });
+});
 
 describe('the node refuses a configuration request', () => {
   test('a refused Config AppKey Add produces a clear failure, never a half-bound device', async () => {
@@ -545,6 +722,11 @@ describe('the node refuses a configuration request', () => {
     expect(outcome.message).toContain('AppKey Add was refused');
     expect(outcome.message).toContain('Insufficient Resources');
     expect(store.getState().nodes).toHaveLength(0);
+    // See the composition-parse-failure test above for why this half is
+    // the one that matters: the bulb must not be bricked.
+    expect(outcome.message).toContain('the node has been reset and can be paired again');
+    const candidates = await scanForUnprovisionedNodes(bluetooth);
+    expect(candidates.map((c) => c.peripheralId)).toContain('refuses-appkey');
   });
 
   test('a refused Config Model App Bind produces a clear failure, never a half-bound device', async () => {
@@ -558,6 +740,38 @@ describe('the node refuses a configuration request', () => {
     if (outcome.kind !== 'failed') return;
     expect(outcome.message).toContain('Model App Bind was refused');
     expect(outcome.message).toContain('Cannot Bind');
+    expect(store.getState().nodes).toHaveLength(0);
+    expect(outcome.message).toContain('the node has been reset and can be paired again');
+    const candidates = await scanForUnprovisionedNodes(bluetooth);
+    expect(candidates.map((c) => c.peripheralId)).toContain('refuses-bind');
+  });
+
+  test('when the reset itself ALSO fails, that is reported too, never silently swallowed', async () => {
+    const { bluetooth, store, clock, deps } = setUp();
+    addUnprovisionedNode(bluetooth, 'refuses-both', -50);
+    // modelAppStatus triggers the original failure; the Node Reset request
+    // that follows is answered with 'succeed' writeBehavior but no
+    // responder reply configured for it, which — bounded by the pairing
+    // clock — eventually surfaces as its own stall.
+    installSuccessfulNodeBehaviour(bluetooth, 'refuses-both', 1, 2, { modelAppStatus: 0x0d, failReset: true });
+
+    const outcomePromise = pairNode(deps, 'refuses-both');
+    // Wait for BOTH: the Node Reset request has actually been written (the
+    // refused Model App Bind's own failWithReset has run), AND a new timer
+    // is pending on the fake clock (that write's own withTimeout has armed
+    // its wait) — only then is it safe to advance, per `waitUntil`'s own
+    // doc comment. 6 provisioning writes + 4 config writes (Composition
+    // Get, 2x AppKey Add, Model App Bind) = 10; the Node Reset is #11.
+    await waitUntil(() => bluetooth.writesReceived.length >= 11 && clock.pendingCount() >= 1);
+    await clock.advance(DEFAULT_PAIRING_STEP_TIMEOUT_MS);
+    const outcome = await outcomePromise;
+
+    expect(outcome.kind).toBe('failed');
+    if (outcome.kind !== 'failed') return;
+    expect(outcome.message).toContain('Model App Bind was refused');
+    expect(outcome.message).toContain('attempted to reset the node');
+    expect(outcome.message).toContain('that also failed');
+    expect(outcome.message).toContain('manual factory reset');
     expect(store.getState().nodes).toHaveLength(0);
   });
 });
@@ -698,6 +912,215 @@ describe('a node that answers a Config request with the wrong status message typ
     expect(outcome.kind).toBe('failed');
     if (outcome.kind !== 'failed') return;
     expect(outcome.message).toContain('did not answer Config Composition Data Get with a Composition Data Status message');
+    expect(store.getState().nodes).toHaveLength(0);
+  });
+});
+
+// ===========================================================================
+// parseBleUuid / bleUuidString — review finding (MEDIUM): moved here, under
+// the gate, from driver.ts (outside it) specifically because the naive
+// version had three real bugs — a test per shape, including the two that
+// were previously silent/wrong rather than merely untested.
+// ===========================================================================
+
+describe('parseBleUuid', () => {
+  test('a bare 4-hex-digit short form parses directly', () => {
+    expect(parseBleUuid('1827')).toBe(0x1827);
+    expect(parseBleUuid('2ADE')).toBe(0x2ade); // case-insensitive
+  });
+
+  test('a canonical, dashed 128-bit UUID embedding a 16-bit short UUID via the Bluetooth Base UUID parses to that short UUID', () => {
+    expect(parseBleUuid('00001827-0000-1000-8000-00805f9b34fb')).toBe(0x1827);
+    expect(parseBleUuid('00002ADE-0000-1000-8000-00805F9B34FB')).toBe(0x2ade);
+  });
+
+  test('the same 128-bit UUID with no dashes parses the same way', () => {
+    expect(parseBleUuid('0000182700001000800000805f9b34fb')).toBe(0x1827);
+  });
+
+  // THE FIRST PREVIOUSLY-SILENT BUG: a full 128-bit UUID that is NOT a
+  // 16-bit short UUID's Base-UUID embedding used to parse via a bare
+  // parseInt as one enormous number that could never match any of this
+  // project's constants — now a thrown, clear error instead.
+  test('a 128-bit UUID that does NOT embed a 16-bit short UUID throws, rather than silently returning an unmatchable enormous number', () => {
+    expect(() => parseBleUuid('6e400001-b5a3-f393-e0a9-e50e24dcca9e')).toThrow('does not embed a 16-bit Bluetooth SIG short UUID');
+  });
+
+  // THE SECOND PREVIOUSLY-SILENT BUG: a dashed form whose middle segments
+  // do NOT match the Bluetooth Base UUID used to silently truncate at the
+  // first dash and return whatever the leading 8 hex digits happened to be
+  // — right only by coincidence for the exact short-UUID embedding, wrong
+  // and unguarded for anything else.
+  test('a dashed 128-bit UUID whose base does not match the Bluetooth Base UUID throws, rather than silently truncating at the first dash', () => {
+    expect(() => parseBleUuid('00001827-abcd-1000-8000-00805f9b34fb')).toThrow('does not embed a 16-bit Bluetooth SIG short UUID');
+  });
+
+  test('a non-hex string throws, rather than silently producing NaN', () => {
+    expect(() => parseBleUuid('not-a-uuid-zzzz')).toThrow('is not a hexadecimal UUID string');
+  });
+
+  test('an empty string throws', () => {
+    expect(() => parseBleUuid('')).toThrow('is not a hexadecimal UUID string');
+  });
+
+  test('a well-formed hex string of an unrecognised length throws', () => {
+    expect(() => parseBleUuid('182')).toThrow('is not a recognised UUID shape');
+    expect(() => parseBleUuid('1827182718271827')).toThrow('is not a recognised UUID shape');
+  });
+});
+
+describe('bleUuidString', () => {
+  test('round-trips with parseBleUuid for every one of this project\'s own constants', () => {
+    for (const uuid of [0x1827, 0x1828, 0x2adb, 0x2adc, 0x2add, 0x2ade]) {
+      expect(parseBleUuid(bleUuidString(uuid))).toBe(uuid);
+    }
+  });
+
+  test('rejects a value outside the 16-bit range', () => {
+    expect(() => bleUuidString(0x10000)).toThrow('is not a 16-bit UUID');
+    expect(() => bleUuidString(-1)).toThrow('is not a 16-bit UUID');
+  });
+});
+
+// ===========================================================================
+// Characteristic lookup discrimination — review finding (smaller item): the
+// shared fake exposes exactly one GATT profile at a time
+// (`gattProfile: 'provisioning' | 'proxy'`), so nothing in the rest of this
+// file ever puts TWO services' characteristics in front of
+// `connectForProvisioning`'s own `.find((c) => c.serviceUuid === ... &&
+// c.characteristicUuid === ...)` at once — which means dropping the
+// `serviceUuid` half of that check would still pass every test above. A
+// real peripheral's `discoverAllServicesAndCharacteristics()` returns EVERY
+// service it has, with no such isolation; a hand-rolled port (not the
+// shared fixture, precisely so it CAN return two services at once) is what
+// it takes to exercise this.
+// ===========================================================================
+
+describe('characteristic lookup discriminates by BOTH service and characteristic UUID', () => {
+  test('picks the characteristic under the correct service, even when a DIFFERENT (real, unrelated) service happens to expose a characteristic with the same UUID number', async () => {
+    const writesTo: unknown[] = [];
+    const port: BluetoothPort = {
+      scan: async (): Promise<ScanResult[]> => [],
+      connect: async (): Promise<unknown> => ({}),
+      discover: async (): Promise<DiscoveredCharacteristic[]> => [
+        // Device Information Service (a real, standard 16-bit UUID, 0x180A)
+        // — coincidentally reusing the SAME characteristic UUID numbers the
+        // Mesh Provisioning Service does, which cannot happen for real
+        // (Bluetooth SIG characteristic UUIDs are globally unique per
+        // purpose) but is exactly the shape needed to prove the lookup
+        // does not just match on characteristicUuid alone.
+        { serviceUuid: 0x180a, characteristicUuid: MESH_PROVISIONING_DATA_IN_UUID, handle: 'wrong-service-in' },
+        { serviceUuid: 0x180a, characteristicUuid: MESH_PROVISIONING_DATA_OUT_UUID, handle: 'wrong-service-out' },
+        { serviceUuid: MESH_PROVISIONING_SERVICE_UUID, characteristicUuid: MESH_PROVISIONING_DATA_IN_UUID, handle: 'right-in' },
+        { serviceUuid: MESH_PROVISIONING_SERVICE_UUID, characteristicUuid: MESH_PROVISIONING_DATA_OUT_UUID, handle: 'right-out' },
+      ],
+      read: async (): Promise<Buffer> => Buffer.alloc(0),
+      write: async (handle: unknown): Promise<void> => {
+        writesTo.push(handle);
+      },
+      subscribe: async (): Promise<Subscription> => ({ unsubscribe: (): void => {} }),
+      disconnect: async (): Promise<void> => {},
+    };
+
+    const session = await connectForProvisioning(port, 'peripheral-x');
+    await session.write(Buffer.from([0x00, 0x00]));
+
+    // THE DISCRIMINATING ASSERTION: a lookup that dropped the serviceUuid
+    // half of its check would find 'wrong-service-in' FIRST (array order)
+    // and write there instead.
+    expect(writesTo).toEqual(['right-in']);
+  });
+});
+
+// ===========================================================================
+// GATT connection failures — review finding (smaller item): the shared
+// fixture already supports every one of these (`connectBehavior`/
+// `discoverBehavior`/`subscribeBehavior: 'fail'`), and they are exactly the
+// design's "clear message in the wizard" paths, but nothing exercised them.
+// ===========================================================================
+
+describe('a GATT connection failure during provisioning', () => {
+  test('connect() failing produces a clear failure, not a crash or a hang', async () => {
+    const { store, deps } = setUp();
+    const bluetooth = new FakeBluetoothPort();
+    bluetooth.addNode({
+      id: 'connect-fails',
+      rssi: -50,
+      serviceUuid: MESH_PROVISIONING_SERVICE_UUID,
+      serviceDataOverride: UNPROVISIONED_SERVICE_DATA,
+      gattProfile: 'provisioning',
+      connectBehavior: 'fail',
+    });
+
+    const outcome = await pairNode({ ...deps, bluetooth }, 'connect-fails');
+
+    expect(outcome.kind).toBe('failed');
+    if (outcome.kind !== 'failed') return;
+    expect(outcome.message).toContain('could not connect to "connect-fails" for provisioning');
+    expect(store.getState().nodes).toHaveLength(0);
+  });
+
+  test('discover() failing produces a clear failure, not a crash or a hang', async () => {
+    const { store, deps } = setUp();
+    const bluetooth = new FakeBluetoothPort();
+    bluetooth.addNode({
+      id: 'discover-fails',
+      rssi: -50,
+      serviceUuid: MESH_PROVISIONING_SERVICE_UUID,
+      serviceDataOverride: UNPROVISIONED_SERVICE_DATA,
+      gattProfile: 'provisioning',
+      discoverBehavior: 'fail',
+    });
+
+    const outcome = await pairNode({ ...deps, bluetooth }, 'discover-fails');
+
+    expect(outcome.kind).toBe('failed');
+    if (outcome.kind !== 'failed') return;
+    // openSession's discover() failure surfaces through connectForProvisioning's
+    // own caller in pairNode, the same as a connect() failure — both are
+    // "could not even establish the provisioning session", one message.
+    expect(outcome.message).toContain('could not connect to "discover-fails" for provisioning');
+    expect(store.getState().nodes).toHaveLength(0);
+  });
+
+  test('subscribe() failing produces a clear failure, not a crash or a hang', async () => {
+    const { store, deps } = setUp();
+    const bluetooth = new FakeBluetoothPort();
+    bluetooth.addNode({
+      id: 'subscribe-fails',
+      rssi: -50,
+      serviceUuid: MESH_PROVISIONING_SERVICE_UUID,
+      serviceDataOverride: UNPROVISIONED_SERVICE_DATA,
+      gattProfile: 'provisioning',
+      subscribeBehavior: 'fail',
+    });
+
+    const outcome = await pairNode({ ...deps, bluetooth }, 'subscribe-fails');
+
+    expect(outcome.kind).toBe('failed');
+    if (outcome.kind !== 'failed') return;
+    expect(outcome.message).toContain('could not connect to "subscribe-fails" for provisioning');
+    expect(store.getState().nodes).toHaveLength(0);
+  });
+});
+
+describe('a GATT connection failure during configuration (after provisioning succeeded)', () => {
+  test('discover() failing on the reconnect for configuration produces a clear failure naming that the node may need a manual reset', async () => {
+    const { bluetooth, store, deps } = setUp();
+    addUnprovisionedNode(bluetooth, 'config-discover-fails', -50);
+    installProvisioningResponder(bluetooth, 'config-discover-fails', {
+      onComplete: () => {
+        bluetooth.reconfigureAsProvisioned('config-discover-fails', TEST_NET_KEY);
+        bluetooth.setDiscoverBehavior('config-discover-fails', 'fail');
+      },
+    });
+
+    const outcome = await pairNode(deps, 'config-discover-fails');
+
+    expect(outcome.kind).toBe('failed');
+    if (outcome.kind !== 'failed') return;
+    expect(outcome.message).toContain('could not reconnect for configuration');
+    expect(outcome.message).toContain('manual factory reset');
     expect(store.getState().nodes).toHaveLength(0);
   });
 });

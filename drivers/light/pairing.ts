@@ -8,10 +8,12 @@ import {
   MESH_PROXY_SERVICE_UUID,
   findServiceData,
   type BluetoothPort,
+  type ClockPort,
   type ConnectionHandle,
+  type TimerHandle,
 } from '../../lib/adapter/connection';
 import { NetworkStore } from '../../lib/adapter/store';
-import { encodeMeshMessage, acceptIncomingPdu, type MeshReceiveState, type MeshReceiveContext } from '../../lib/adapter/meshMessage';
+import { encodeMeshMessage, acceptIncomingPdu, type MeshReceiveState, type MeshReceiveContext } from '../../lib/mesh/packet/message';
 import {
   beginProvisioning,
   step as provisioningStep,
@@ -24,10 +26,11 @@ import {
   encodeConfigCompositionDataGet,
   encodeConfigAppKeyAdd,
   encodeConfigModelAppBind,
+  encodeConfigNodeReset,
   decodeConfigStatus,
 } from '../../lib/mesh/config/client';
 import { encodeAccessMessage, type AccessMessage } from '../../lib/mesh/packet/access';
-import { parseCompositionData, type CompositionData } from '../../lib/mesh/config/composition';
+import type { CompositionData } from '../../lib/mesh/config/composition';
 import { mapCompositionToCapabilities, LIGHTING_SERVER_MODEL_IDS, type HomeyCapability } from '../../lib/models/capabilities';
 
 /**
@@ -43,7 +46,7 @@ import { mapCompositionToCapabilities, LIGHTING_SERVER_MODEL_IDS, type HomeyCapa
  * the provisioning state machine (`lib/mesh/provisioning/machine.ts`), the
  * Configuration Client messages and composition parser
  * (`lib/mesh/config/*.ts`), the network/transport/access layers
- * (`lib/mesh/packet/*.ts`, composed by `lib/adapter/meshMessage.ts`), the
+ * (`lib/mesh/packet/*.ts`, composed by `lib/mesh/packet/message.ts`), the
  * settings-backed store and its unicast-address allocator
  * (`lib/adapter/store.ts`), and capability mapping
  * (`lib/models/capabilities.ts`). This module is PURE orchestration of all
@@ -94,7 +97,8 @@ import { mapCompositionToCapabilities, LIGHTING_SERVER_MODEL_IDS, type HomeyCapa
  * below) are the SECOND thing that needs real randomness, and go through
  * the exact same injected source for the exact same reason.
  *
- * NODE ENTRIES ARE WRITTEN ONLY ON COMPLETE SUCCESS. The allocated node
+ * NODE ENTRIES ARE WRITTEN ONLY ON COMPLETE SUCCESS (`finishPairing`, the
+ * ONE place this module writes to `store.nodes`). The allocated node
  * address, by contrast, is NEVER reclaimed on failure — once
  * `store.allocateUnicastAddress()` hands one out, this module simply
  * abandons it if anything later fails, the same way a real provisioner
@@ -104,20 +108,43 @@ import { mapCompositionToCapabilities, LIGHTING_SERVER_MODEL_IDS, type HomeyCapa
  * twice is the one failure this design treats as worse than wasting a
  * unicast address.
  *
+ * A FAILURE AFTER PROVISIONING SUCCEEDS MUST NOT ORPHAN THE NODE (review
+ * finding, HIGH). The design: a failed provisioning "leaves the node
+ * untouched and can be retried." That is true up to the moment `machine.ts`
+ * reaches `'provisioned'` — but a review proved that past that point, a
+ * LATER failure (a refused AppKey Add, an unparseable composition reply, a
+ * stalled wait) with no further action left the node PERMANENTLY
+ * unreachable by this app: it had already left the Mesh Provisioning
+ * Service for the Mesh Proxy Service (so a later scan for unprovisioned
+ * nodes can never find it again), while no store entry existed yet to hold
+ * the device key it would take to reach it any other way — recoverable only
+ * by a physical factory reset. `runConfigExchange`'s own `failWithReset`
+ * closes this: every failure path once provisioning has succeeded sends a
+ * Config Node Reset over the still-open session FIRST (the encoder/decoder
+ * for this already existed, already tested, and had no caller before this
+ * fix), and names whether that reset itself succeeded in the returned
+ * message — never silently swallowed. The one case this cannot cover is a
+ * configuration session that could never be opened at all (no session, no
+ * way to send anything); `pairNode` says so plainly in that message instead
+ * of pretending the node is still reachable.
+ *
  * THE INHERITED ADDRESS-ADVANCE HAZARD (plan 1, carried into this task's
  * brief). `store.allocateUnicastAddress()` hands out exactly ONE address,
  * but a node occupies as many CONSECUTIVE unicast addresses as it has
  * elements — and composition data, which reveals the element count, is only
- * read AFTER provisioning assigns the node's own (single) address. This
- * module advances `nextUnicastAddress` past the extra elements itself, in
- * `finishPairing` below, the ONE place this module writes to `nodes` at
- * all — and does so from a FRESH `store.getState()` read taken immediately
- * before that single `setState` call, never from a state snapshot read
- * before `allocateUnicastAddress()` ran, per that method's own loud
- * CALLER HAZARD comment (reading-before-allocating and writing after would
- * silently rewind the pointer and reissue an address already handed out —
- * see `ensureNetworkInitialized` below for the other call site with the
- * exact same discipline).
+ * read AFTER provisioning assigns the node's own (single) address.
+ * `reserveElementAddresses` advances `nextUnicastAddress` past the extra
+ * elements — called by `pairNode` as soon as the element count is known,
+ * WIN OR LOSE (review finding, MEDIUM: the same root cause as the orphaning
+ * finding above — a multi-element node that provisions and then fails
+ * configuration still occupies several consecutive addresses, regardless of
+ * whether this app ever finishes configuring it), from a FRESH
+ * `store.getState()` read taken immediately before that single `setState`
+ * call, never from a state snapshot read before `allocateUnicastAddress()`
+ * ran, per that method's own loud CALLER HAZARD comment (reading-before-
+ * allocating and writing after would silently rewind the pointer and
+ * reissue an address already handed out — see `ensureNetworkInitialized`
+ * below for the other call site with the exact same discipline).
  *
  * COMPOSITION DATA THAT DOES NOT PARSE (plan 4's open question, this task's
  * brief). `parseCompositionData` returns a single `null` for four distinct
@@ -153,6 +180,142 @@ export function createNodeCryptoRandomSource(): ProvisioningRandomSource {
     randomBytes: (length: number): Buffer => nodeRandomBytes(length),
     generateEphemeralKeyPair: (): EphemeralKeyPair => generateKeyPair(),
   };
+}
+
+// ===========================================================================
+// The clock — review finding (HIGH): nothing in this module bounded a wait
+// for a reply, so a silent node (or a stream of packets this module ignores)
+// left a pairing attempt pending forever, with the wizard stuck on
+// "Pairing…" and no way back. This project already built exactly the
+// machinery for "the node never answered" — `ClockPort` and
+// `lib/adapter/queue.ts`'s own bounded per-attempt timeout — and pairing
+// bypassed both. `PairingDeps.clock` below, and `withTimeout`'s use of it in
+// `runProvisioningExchange`/`sendConfigRequest`, close that: every wait for a
+// notification is now bounded by `timeoutMs` and fails with a message naming
+// the stall, instead of hanging.
+//
+// SCOPE, STATED PLAINLY: only the "wait for a reply" step is bounded.
+// `BluetoothPort.connect`/`discover`/`subscribe` are not wrapped — nothing in
+// this project's fake port can make those hang (only `write()` has a 'hold'
+// mode), and the review's own demonstration (nine mutations "caught" only as
+// test timeouts) was entirely about notification waits. A real GATT
+// connect() that never resolves is a real, separate risk this task does not
+// close; see the report.
+// ===========================================================================
+
+/** Not a specification value — an engineering choice. Generous because
+ *  pairing is a one-shot, human-paced action (not an automatic retry loop
+ *  like `queue.ts`'s), but still bounded: a node that will never answer must
+ *  eventually fail the attempt rather than hang it forever. */
+export const DEFAULT_PAIRING_STEP_TIMEOUT_MS = 30_000;
+
+/** The real clock: wraps the global timer functions, same shape as
+ *  `lib/adapter/connection.ts#ClockPort` (which every fake in this project
+ *  already implements against — see `lib/adapter/__tests__/fakeClock.ts`). */
+export function createRealClock(): ClockPort {
+  return {
+    now: (): number => Date.now(),
+    setTimeout: (callback: () => void, delayMs: number): TimerHandle => setTimeout(callback, delayMs),
+    clearTimeout: (handle: TimerHandle): void => clearTimeout(handle as ReturnType<typeof setTimeout>),
+  };
+}
+
+/** Races `promise` against a `clock`-driven timer; rejects with an error
+ *  naming `what` if `timeoutMs` elapses first. Whichever settles first wins
+ *  cleanly — the loser's own eventual settlement (a late reply arriving
+ *  after a timeout, or the timer that never gets to fire because the reply
+ *  arrived first) is a no-op, never a second resolve/reject. */
+function withTimeout<T>(promise: Promise<T>, clock: ClockPort, timeoutMs: number, what: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    let settled = false;
+    const timer = clock.setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      reject(new Error(`${what}: no reply from the node within ${timeoutMs}ms`));
+    }, timeoutMs);
+    promise.then(
+      (value) => {
+        if (settled) return;
+        settled = true;
+        clock.clearTimeout(timer);
+        resolve(value);
+      },
+      (err: unknown) => {
+        if (settled) return;
+        settled = true;
+        clock.clearTimeout(timer);
+        reject(err instanceof Error ? err : new Error(String(err)));
+      },
+    );
+  });
+}
+
+// ===========================================================================
+// Homey BLE UUID parsing — review finding (MEDIUM): this used to be three
+// lines of real logic (`parseInt(uuid, 16)`) sitting in `driver.ts`, outside
+// the typecheck/jest gate (that file imports `homey`). Moved here, under the
+// gate, with a test per shape — the naive version had three real bugs: a
+// full canonical 128-bit form (32 hex chars) parses as one enormous number
+// that never matches any of this project's 16-bit constants; a DASHED
+// canonical form silently truncates at the first dash, which only happens
+// to recover the right 16-bit value when that value is the EXACT short-UUID
+// embedding (and gives a wrong, unguarded answer for any other 128-bit
+// UUID a real scan can legitimately include); and a non-hex string produces
+// `NaN`, not a thrown error, so a lookup failure then surfaces as "does not
+// expose both required characteristics" — pointing at the wrong place
+// entirely. This module only ever needs to recognise Bluetooth SIG 16-bit
+// short UUIDs (the Mesh Provisioning/Proxy services and their four
+// characteristics), in the two shapes Homey's own BLE API plausibly hands
+// back: a bare 4-hex-digit short form, or a full 128-bit UUID string (dashed
+// or not) that embeds one via the Bluetooth Base UUID. Anything else throws
+// a clear error rather than silently producing a wrong number.
+// ===========================================================================
+
+// Bluetooth Core Specification, Vol 3, Part B, Section 2.5.1 "UUID": 16-/32-
+// bit "short" Bluetooth SIG UUIDs are the first 32 bits of a 128-bit UUID
+// built from this fixed base, lowercase hex, no dashes (bytes 4-15):
+// 0000xxxx-0000-1000-8000-00805F9B34FB.
+const BLE_BASE_UUID_SUFFIX = '00001000800000805f9b34fb';
+
+/**
+ * Parses a Bluetooth UUID string into this project's own 16-bit numeric
+ * convention (`lib/adapter/connection.ts`'s `MESH_PROXY_SERVICE_UUID`-style
+ * constants). Accepts a bare 4-hex-digit short form ("1827") or a 128-bit
+ * form (32 hex digits, with or without the canonical dashes) that embeds a
+ * 16-bit short UUID via the Bluetooth Base UUID — throws for anything else
+ * (non-hex input, the wrong length, or a well-formed 128-bit UUID that does
+ * NOT embed a 16-bit short UUID) rather than silently returning a wrong or
+ * `NaN` value.
+ */
+export function parseBleUuid(uuid: string): number {
+  const normalized = uuid.toLowerCase().replace(/-/g, '');
+  if (normalized.length === 0 || !/^[0-9a-f]+$/.test(normalized)) {
+    throw new Error(`parseBleUuid: "${uuid}" is not a hexadecimal UUID string`);
+  }
+  if (normalized.length === 4) {
+    return parseInt(normalized, 16);
+  }
+  if (normalized.length === 32) {
+    const shortPart = normalized.slice(0, 8);
+    const rest = normalized.slice(8);
+    if (rest === BLE_BASE_UUID_SUFFIX && shortPart.startsWith('0000')) {
+      return parseInt(shortPart.slice(4), 16);
+    }
+    throw new Error(
+      `parseBleUuid: "${uuid}" is a 128-bit UUID that does not embed a 16-bit Bluetooth SIG short UUID via the Bluetooth Base UUID (this project only expects the Mesh Provisioning/Proxy services and their characteristics)`,
+    );
+  }
+  throw new Error(`parseBleUuid: "${uuid}" is not a recognised UUID shape (expected 4 hex digits, or 32 with dashes optional)`);
+}
+
+/** Inverse of `parseBleUuid` for this project's own 16-bit constants only —
+ *  used to build the service filter `HomeyBluetoothPort.scan()` passes to
+ *  `ManagerBLE.discover()`. */
+export function bleUuidString(uuid: number): string {
+  if (!Number.isInteger(uuid) || uuid < 0 || uuid > 0xffff) {
+    throw new Error(`bleUuidString: ${uuid} is not a 16-bit UUID`);
+  }
+  return uuid.toString(16).padStart(4, '0');
 }
 
 // ===========================================================================
@@ -216,6 +379,16 @@ class NotificationChannel {
   next(): Promise<Buffer> {
     const queued = this.queue.shift();
     if (queued !== undefined) return Promise.resolve(queued);
+    if (this.waiting !== null) {
+      // Review finding: calling `next()` again while a previous call is
+      // still pending would silently overwrite `this.waiting`, losing the
+      // first caller's wait forever (it would never resolve, since `push`
+      // only ever resolves the CURRENT `this.waiting`). Every call site in
+      // this module awaits exactly one `next()` at a time in a strict loop,
+      // so this is never reachable through this module's own use — thrown
+      // loudly, as a programming error, rather than silently losing data.
+      throw new Error('NotificationChannel.next: called again while a previous call is still pending');
+    }
     return new Promise<Buffer>((resolve) => {
       this.waiting = resolve;
     });
@@ -262,14 +435,14 @@ async function openSession(
 }
 
 /** Connects for the PROVISIONING phase (Mesh Provisioning Service). */
-function connectForProvisioning(bluetooth: BluetoothPort, peripheralId: string): Promise<GattSession> {
+export function connectForProvisioning(bluetooth: BluetoothPort, peripheralId: string): Promise<GattSession> {
   return openSession(bluetooth, peripheralId, MESH_PROVISIONING_SERVICE_UUID, MESH_PROVISIONING_DATA_IN_UUID, MESH_PROVISIONING_DATA_OUT_UUID);
 }
 
 /** Connects for the CONFIGURATION phase (Mesh Proxy Service) — see the
  *  module header's "TWO GATT SESSIONS" note for why this is a fresh
  *  connection, not the same one. */
-function connectForConfiguration(bluetooth: BluetoothPort, peripheralId: string): Promise<GattSession> {
+export function connectForConfiguration(bluetooth: BluetoothPort, peripheralId: string): Promise<GattSession> {
   return openSession(bluetooth, peripheralId, MESH_PROXY_SERVICE_UUID, MESH_PROXY_DATA_IN_UUID, MESH_PROXY_DATA_OUT_UUID);
 }
 
@@ -281,14 +454,22 @@ function connectForConfiguration(bluetooth: BluetoothPort, peripheralId: string)
  * Drives `machine.ts`'s `beginProvisioning`/`step` to a terminal phase over
  * `session`, writing every PDU the machine produces and feeding back every
  * notification the channel delivers, in order, until the state reaches
- * `'provisioned'`, `'unsupported'` or `'failed'`.
+ * `'provisioned'`, `'unsupported'` or `'failed'`. Each wait for a reply is
+ * bounded by `timeoutMs` (see the module header's "The clock" note) —
+ * throws, naming the stall, rather than hanging forever against a silent
+ * node.
  */
-export async function runProvisioningExchange(session: GattSession, input: BeginProvisioningInput): Promise<ProvisioningState> {
+export async function runProvisioningExchange(
+  session: GattSession,
+  input: BeginProvisioningInput,
+  clock: ClockPort,
+  timeoutMs: number = DEFAULT_PAIRING_STEP_TIMEOUT_MS,
+): Promise<ProvisioningState> {
   let { state, send } = beginProvisioning(input);
   for (const pdu of send) await session.write(pdu);
 
   while (state.phase !== 'provisioned' && state.phase !== 'unsupported' && state.phase !== 'failed') {
-    const incoming = await session.next();
+    const incoming = await withTimeout(session.next(), clock, timeoutMs, 'provisioning stalled');
     ({ state, send } = provisioningStep(state, incoming));
     for (const pdu of send) await session.write(pdu);
   }
@@ -310,12 +491,27 @@ interface ConfigExchangeInput {
   readonly nodeAddress: number;
   readonly deviceKey: Buffer;
   readonly allocateSeq: () => number;
+  readonly clock: ClockPort;
+  readonly timeoutMs: number;
 }
 
-export type ConfigExchangeResult = { readonly kind: 'ok'; readonly composition: CompositionData } | { readonly kind: 'failed'; readonly message: string };
+/**
+ * `composition` is carried on BOTH variants, not only `'ok'` — review
+ * finding (MEDIUM): the extra-element address reservation (see
+ * `reserveElementAddresses` below) must happen whenever the element count
+ * becomes known, regardless of whether configuration goes on to succeed.
+ * `null` on `'failed'` means the failure happened before Composition Data
+ * Status was even read (nothing to reserve for); a non-null composition on
+ * `'failed'` means it parsed fine but something LATER (AppKey Add, a Model
+ * App Bind) was refused or stalled.
+ */
+export type ConfigExchangeResult =
+  | { readonly kind: 'ok'; readonly composition: CompositionData }
+  | { readonly kind: 'failed'; readonly message: string; readonly composition: CompositionData | null };
 
 /** Sends one device-key-secured Config message and waits for the (possibly
- *  segmented) reply, decoded all the way to an `AccessMessage`. */
+ *  segmented) reply, decoded all the way to an `AccessMessage`. Bounded by
+ *  `input.timeoutMs` — see the module header's "The clock" note. */
 async function sendConfigRequest(input: ConfigExchangeInput, accessPayload: Buffer): Promise<AccessMessage> {
   const pdus = encodeMeshMessage({
     accessPayload,
@@ -338,7 +534,7 @@ async function sendConfigRequest(input: ConfigExchangeInput, accessPayload: Buff
   };
   let state: MeshReceiveState | undefined;
   for (;;) {
-    const incoming = await input.session.next();
+    const incoming = await withTimeout(input.session.next(), input.clock, input.timeoutMs, 'configuration exchange stalled');
     const result = acceptIncomingPdu(state, receiveContext, incoming);
     if (result.kind === 'complete') return result.message;
     state = result.state;
@@ -355,70 +551,123 @@ function toConfigStatus(message: AccessMessage): ReturnType<typeof decodeConfigS
 }
 
 /**
+ * Sends a Config Node Reset over the SAME still-open session and waits for
+ * Node Reset Status — review finding (HIGH): without this, any failure
+ * AFTER provisioning succeeds orphaned the node permanently (it has already
+ * left the Mesh Provisioning Service for the Mesh Proxy Service, so a later
+ * scan for unprovisioned nodes can never find it again; no store entry was
+ * ever written, so this app holds no device key to reach it with later
+ * either). The design: a failed provisioning "leaves the node untouched and
+ * can be retried" — once a node is actually provisioned, "untouched" is no
+ * longer achievable, but "reset back to the unowned state" is the
+ * equivalent a configuration-phase failure can still deliver, using the
+ * encoder/decoder pair (`encodeConfigNodeReset`/`decodeConfigStatus`'s
+ * `'nodeReset'` variant) that already existed and were already tested but
+ * had no caller before this fix. Never throws — a failure to reset is
+ * reported back to the caller, never swallowed.
+ */
+async function attemptNodeReset(input: ConfigExchangeInput): Promise<{ readonly ok: true } | { readonly ok: false; readonly error: string }> {
+  try {
+    const message = await sendConfigRequest(input, encodeConfigNodeReset());
+    const status = toConfigStatus(message);
+    if (status === null || status.type !== 'nodeReset') {
+      return { ok: false, error: 'node did not answer Config Node Reset with a Node Reset Status message' };
+    }
+    return { ok: true };
+  } catch (err) {
+    return { ok: false, error: errorMessage(err) };
+  }
+}
+
+/** Builds a `'failed'` result, attempting a node reset first (see
+ *  `attemptNodeReset`) and naming the outcome of THAT attempt in the
+ *  message too — never silently losing whether the node is still orphaned
+ *  or has been returned to the unowned state. */
+async function failWithReset(input: ConfigExchangeInput, composition: CompositionData | null, message: string): Promise<ConfigExchangeResult> {
+  const reset = await attemptNodeReset(input);
+  const suffix = reset.ok
+    ? ' — the node has been reset and can be paired again'
+    : ` — attempted to reset the node so it can be paired again, but that also failed (${reset.error}); it may need a manual factory reset`;
+  return { kind: 'failed', message: `${message}${suffix}`, composition };
+}
+
+/**
  * Reads composition data, adds the application key, and binds it to every
  * one of the node's SIG models this design maps to a Homey capability
  * (`LIGHTING_SERVER_MODEL_IDS`) — the design's "adds the application key,
  * reads the composition data and binds the key to the node's models", in
  * that dependency order (binding needs to know WHICH models exist, which
- * composition data is what reveals).
+ * composition data is what reveals). Every failure path — including an
+ * unexpected exception (e.g. a stalled wait timing out mid-exchange) —
+ * attempts a node reset before returning; see `failWithReset`.
  */
 export async function runConfigExchange(input: ConfigExchangeInput): Promise<ConfigExchangeResult> {
-  const compositionReply = toConfigStatus(await sendConfigRequest(input, encodeConfigCompositionDataGet(0)));
-  if (compositionReply === null || compositionReply.type !== 'compositionData') {
-    return { kind: 'failed', message: 'node did not answer Config Composition Data Get with a Composition Data Status message' };
-  }
-  if (compositionReply.composition === null) {
-    // See the module header's COMPOSITION DATA THAT DOES NOT PARSE note —
-    // genuinely cannot say more than this without guessing.
-    return {
-      kind: 'failed',
-      message: "the node's composition data could not be parsed (malformed or truncated Composition Data Page 0)",
-    };
-  }
-  const composition = compositionReply.composition;
-
-  const appKeyReply = toConfigStatus(
-    await sendConfigRequest(
-      input,
-      encodeConfigAppKeyAdd({ netKeyIndex: input.netKeyIndex, appKeyIndex: input.appKeyIndex, appKey: input.appKey }),
-    ),
-  );
-  if (appKeyReply === null || appKeyReply.type !== 'appKey') {
-    return { kind: 'failed', message: 'node did not answer Config AppKey Add with an AppKey Status message' };
-  }
-  if (appKeyReply.status !== 0x00) {
-    return {
-      kind: 'failed',
-      message: `Config AppKey Add was refused: ${appKeyReply.statusName ?? `status 0x${appKeyReply.status.toString(16)}`}`,
-    };
-  }
-
-  for (const [elementIndex, element] of composition.elements.entries()) {
-    for (const modelId of LIGHTING_SERVER_MODEL_IDS) {
-      if (!element.sigModels.includes(modelId)) continue;
-      const elementAddress = input.nodeAddress + elementIndex;
-      const bindReply = toConfigStatus(
-        await sendConfigRequest(
-          input,
-          encodeConfigModelAppBind({ elementAddress, appKeyIndex: input.appKeyIndex, modelIdentifier: modelId }),
-        ),
+  let knownComposition: CompositionData | null = null;
+  try {
+    const compositionReply = toConfigStatus(await sendConfigRequest(input, encodeConfigCompositionDataGet(0)));
+    if (compositionReply === null || compositionReply.type !== 'compositionData') {
+      return await failWithReset(input, null, 'node did not answer Config Composition Data Get with a Composition Data Status message');
+    }
+    if (compositionReply.composition === null) {
+      // See the module header's COMPOSITION DATA THAT DOES NOT PARSE note —
+      // genuinely cannot say more than this without guessing.
+      return await failWithReset(
+        input,
+        null,
+        "the node's composition data could not be parsed (malformed or truncated Composition Data Page 0)",
       );
-      if (bindReply === null || bindReply.type !== 'modelApp') {
-        return {
-          kind: 'failed',
-          message: `node did not answer Config Model App Bind (element ${elementIndex}, model 0x${modelId.toString(16)}) with a Model App Status message`,
-        };
-      }
-      if (bindReply.status !== 0x00) {
-        return {
-          kind: 'failed',
-          message: `Config Model App Bind was refused for element ${elementIndex}, model 0x${modelId.toString(16)}: ${bindReply.statusName ?? `status 0x${bindReply.status.toString(16)}`}`,
-        };
+    }
+    knownComposition = compositionReply.composition;
+    const composition = knownComposition;
+
+    const appKeyReply = toConfigStatus(
+      await sendConfigRequest(
+        input,
+        encodeConfigAppKeyAdd({ netKeyIndex: input.netKeyIndex, appKeyIndex: input.appKeyIndex, appKey: input.appKey }),
+      ),
+    );
+    if (appKeyReply === null || appKeyReply.type !== 'appKey') {
+      return await failWithReset(input, composition, 'node did not answer Config AppKey Add with an AppKey Status message');
+    }
+    if (appKeyReply.status !== 0x00) {
+      return await failWithReset(
+        input,
+        composition,
+        `Config AppKey Add was refused: ${appKeyReply.statusName ?? `status 0x${appKeyReply.status.toString(16)}`}`,
+      );
+    }
+
+    for (const [elementIndex, element] of composition.elements.entries()) {
+      for (const modelId of LIGHTING_SERVER_MODEL_IDS) {
+        if (!element.sigModels.includes(modelId)) continue;
+        const elementAddress = input.nodeAddress + elementIndex;
+        const bindReply = toConfigStatus(
+          await sendConfigRequest(
+            input,
+            encodeConfigModelAppBind({ elementAddress, appKeyIndex: input.appKeyIndex, modelIdentifier: modelId }),
+          ),
+        );
+        if (bindReply === null || bindReply.type !== 'modelApp') {
+          return await failWithReset(
+            input,
+            composition,
+            `node did not answer Config Model App Bind (element ${elementIndex}, model 0x${modelId.toString(16)}) with a Model App Status message`,
+          );
+        }
+        if (bindReply.status !== 0x00) {
+          return await failWithReset(
+            input,
+            composition,
+            `Config Model App Bind was refused for element ${elementIndex}, model 0x${modelId.toString(16)}: ${bindReply.statusName ?? `status 0x${bindReply.status.toString(16)}`}`,
+          );
+        }
       }
     }
-  }
 
-  return { kind: 'ok', composition };
+    return { kind: 'ok', composition };
+  } catch (err) {
+    return failWithReset(input, knownComposition, `configuration exchange failed unexpectedly: ${errorMessage(err)}`);
+  }
 }
 
 // ===========================================================================
@@ -464,6 +713,11 @@ export interface PairingDeps {
   readonly bluetooth: BluetoothPort;
   readonly store: NetworkStore;
   readonly random: ProvisioningRandomSource;
+  /** See the module header's "The clock" note — every bounded wait for a
+   *  reply in one pairing attempt is driven by this. */
+  readonly clock: ClockPort;
+  /** Overrides `DEFAULT_PAIRING_STEP_TIMEOUT_MS` for this attempt. */
+  readonly stepTimeoutMs?: number;
 }
 
 export interface PairedDeviceDescriptor {
@@ -504,6 +758,7 @@ async function disconnectQuietly(session: GattSession): Promise<void> {
  * happens to the store on every non-`'paired'` outcome.
  */
 export async function pairNode(deps: PairingDeps, peripheralId: string): Promise<PairingOutcome> {
+  const timeoutMs = deps.stepTimeoutMs ?? DEFAULT_PAIRING_STEP_TIMEOUT_MS;
   let provisioningSession: GattSession;
   try {
     provisioningSession = await connectForProvisioning(deps.bluetooth, peripheralId);
@@ -532,7 +787,7 @@ export async function pairNode(deps: PairingDeps, peripheralId: string): Promise
       provisioningData: { netKey, netKeyIndex, flags: 0, ivIndex, unicastAddress: nodeAddress },
     };
 
-    const finalState = await runProvisioningExchange(provisioningSession, provisioningInput);
+    const finalState = await runProvisioningExchange(provisioningSession, provisioningInput, deps.clock, timeoutMs);
     await disconnectQuietly(provisioningSession);
 
     if (finalState.phase === 'unsupported') {
@@ -559,7 +814,13 @@ export async function pairNode(deps: PairingDeps, peripheralId: string): Promise
     try {
       configSession = await connectForConfiguration(deps.bluetooth, peripheralId);
     } catch (err) {
-      return { kind: 'failed', message: `provisioned "${peripheralId}", but could not reconnect for configuration: ${errorMessage(err)}` };
+      // No session, no way to send a reset — the node is provisioned but
+      // unreachable right now. Said plainly, not hidden behind a generic
+      // message: see the report's disclosed residual risk for this path.
+      return {
+        kind: 'failed',
+        message: `provisioned "${peripheralId}", but could not reconnect for configuration: ${errorMessage(err)} — the node is provisioned but could not be reset, and may need a manual factory reset`,
+      };
     }
 
     try {
@@ -574,14 +835,32 @@ export async function pairNode(deps: PairingDeps, peripheralId: string): Promise
         nodeAddress,
         deviceKey,
         allocateSeq: () => deps.store.allocateSequenceBlock(),
+        clock: deps.clock,
+        timeoutMs,
       });
       await disconnectQuietly(configSession);
+
+      // Review finding (MEDIUM): reserve the extra-element addresses as
+      // soon as the element count is known, regardless of whether
+      // configuration goes on to succeed — a node that provisions with N
+      // elements occupies N consecutive addresses the moment it is
+      // provisioned, independent of whether AppKey Add/Model App Bind ever
+      // complete. Done here, not inside `finishPairing`, which no longer
+      // touches `nextUnicastAddress` at all (see that function's own
+      // comment).
+      if (exchangeResult.composition !== null) {
+        reserveElementAddresses(deps.store, exchangeResult.composition);
+      }
 
       if (exchangeResult.kind === 'failed') {
         return { kind: 'failed', message: exchangeResult.message };
       }
       return finishPairing(deps.store, peripheralId, nodeAddress, deviceKey, exchangeResult.composition);
     } catch (err) {
+      // Defensive only: runConfigExchange catches its own exceptions
+      // internally now (attempting a reset first — see failWithReset) and
+      // should never actually throw; kept so an unforeseen bug here still
+      // produces an honest failure instead of an unhandled rejection.
       await disconnectQuietly(configSession);
       return { kind: 'failed', message: `configuring "${peripheralId}" failed: ${errorMessage(err)}` };
     }
@@ -591,9 +870,26 @@ export async function pairNode(deps: PairingDeps, peripheralId: string): Promise
   }
 }
 
-/** The ONE place this module writes a node entry — see the module header's
- *  two notes on why this is also the only place `nextUnicastAddress`
- *  advances past a multi-element node's extra elements. */
+/**
+ * Advances the store's next-free unicast address past a multi-element
+ * node's EXTRA elements (the node's own primary address was already
+ * allocated via `store.allocateUnicastAddress()` before provisioning — see
+ * the module header's INHERITED ADDRESS-ADVANCE HAZARD note). Called as
+ * soon as the element count is known, win or lose — see `pairNode`'s own
+ * comment at its one call site for why this must not wait for success.
+ * A no-op for a single-element node (nothing extra to reserve). Follows the
+ * same "re-read immediately before the one `setState`" discipline as
+ * `ensureNetworkInitialized`.
+ */
+function reserveElementAddresses(store: NetworkStore, composition: CompositionData): void {
+  if (composition.elements.length <= 1) return;
+  const fresh = store.getState();
+  store.setState({ ...fresh, nextUnicastAddress: fresh.nextUnicastAddress + (composition.elements.length - 1) });
+}
+
+/** The ONE place this module writes a node entry. Does NOT touch
+ *  `nextUnicastAddress` (see `reserveElementAddresses` above, which the
+ *  caller runs separately and unconditionally once composition is known). */
 function finishPairing(
   store: NetworkStore,
   peripheralId: string,
@@ -604,7 +900,6 @@ function finishPairing(
   const fresh = store.getState();
   store.setState({
     ...fresh,
-    nextUnicastAddress: fresh.nextUnicastAddress + (composition.elements.length - 1),
     nodes: [...fresh.nodes, { address: nodeAddress, deviceKey, composition }],
   });
 

@@ -339,6 +339,25 @@ export class FakeBluetoothPort implements BluetoothPort {
     node.gattProfile = 'proxy';
   }
 
+  /** The inverse of `reconfigureAsProvisioned` — models a node returning to
+   *  the unowned state (Config Node Reset accepted, or a factory reset):
+   *  it stops advertising our network's identity and starts advertising the
+   *  Mesh Provisioning Service again, with `serviceData` the caller
+   *  supplies (an arbitrary non-empty buffer is enough — nothing in this
+   *  project inspects an unprovisioned node's Service Data content, only
+   *  its presence under `MESH_PROVISIONING_SERVICE_UUID`; see
+   *  `drivers/light/pairing.ts#scanForUnprovisionedNodes`). Added for the
+   *  review finding that a configuration-phase failure must not orphan the
+   *  node: a test can call this (from a Config Node Reset auto-responder)
+   *  and then assert the SAME peripheral is scannable as unprovisioned
+   *  again. */
+  reconfigureAsUnprovisioned(id: string, serviceData: Buffer): void {
+    const node = this.node(id);
+    node.serviceUuid = MESH_PROVISIONING_SERVICE_UUID;
+    node.serviceData = Buffer.from(serviceData);
+    node.gattProfile = 'provisioning';
+  }
+
   removeNode(id: string): void {
     this.nodes.delete(id);
   }
