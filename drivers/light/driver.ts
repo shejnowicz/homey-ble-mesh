@@ -8,6 +8,26 @@
 // over `this.homey.settings`, and a custom pairing view
 // (`pair/list_devices.html`) talking to `onPair`'s two handlers below.
 //
+// THE SHARED NetworkStore, NOT A SECOND ONE (task 7 finding, fixed here as
+// part of that task's own wiring responsibility). This file used to
+// construct its OWN `NetworkStore` for pairing, which was harmless while
+// nothing else in the app ever ran one at the same time — app.ts was a
+// skeleton. Task 7 gives app.ts a LONG-LIVED `NetworkStore` that every
+// device's ordinary commands allocate sequence numbers through for as long
+// as the app runs. `NetworkStore`'s sequence allocator keeps its "next
+// number" cursor IN MEMORY, loaded once at construction (store.ts's own
+// module header) — if pairing kept constructing its own second instance
+// (reading the SAME persisted ceiling independently), opening the pairing
+// wizard while existing bulbs are already being controlled could hand out
+// the SAME sequence number to two unrelated messages, which a receiving
+// node's own replay protection would then treat as a replay and silently
+// drop one of (see meshLight.ts's/device.ts's own identical note — this
+// file is the other half of the same hazard). `onPair` below therefore
+// reaches into `this.homey.app` for the one shared instance instead, the
+// same in-process pattern device.ts uses, and tells the app to start the
+// mesh connection (a no-op after the first time) the moment the FIRST
+// pairing ever succeeds — see `ensureMeshStarted`'s own call site below.
+//
 // REAL BLUETOOTH ADAPTER, FIRST TIME IN THIS PROJECT. Every earlier task's
 // `BluetoothPort` consumer (`lib/adapter/connection.ts`, `lib/adapter/
 // queue.ts`) was only ever driven against `lib/adapter/__tests__/
@@ -47,7 +67,7 @@
 import Homey from 'homey';
 import type { BleAdvertisement, BlePeripheral, BleCharacteristic } from 'homey';
 
-import { NetworkStore, type SettingsPort } from '../../lib/adapter/store';
+import type { NetworkStore } from '../../lib/adapter/store';
 import {
   MESH_PROVISIONING_SERVICE_UUID,
   MESH_PROXY_SERVICE_UUID,
@@ -100,7 +120,14 @@ interface HomeyCharacteristicHandle {
   readonly characteristic: BleCharacteristic;
 }
 
-class HomeyBluetoothPort implements BluetoothPort {
+/** Exported for task 7's `app.ts`, which needs the identical real-Bluetooth
+ *  wiring for the shared proxy connection manager — `this.homey.ble` is the
+ *  same manager regardless of whether it is read from `Homey.App` or
+ *  `Homey.Driver` (both type it as the same `Homey` class's own `ble`
+ *  property), so one class serves both rather than a second copy of this
+ *  file's own UNVERIFIED-ON-HARDWARE wiring (see this file's own header)
+ *  drifting from it. */
+export class HomeyBluetoothPort implements BluetoothPort {
   constructor(private readonly ble: BleManager) {}
 
   async scan(_durationMs: number): Promise<ScanResult[]> {
@@ -166,15 +193,19 @@ class HomeyBluetoothPort implements BluetoothPort {
   }
 }
 
-/** `this.homey.settings` already matches `SettingsPort`'s own
- *  `{get(key), set(key, value)}` shape structurally — no adapter class
- *  needed, same as every other `lib/adapter` module that takes a settings
- *  port. */
-function settingsPort(homey: DriverHomey): SettingsPort {
-  return {
-    get: (key: string): unknown => homey.settings.get(key),
-    set: (key: string, value: unknown): void => homey.settings.set(key, value),
-  };
+/** What `app.ts`'s `BleMeshApp` exposes in-process for pairing — see this
+ *  file's own module header's "THE SHARED NetworkStore" note. A narrow,
+ *  driver-local interface (not shared with `device.ts`'s own
+ *  `BleMeshAppHost`), same convention homey-heating's own
+ *  `drivers/automation/device.ts` already uses for its own, differently-
+ *  shaped `AutomationHost`: each caller declares exactly what IT needs from
+ *  the app, rather than every caller sharing one grab-bag interface. */
+interface MeshBootstrapHost {
+  getNetworkStore(): NetworkStore;
+  /** Starts the shared proxy connection manager the first time a network
+   *  key exists; a no-op on every later call (including every call before
+   *  the first network key exists). */
+  ensureMeshStarted(): void;
 }
 
 class LightDriver extends Homey.Driver {
@@ -188,15 +219,23 @@ class LightDriver extends Homey.Driver {
   // `PairSession` from its top-level module for this file to name directly.
   async onPair(session: Parameters<InstanceType<typeof Homey.Driver>['onPair']>[0]): Promise<void> {
     const bluetooth = new HomeyBluetoothPort(this.homey.ble);
-    const store = new NetworkStore(settingsPort(this.homey));
-    const deps: PairingDeps = { bluetooth, store, random: createNodeCryptoRandomSource(), clock: createRealClock() };
+    const host = this.homey.app as unknown as MeshBootstrapHost;
+    const deps: PairingDeps = { bluetooth, store: host.getNetworkStore(), random: createNodeCryptoRandomSource(), clock: createRealClock() };
 
     session.setHandler('list_devices', async (): Promise<UnprovisionedNodeCandidate[]> => {
       return scanForUnprovisionedNodes(bluetooth);
     });
 
     session.setHandler('pair_node', async (data: { peripheralId: string }): Promise<PairingOutcome> => {
-      return pairNode(deps, data.peripheralId);
+      const outcome = await pairNode(deps, data.peripheralId);
+      if (outcome.kind === 'paired') {
+        // First-ever pairing is what creates the network (ensureNetworkInitialized,
+        // pairing.ts) — this is the one place that tells app.ts to start the
+        // shared connection manager once that has happened. A no-op on every
+        // later pairing (the mesh is already running by then).
+        host.ensureMeshStarted();
+      }
+      return outcome;
     });
   }
 }

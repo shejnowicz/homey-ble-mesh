@@ -1,0 +1,112 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <script type="text/javascript" src="/homey.js" data-origin="settings"></script>
+    <style>
+      body {
+        font-family: -apple-system, sans-serif;
+        margin: 0;
+        padding: 16px;
+      }
+      h1 {
+        font-size: 18px;
+        margin-bottom: 8px;
+      }
+      p {
+        line-height: 1.4;
+      }
+      /*
+        Design (docs/superpowers/specs/2026-10-06-ble-mesh-provisioner-
+        design.md, "Owner decisions" / "Risks accepted"): "Network state:
+        stored in the app's settings only. Export and import were offered
+        and declined. The consequence — losing the settings means physically
+        resetting every bulb — is accepted and must be stated plainly in the
+        app's settings screen." This block is deliberately the FIRST thing
+        on the page and visually distinct (not a tooltip, not a footnote) —
+        task 7's own "write that where a user will see it before it
+        matters" instruction.
+      */
+      .warning {
+        background: #fff3cd;
+        border: 1px solid #e0a800;
+        border-radius: 8px;
+        padding: 12px 16px;
+        margin: 16px 0;
+        color: #664d03;
+      }
+      .warning strong {
+        display: block;
+        margin-bottom: 4px;
+        font-size: 14px;
+      }
+      fieldset {
+        border: 1px solid #ccc;
+        border-radius: 8px;
+        margin-top: 16px;
+        padding: 8px 16px 16px;
+      }
+      legend {
+        padding: 0 4px;
+        font-weight: 600;
+      }
+      dl {
+        margin: 0;
+      }
+      dt {
+        font-weight: 600;
+        margin-top: 8px;
+      }
+      dd {
+        margin: 0 0 4px 0;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>BLE mesh network</h1>
+
+    <div class="warning">
+      <strong>This network's keys live only in this app's settings — there is no export or import.</strong>
+      If these settings are lost — removing or reinstalling this app, or resetting Homey itself — every bulb stays
+      bound to a network nobody can reach anymore. The only way back is a physical factory reset of each bulb,
+      followed by pairing it again. A Homey backup (which includes this app's settings) protects against this; this
+      app offers no separate backup of its own.
+    </div>
+
+    <fieldset>
+      <legend>Current network</legend>
+      <dl>
+        <dt>Network established</dt>
+        <dd id="established">—</dd>
+        <dt>Bulbs paired</dt>
+        <dd id="nodeCount">—</dd>
+      </dl>
+    </fieldset>
+
+    <script type="text/javascript">
+      // Read-only — this page reads the SAME settings key
+      // (lib/adapter/store.ts's own SETTINGS_KEY_NETWORK) the app itself
+      // writes through NetworkStore; it never writes anything itself, so
+      // there is no save button and nothing here can corrupt that state.
+      function onHomeyReady() {
+        Homey.ready();
+        Homey.get('network', function (err, network) {
+          var establishedEl = document.getElementById('established');
+          var nodeCountEl = document.getElementById('nodeCount');
+          if (err) {
+            establishedEl.textContent = 'Unknown (could not read settings)';
+            nodeCountEl.textContent = '—';
+            return;
+          }
+          if (!network || !network.netKey) {
+            establishedEl.textContent = 'Not yet — pair a bulb to create it';
+            nodeCountEl.textContent = '0';
+            return;
+          }
+          establishedEl.textContent = 'Yes';
+          nodeCountEl.textContent = String((network.nodes || []).length);
+        });
+      }
+    </script>
+  </body>
+</html>

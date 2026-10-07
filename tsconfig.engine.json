@@ -11,5 +11,11 @@
     "outDir": "build",
     "types": ["node", "jest"]
   },
-  "include": ["lib/**/*.ts", "drivers/light/pairing.ts", "drivers/light/__tests__/pairing.test.ts"]
+  "include": [
+    "lib/**/*.ts",
+    "drivers/light/pairing.ts",
+    "drivers/light/__tests__/pairing.test.ts",
+    "drivers/light/meshLight.ts",
+    "drivers/light/__tests__/meshLight.test.ts"
+  ]
 }

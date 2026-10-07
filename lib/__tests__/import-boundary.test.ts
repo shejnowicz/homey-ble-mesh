@@ -124,3 +124,18 @@ test('drivers/light/pairing.ts never imports homey', () => {
   const specifiers = extractSpecifiers(source);
   expect(specifiers).not.toContain('homey');
 });
+
+/**
+ * Task 7's own instance of the same narrow rule above, for the same reason:
+ * `drivers/light/meshLight.ts` is this task's pure orchestration module
+ * (its own module header: "the ONE file in drivers/light that imports
+ * homey" is `device.ts`, not this one) — a mutation re-adding `import Homey
+ * from 'homey'` here would typecheck cleanly and only fail once ts-jest
+ * actually tries to run it, exactly as pairing.ts's own test above argues.
+ */
+test('drivers/light/meshLight.ts never imports homey', () => {
+  const file = join(__dirname, '..', '..', 'drivers', 'light', 'meshLight.ts');
+  const source = readFileSync(file, 'utf8');
+  const specifiers = extractSpecifiers(source);
+  expect(specifiers).not.toContain('homey');
+});
