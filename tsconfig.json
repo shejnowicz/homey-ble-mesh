@@ -13,5 +13,5 @@
     "types": ["node"]
   },
   "include": ["app.ts", "lib/**/*.ts", "drivers/**/*.ts"],
-  "exclude": ["node_modules", ".homeybuild", "lib/**/__tests__/**"]
+  "exclude": ["node_modules", ".homeybuild", "lib/**/__tests__/**", "drivers/**/__tests__/**"]
 }

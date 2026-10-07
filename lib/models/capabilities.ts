@@ -121,6 +121,26 @@ const MODEL_ID_LIGHT_LIGHTNESS_SERVER = 0x1300;
 const MODEL_ID_LIGHT_CTL_SERVER = 0x1303;
 const MODEL_ID_LIGHT_HSL_SERVER = 0x1307;
 
+/**
+ * The same four SIG Model IDs this module matches against (see the module
+ * header's MODEL IDENTIFIER PROVENANCE note), exported so a caller that must
+ * enumerate exactly "the node's models" this design's table cares about —
+ * the pairing flow binds the application key to each one it finds, per
+ * element (docs/superpowers/specs/2026-10-06-ble-mesh-provisioner-design.md:
+ * "binds the key to the node's models") — reads the SAME set this function
+ * matches, rather than re-transcribing these assigned numbers a second time
+ * in `drivers/light/pairing.ts`. Order is this module's own table order; a
+ * caller enumerating per-element bind targets should not rely on it for
+ * anything beyond iteration (there is no ordering requirement on Model App
+ * Bind, Section 4.3.2.46).
+ */
+export const LIGHTING_SERVER_MODEL_IDS: ReadonlyArray<number> = [
+  MODEL_ID_GENERIC_ONOFF_SERVER,
+  MODEL_ID_LIGHT_LIGHTNESS_SERVER,
+  MODEL_ID_LIGHT_CTL_SERVER,
+  MODEL_ID_LIGHT_HSL_SERVER,
+];
+
 /** The Homey capability identifiers this mapping ever produces: the design's fixed table, plus `light_mode`. */
 export type HomeyCapability =
   | 'onoff'

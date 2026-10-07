@@ -5,7 +5,9 @@ import {
   MESH_PROXY_SERVICE_UUID,
   MESH_PROXY_DATA_IN_UUID,
   MESH_PROXY_DATA_OUT_UUID,
+  MESH_PROVISIONING_SERVICE_UUID,
   SCAN_DURATION_MS,
+  findServiceData,
   type BluetoothPort,
   type ScanResult,
   type DiscoveredCharacteristic,
@@ -401,7 +403,7 @@ describe('epoch guards against stale or superseded port callbacks', () => {
     const serviceData = Buffer.concat([Buffer.from([0x00]), k3(netKey)]);
     const disconnectCallbacks: Array<() => void> = [];
     const port: BluetoothPort = {
-      scan: async (): Promise<ScanResult[]> => [{ peripheralId: 'A', rssi: -50, proxyServiceData: serviceData }],
+      scan: async (): Promise<ScanResult[]> => [{ peripheralId: 'A', rssi: -50, serviceData: [{ serviceUuid: MESH_PROXY_SERVICE_UUID, data: serviceData }] }],
       connect: async (_id, onDisconnect): Promise<unknown> => {
         disconnectCallbacks.push(onDisconnect);
         return {};
@@ -446,7 +448,7 @@ describe('epoch guards against stale or superseded port callbacks', () => {
     let resolveConnect: (() => void) | null = null;
     let disconnectCalls = 0;
     const port: BluetoothPort = {
-      scan: async (): Promise<ScanResult[]> => [{ peripheralId: 'A', rssi: -50, proxyServiceData: serviceData }],
+      scan: async (): Promise<ScanResult[]> => [{ peripheralId: 'A', rssi: -50, serviceData: [{ serviceUuid: MESH_PROXY_SERVICE_UUID, data: serviceData }] }],
       connect: (): Promise<unknown> =>
         new Promise((resolve) => {
           resolveConnect = (): void => resolve({});
@@ -548,7 +550,7 @@ describe('write and notifications', () => {
     const serviceData = Buffer.concat([Buffer.from([0x00]), k3(netKey)]);
     let captured: Buffer | null = null;
     const stub: BluetoothPort = {
-      scan: async (): Promise<ScanResult[]> => [{ peripheralId: 'A', rssi: -50, proxyServiceData: serviceData }],
+      scan: async (): Promise<ScanResult[]> => [{ peripheralId: 'A', rssi: -50, serviceData: [{ serviceUuid: MESH_PROXY_SERVICE_UUID, data: serviceData }] }],
       connect: async (): Promise<unknown> => ({}),
       discover: async (): Promise<DiscoveredCharacteristic[]> => [
         { serviceUuid: MESH_PROXY_SERVICE_UUID, characteristicUuid: MESH_PROXY_DATA_IN_UUID, handle: {} },
@@ -688,7 +690,7 @@ describe('stop', () => {
     const serviceData = Buffer.concat([Buffer.from([0x00]), k3(netKey)]);
     let unsubscribeCalled = false;
     const port: BluetoothPort = {
-      scan: async (): Promise<ScanResult[]> => [{ peripheralId: 'A', rssi: -50, proxyServiceData: serviceData }],
+      scan: async (): Promise<ScanResult[]> => [{ peripheralId: 'A', rssi: -50, serviceData: [{ serviceUuid: MESH_PROXY_SERVICE_UUID, data: serviceData }] }],
       connect: async (): Promise<unknown> => ({}),
       discover: async (): Promise<DiscoveredCharacteristic[]> => [
         { serviceUuid: MESH_PROXY_SERVICE_UUID, characteristicUuid: MESH_PROXY_DATA_IN_UUID, handle: {} },
@@ -787,5 +789,44 @@ describe('fixture coverage: fakeBluetooth capabilities this task does not itself
     await bluetooth.disconnect(connection);
 
     await expect(bluetooth.read(dataIn.handle)).rejects.toThrow('is not connected');
+  });
+});
+
+/**
+ * `findServiceData` is new in task 6 (the SCAN RESULT SHAPE generalisation
+ * — see connection.ts's own module header): every OTHER test in this file
+ * only ever gives a `ScanResult` ONE service data entry, so a version that
+ * ignored `serviceUuid` entirely and returned whichever entry came first
+ * would still pass every one of them — measured, not assumed (see the
+ * task 6 report). A result carrying TWO entries, for TWO DIFFERENT service
+ * UUIDs, is the only fixture that can tell "found the right one" apart
+ * from "found a thing".
+ */
+describe('findServiceData', () => {
+  const proxyData = Buffer.from([0xaa, 0xaa]);
+  const provisioningData = Buffer.from([0xbb, 0xbb]);
+  const result: ScanResult = {
+    peripheralId: 'A',
+    rssi: -50,
+    serviceData: [
+      { serviceUuid: MESH_PROXY_SERVICE_UUID, data: proxyData },
+      { serviceUuid: MESH_PROVISIONING_SERVICE_UUID, data: provisioningData },
+    ],
+  };
+
+  test('returns the entry matching the requested service UUID, not merely the first one present', () => {
+    // Asking for the SECOND-listed service first: a "return entry 0
+    // regardless" bug would fail this specific call even though the proxy
+    // one (entry 0) would still look right by coincidence.
+    expect(findServiceData(result, MESH_PROVISIONING_SERVICE_UUID)).toEqual(provisioningData);
+    expect(findServiceData(result, MESH_PROXY_SERVICE_UUID)).toEqual(proxyData);
+  });
+
+  test('returns null for a service UUID not present at all', () => {
+    expect(findServiceData(result, 0x1234)).toBeNull();
+  });
+
+  test('returns null for an empty serviceData array', () => {
+    expect(findServiceData({ peripheralId: 'A', rssi: -50, serviceData: [] }, MESH_PROXY_SERVICE_UUID)).toBeNull();
   });
 });

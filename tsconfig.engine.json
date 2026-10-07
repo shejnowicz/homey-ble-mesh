@@ -11,5 +11,5 @@
     "outDir": "build",
     "types": ["node", "jest"]
   },
-  "include": ["lib/**/*.ts"]
+  "include": ["lib/**/*.ts", "drivers/light/pairing.ts", "drivers/light/__tests__/pairing.test.ts"]
 }

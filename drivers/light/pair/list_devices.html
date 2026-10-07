@@ -1,0 +1,101 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <style>
+      body { font-family: -apple-system, sans-serif; margin: 0; padding: 16px; }
+      h1 { font-size: 18px; }
+      ul { list-style: none; margin: 0; padding: 0; }
+      li {
+        padding: 12px;
+        margin-bottom: 8px;
+        border: 1px solid #ccc;
+        border-radius: 8px;
+        cursor: pointer;
+      }
+      li.disabled { opacity: 0.5; cursor: default; }
+      #status { margin-top: 12px; }
+      #error { color: #b00020; margin-top: 12px; white-space: pre-wrap; }
+    </style>
+  </head>
+  <body>
+    <h1 data-i18n="pair.list_devices.title">Select a bulb to pair</h1>
+    <div id="status">Scanning…</div>
+    <ul id="devices"></ul>
+    <div id="error"></div>
+
+    <script>
+      // Design (docs/superpowers/specs/2026-10-06-ble-mesh-provisioner-
+      // design.md, "Pairing"): list unprovisioned nodes with signal
+      // strength, then provision ONLY the one the user selects — never
+      // every node seen while scanning. This page is deliberately thin:
+      // 'list_devices' and 'pair_node' (drivers/light/driver.ts's own
+      // onPair handlers) do all the real work; this script only renders
+      // their results and reports a failed/unsupported outcome in place,
+      // per the design's "A failed provisioning ends with a clear message
+      // in the pairing wizard, leaves the node untouched and can be
+      // retried."
+      const statusEl = document.getElementById('status');
+      const listEl = document.getElementById('devices');
+      const errorEl = document.getElementById('error');
+      let pairing = false;
+
+      function renderDevices(candidates) {
+        listEl.innerHTML = '';
+        for (const candidate of candidates) {
+          const li = document.createElement('li');
+          li.textContent = `${candidate.peripheralId} (${candidate.rssi} dBm)`;
+          li.addEventListener('click', () => onSelect(candidate, li));
+          listEl.appendChild(li);
+        }
+      }
+
+      async function onSelect(candidate, li) {
+        if (pairing) return;
+        pairing = true;
+        errorEl.textContent = '';
+        statusEl.textContent = `Pairing ${candidate.peripheralId}…`;
+        for (const el of listEl.querySelectorAll('li')) el.classList.add('disabled');
+
+        try {
+          const outcome = await Homey.emit('pair_node', { peripheralId: candidate.peripheralId });
+          if (outcome.kind === 'paired') {
+            statusEl.textContent = 'Paired — adding device…';
+            await Homey.createDevice(outcome.device);
+            await Homey.done();
+            return;
+          }
+          if (outcome.kind === 'unsupported') {
+            errorEl.textContent = `This node cannot be paired: ${outcome.reason}`;
+          } else {
+            errorEl.textContent = `Pairing failed: ${outcome.message}`;
+          }
+          statusEl.textContent = 'Select a bulb to pair';
+        } catch (err) {
+          errorEl.textContent = `Pairing failed: ${err && err.message ? err.message : err}`;
+          statusEl.textContent = 'Select a bulb to pair';
+        } finally {
+          pairing = false;
+          for (const el of listEl.querySelectorAll('li')) el.classList.remove('disabled');
+        }
+      }
+
+      async function scan() {
+        statusEl.textContent = 'Scanning…';
+        errorEl.textContent = '';
+        try {
+          const candidates = await Homey.emit('list_devices', {});
+          renderDevices(candidates);
+          statusEl.textContent = candidates.length > 0 ? 'Select a bulb to pair' : 'No unpaired bulbs found nearby';
+        } catch (err) {
+          errorEl.textContent = `Scan failed: ${err && err.message ? err.message : err}`;
+          statusEl.textContent = '';
+        }
+      }
+
+      Homey.on('list_devices_refresh', scan);
+      Homey.ready();
+      scan();
+    </script>
+  </body>
+</html>

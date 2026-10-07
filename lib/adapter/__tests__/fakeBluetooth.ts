@@ -51,10 +51,43 @@
  * needing to exercise that fuller cost would need connect/discover/
  * subscribe to accept their own simulated delay the same way `scan` now
  * does.
+ *
+ * TWO GATT PROFILES, ADDED FOR TASK 6 (pairing). A node's `serviceUuid`
+ * (which service `scan()` advertises Service Data for) and `gattProfile`
+ * (which characteristic pair `discover()` returns) now default to the Mesh
+ * PROXY Service/characteristics — every existing connection.ts/queue.ts
+ * test that never sets either field keeps behaving exactly as before this
+ * task. A node can instead be configured as `gattProfile: 'provisioning'`
+ * (and `serviceUuid: MESH_PROVISIONING_SERVICE_UUID`) to model an
+ * UNPROVISIONED node, which `discover()` then answers with the Mesh
+ * Provisioning Service's Data In/Out characteristics instead of the Mesh
+ * Proxy Service's. `reconfigureAsProvisioned` flips a node from the former
+ * to the latter in one call, modelling what a real bulb does the moment
+ * provisioning completes — it stops being findable as an unowned node and
+ * starts advertising our own network's identity instead. This generalises
+ * the SAME hardcoded-to-proxy assumption `ScanResult.proxyServiceData` had
+ * (connection.ts's own module header) one layer lower, in the fixture that
+ * produces it — see that module's SCAN RESULT SHAPE note for why one
+ * hardcoded field could not serve both connection.ts and pairing.ts.
+ *
+ * FOUR ASYMMETRIES ARE DOCUMENTED BELOW AND DELIBERATELY LEFT UNRESOLVED BY
+ * THIS TASK (see each one's own comment: `write()`'s dropWrites-vs-fail
+ * recording order, `releaseWrite`'s lack of pruning/double-release guard,
+ * `simulateDisconnect` not settling a held write, and SCAN TIMING IS
+ * PARTIAL above). Task 6's pairing flow talks to `BluetoothPort` directly —
+ * it never goes through `ProxyConnectionManager` or `TrafficQueue`, which
+ * is the entire reason its scan targets a different service in the first
+ * place — so it has no backoff to race, no queued retries to hold a write
+ * open for, and no reconnect timing to get right. None of its required
+ * test scenarios exercise any of the four, so none are touched here; they
+ * remain exactly as documented for whichever task next needs one.
  */
 
 import { k3 } from '../../mesh/crypto/derive';
 import {
+  MESH_PROVISIONING_DATA_IN_UUID,
+  MESH_PROVISIONING_DATA_OUT_UUID,
+  MESH_PROVISIONING_SERVICE_UUID,
   MESH_PROXY_DATA_IN_UUID,
   MESH_PROXY_DATA_OUT_UUID,
   MESH_PROXY_SERVICE_UUID,
@@ -66,6 +99,10 @@ import {
   type ScanResult,
   type Subscription,
 } from '../connection';
+
+/** Which GATT profile a `FakeNode` currently exposes — see the module
+ *  header's "TWO GATT PROFILES" note. */
+export type GattProfile = 'proxy' | 'provisioning';
 
 export type AttemptBehavior = 'succeed' | 'fail';
 
@@ -83,32 +120,54 @@ export interface FakeNodeConfig {
   readonly rssi: number;
   /** The network key this node's advertised Network ID is derived from
    *  (via k3, same as connection.ts's own `ourNetworkId`). Exactly one of
-   *  `networkKey`/`serviceDataOverride` must be given. */
+   *  `networkKey`/`serviceDataOverride` must be given. Only meaningful
+   *  together with `serviceUuid: MESH_PROXY_SERVICE_UUID` (the default) —
+   *  an unprovisioned node has no network key to derive an identity from at
+   *  all, so a `gattProfile: 'provisioning'` node should use
+   *  `serviceDataOverride` instead (see that field's own doc comment). */
   readonly networkKey?: Buffer;
   /** Advertise this exact Service Data value instead of deriving one from
-   *  `networkKey` — for a malformed payload or a non-Network-ID
-   *  identification type (Table 7.8). `null` means "advertises the Mesh
-   *  Proxy Service with no Service Data at all", distinct from
-   *  `advertising: false` ("does not advertise the service at all": see
+   *  `networkKey` — for a malformed payload, a non-Network-ID
+   *  identification type (Table 7.8), or an unprovisioned node's Mesh
+   *  Provisioning Service data (which this fixture never derives, having no
+   *  notion of a Device UUID to build one from — any non-empty buffer
+   *  models it well enough, since `pairing.ts` never inspects its content,
+   *  only its PRESENCE under `MESH_PROVISIONING_SERVICE_UUID`). `null` means
+   *  "advertises `serviceUuid` with no Service Data value at all", distinct
+   *  from `advertising: false` ("does not advertise at all": see
    *  `setAdvertising`). Exactly one of `networkKey`/`serviceDataOverride`
    *  must be given. */
   readonly serviceDataOverride?: Buffer | null;
+  /** Which service UUID `scan()` attaches this node's Service Data to —
+   *  default `MESH_PROXY_SERVICE_UUID`, matching every test written before
+   *  task 6. Set to `MESH_PROVISIONING_SERVICE_UUID` to model an
+   *  unprovisioned node (see the module header's "TWO GATT PROFILES"
+   *  note). */
+  readonly serviceUuid?: number;
+  /** Which characteristic pair `discover()` returns for this node — default
+   *  `'proxy'` (Mesh Proxy Data In/Out), matching every test written before
+   *  task 6. `'provisioning'` returns the Mesh Provisioning Service's Data
+   *  In/Out characteristics instead. */
+  readonly gattProfile?: GattProfile;
   readonly advertising?: boolean; // default true
   readonly connectBehavior?: AttemptBehavior; // default 'succeed'
   readonly discoverBehavior?: AttemptBehavior; // default 'succeed'
   readonly subscribeBehavior?: AttemptBehavior; // default 'succeed'
   readonly dropWrites?: boolean; // default false
   readonly writeBehavior?: WriteBehavior; // default 'succeed'; see setWriteBehavior
-  /** Omit one Mesh Proxy characteristic from `discover()`'s result,
-   *  modelling a node that advertises the service but does not fully
-   *  implement it. `null` (default): expose both. */
+  /** Omit one data characteristic (of whichever pair `gattProfile`
+   *  selects) from `discover()`'s result, modelling a node that advertises
+   *  the service but does not fully implement it. `null` (default): expose
+   *  both. */
   readonly missingCharacteristic?: 'dataIn' | 'dataOut' | null;
 }
 
 interface FakeNode {
   id: string;
   rssi: number;
+  serviceUuid: number;
   serviceData: Buffer | null;
+  gattProfile: GattProfile;
   advertising: boolean;
   connectBehavior: AttemptBehavior;
   discoverBehavior: AttemptBehavior;
@@ -116,6 +175,7 @@ interface FakeNode {
   dropWrites: boolean;
   writeBehavior: WriteBehavior;
   missingCharacteristic: 'dataIn' | 'dataOut' | null;
+  autoResponder: AutoResponder | null;
 }
 
 /**
@@ -152,6 +212,27 @@ interface FakeCharacteristicHandle {
   readonly serviceUuid: number;
   readonly characteristicUuid: number;
 }
+
+/**
+ * ADDED FOR TASK 6 (pairing): a node's canned reply to one `write()` on its
+ * Data In characteristic, if any — `undefined`/no return means no reply for
+ * THIS write (modelling, e.g., one segment of a multi-segment request,
+ * which a real node never acknowledges individually). Delivered
+ * SYNCHRONOUSLY, inside `write()` itself, before its own returned promise
+ * resolves — this models a real node answering a request with a
+ * notification shortly afterwards without this fixture needing a second,
+ * separately-timed call the way `simulateNotification` requires; a test
+ * that instead wants to control exactly when a reply lands (to pin a race)
+ * should keep using `simulateNotification` directly, which this does not
+ * replace. Takes the written bytes and the characteristic written to,
+ * mirroring the shape `writesReceived` already records, so a responder can
+ * build a real, stateful fake peer (see `drivers/light/__tests__/
+ * pairing.test.ts`, which drives the real provisioning state machine and
+ * real config exchange this way, keyed on how many writes it has seen
+ * rather than on their contents, which the published sample fixtures this
+ * project already trusts for `machine.ts` make exact).
+ */
+export type AutoResponder = (data: Buffer, characteristicUuid: number) => Buffer[] | undefined;
 
 function deriveServiceData(networkKey: Buffer): Buffer {
   // Table 7.11: Identification Type (0x00 = Network ID type, Table 7.8)
@@ -216,7 +297,9 @@ export class FakeBluetoothPort implements BluetoothPort {
     this.nodes.set(config.id, {
       id: config.id,
       rssi: config.rssi,
+      serviceUuid: config.serviceUuid ?? MESH_PROXY_SERVICE_UUID,
       serviceData,
+      gattProfile: config.gattProfile ?? 'proxy',
       advertising: config.advertising ?? true,
       connectBehavior: config.connectBehavior ?? 'succeed',
       discoverBehavior: config.discoverBehavior ?? 'succeed',
@@ -224,7 +307,36 @@ export class FakeBluetoothPort implements BluetoothPort {
       dropWrites: config.dropWrites ?? false,
       writeBehavior: config.writeBehavior ?? 'succeed',
       missingCharacteristic: config.missingCharacteristic ?? null,
+      autoResponder: null,
     });
+  }
+
+  /** Sets (or, with `null`, clears) `id`'s auto-responder — see
+   *  `AutoResponder`'s own doc comment. Replacing a node's responder with a
+   *  new one is the normal way a test models the node's own behaviour
+   *  CHANGING mid-session (e.g. switching from answering provisioning
+   *  requests to answering configuration requests, once provisioning
+   *  completes) — each responder instance tracks its own state (such as a
+   *  write counter) in its own closure, so replacing it always starts that
+   *  state fresh. */
+  setAutoResponder(id: string, responder: AutoResponder | null): void {
+    this.node(id).autoResponder = responder;
+  }
+
+  /** Models a node completing provisioning: it stops being findable as an
+   *  unowned node and starts advertising OUR network's identity instead —
+   *  both halves at once, the way a real bulb's own transition from the
+   *  Mesh Provisioning Service to the Mesh Proxy Service is one event, not
+   *  two independently-timed ones. A test calls this between the
+   *  provisioning phase and the configuration phase of a pairing flow,
+   *  exactly where the real GATT bearer switches over (see
+   *  `drivers/light/pairing.ts`'s own module header for why pairing
+   *  reconnects rather than reusing one link across both phases). */
+  reconfigureAsProvisioned(id: string, networkKey: Buffer): void {
+    const node = this.node(id);
+    node.serviceUuid = MESH_PROXY_SERVICE_UUID;
+    node.serviceData = deriveServiceData(networkKey);
+    node.gattProfile = 'proxy';
   }
 
   removeNode(id: string): void {
@@ -323,13 +435,19 @@ export class FakeBluetoothPort implements BluetoothPort {
     }
   }
 
-  /** Simulates an inbound notification on `id`'s Mesh Proxy Data Out
-   *  characteristic. Throws if nothing is currently subscribed to it — a
-   *  misconfigured test, not a silently-dropped notification (that is
-   *  what `dropWrites` models for the opposite direction; nothing in this
-   *  fixture silently drops a configured notification). */
+  /** Simulates an inbound notification on `id`'s Data Out characteristic —
+   *  the Mesh Proxy one by default, or the Mesh Provisioning one when the
+   *  node is currently `gattProfile: 'provisioning'` (see the module
+   *  header's "TWO GATT PROFILES" note), matching whichever pair
+   *  `discover()` would return for it right now. Throws if nothing is
+   *  currently subscribed to it — a misconfigured test, not a
+   *  silently-dropped notification (that is what `dropWrites` models for
+   *  the opposite direction; nothing in this fixture silently drops a
+   *  configured notification). */
   simulateNotification(id: string, data: Buffer): void {
-    const key = notifyKey(id, MESH_PROXY_DATA_OUT_UUID);
+    const node = this.node(id);
+    const dataOutUuid = node.gattProfile === 'provisioning' ? MESH_PROVISIONING_DATA_OUT_UUID : MESH_PROXY_DATA_OUT_UUID;
+    const key = notifyKey(id, dataOutUuid);
     const callback = this.notifyCallbacks.get(key);
     if (!callback) {
       throw new Error(`FakeBluetoothPort.simulateNotification: "${id}" has no active Data Out subscription`);
@@ -363,7 +481,7 @@ export class FakeBluetoothPort implements BluetoothPort {
       results.push({
         peripheralId: node.id,
         rssi: node.rssi,
-        proxyServiceData: node.serviceData === null ? null : Buffer.from(node.serviceData),
+        serviceData: node.serviceData === null ? [] : [{ serviceUuid: node.serviceUuid, data: Buffer.from(node.serviceData) }],
       });
     }
     return results;
@@ -392,19 +510,22 @@ export class FakeBluetoothPort implements BluetoothPort {
     if (node.discoverBehavior === 'fail') {
       throw new Error(`FakeBluetoothPort.discover: configured to fail for "${peripheralId}"`);
     }
+    const serviceUuid = node.gattProfile === 'provisioning' ? MESH_PROVISIONING_SERVICE_UUID : MESH_PROXY_SERVICE_UUID;
+    const dataInUuid = node.gattProfile === 'provisioning' ? MESH_PROVISIONING_DATA_IN_UUID : MESH_PROXY_DATA_IN_UUID;
+    const dataOutUuid = node.gattProfile === 'provisioning' ? MESH_PROVISIONING_DATA_OUT_UUID : MESH_PROXY_DATA_OUT_UUID;
     const characteristics: DiscoveredCharacteristic[] = [];
     if (node.missingCharacteristic !== 'dataIn') {
-      characteristics.push(this.characteristic(peripheralId, MESH_PROXY_DATA_IN_UUID));
+      characteristics.push(this.characteristic(peripheralId, serviceUuid, dataInUuid));
     }
     if (node.missingCharacteristic !== 'dataOut') {
-      characteristics.push(this.characteristic(peripheralId, MESH_PROXY_DATA_OUT_UUID));
+      characteristics.push(this.characteristic(peripheralId, serviceUuid, dataOutUuid));
     }
     return characteristics;
   }
 
-  private characteristic(peripheralId: string, characteristicUuid: number): DiscoveredCharacteristic {
-    const handle: FakeCharacteristicHandle = { peripheralId, serviceUuid: MESH_PROXY_SERVICE_UUID, characteristicUuid };
-    return { serviceUuid: MESH_PROXY_SERVICE_UUID, characteristicUuid, handle };
+  private characteristic(peripheralId: string, serviceUuid: number, characteristicUuid: number): DiscoveredCharacteristic {
+    const handle: FakeCharacteristicHandle = { peripheralId, serviceUuid, characteristicUuid };
+    return { serviceUuid, characteristicUuid, handle };
   }
 
   private requireConnectedCharacteristic(characteristic: CharacteristicHandle): FakeCharacteristicHandle {
@@ -463,6 +584,24 @@ export class FakeBluetoothPort implements BluetoothPort {
         held.push({ resolve, reject });
         this.heldWrites.set(handle.peripheralId, held);
       });
+    }
+    if (node.autoResponder) {
+      // Captured from `handle` BEFORE calling the responder, not read from
+      // `node.gattProfile` afterwards: a responder is allowed to flip the
+      // node's profile as a side effect of answering (exactly what models a
+      // node completing provisioning — see `AutoResponder`'s own doc
+      // comment and `reconfigureAsProvisioned`). Reading `node.gattProfile`
+      // AFTER that call would then route THIS reply to the NEW profile's
+      // Data Out — the wrong one, since this write (and so this reply)
+      // belongs to whichever service `handle` itself was discovered under.
+      const dataOutUuid = handle.serviceUuid === MESH_PROVISIONING_SERVICE_UUID ? MESH_PROVISIONING_DATA_OUT_UUID : MESH_PROXY_DATA_OUT_UUID;
+      const replies = node.autoResponder(Buffer.from(data), handle.characteristicUuid);
+      if (replies && replies.length > 0) {
+        const callback = this.notifyCallbacks.get(notifyKey(handle.peripheralId, dataOutUuid));
+        if (callback) {
+          for (const reply of replies) callback(Buffer.from(reply));
+        }
+      }
     }
   }
 

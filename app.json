@@ -21,5 +21,42 @@
   "images": {
     "small": "/assets/images/small.png",
     "large": "/assets/images/large.png"
-  }
+  },
+  "drivers": [
+    {
+      "id": "light",
+      "name": {
+        "en": "Mesh Light"
+      },
+      "class": "light",
+      "capabilities": [
+        "onoff",
+        "dim",
+        "light_temperature",
+        "light_hue",
+        "light_saturation",
+        "light_mode"
+      ],
+      "capabilitiesOptions": {
+        "light_mode": {
+          "preventInsights": true
+        }
+      },
+      "platforms": [
+        "local"
+      ],
+      "connectivity": [
+        "ble"
+      ],
+      "images": {
+        "small": "/drivers/light/assets/images/small.png",
+        "large": "/drivers/light/assets/images/large.png"
+      },
+      "pair": [
+        {
+          "id": "list_devices"
+        }
+      ]
+    }
+  ]
 }

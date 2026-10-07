@@ -75,10 +75,29 @@
  * project's OWN design, pinned by behavioural tests against the fakes, not
  * by anything the specification publishes. See connection.test.ts.
  *
- * NULLISH CONVENTION: `null` throughout, matching store.ts — a scan result
- * with no Mesh Proxy Service data is `proxyServiceData: null`, the manager's
+ * NULLISH CONVENTION: `null` throughout, matching store.ts — the manager's
  * reported `peripheralId` is `null` whenever `status` is not `'connected'`,
- * never `undefined` for either.
+ * never `undefined`. `ScanResult.serviceData` (below) follows the same
+ * "absent is empty, never a bare null/undefined" rule a `ReadonlyArray`
+ * already gives for free — a peripheral advertising no service data at all
+ * is simply an empty array, not a third spelling of "nothing here".
+ *
+ * SCAN RESULT SHAPE, GENERALISED (task 6 / pairing). This module used to
+ * give every `ScanResult` one `proxyServiceData: Buffer | null` field,
+ * hardcoded to the single service THIS module happens to care about. Task
+ * 6's pairing flow scans for a DIFFERENT service entirely (the Mesh
+ * Provisioning Service, `MESH_PROVISIONING_SERVICE_UUID` below) through the
+ * exact same `BluetoothPort.scan()`/`FakeBluetoothPort`, so one hardcoded
+ * field cannot serve both callers without one of them reading a field named
+ * after the OTHER'S service. `serviceData` below is the general shape
+ * instead — every Service Data entry a scan result advertised, keyed by
+ * service UUID, mirroring Homey's own real
+ * `BleAdvertisement.serviceData: {uuid, data}[]` (`@types/homey`'s
+ * `BleAdvertisement.d.ts`) rather than inventing a parallel shape this
+ * project would have to translate from scratch. `findServiceData` below is
+ * the one lookup helper both this module's own `isOurNetworkId` and
+ * `drivers/light/pairing.ts` use, rather than two call sites each
+ * re-deriving the same `.find(...)`.
  */
 
 import { k3 } from '../mesh/crypto/derive';
@@ -88,6 +107,21 @@ export const MESH_PROXY_SERVICE_UUID = 0x1828;
 // Assigned Numbers, Section 3.8.1 "Characteristics by Name".
 export const MESH_PROXY_DATA_IN_UUID = 0x2add;
 export const MESH_PROXY_DATA_OUT_UUID = 0x2ade;
+
+// Assigned Numbers, Section 3.4.1 "Services by Name": Mesh Provisioning
+// Service — the service an UNPROVISIONED node (no owner) advertises, unlike
+// Mesh Proxy Service above, which only a PROVISIONED node advertises.
+// Transcribed from the SAME fetch the three proxy constants above already
+// cite (version date 2026-10-05, 1,324,070 bytes) — re-fetched 2026-10-07
+// and re-extracted with `pdftotext -layout` for this task: "Mesh
+// Provisioning Service" appears on the identical page (67 of 446) as "Mesh
+// Proxy Service", one row above it in the same table.
+export const MESH_PROVISIONING_SERVICE_UUID = 0x1827;
+// Assigned Numbers, Section 3.8.1 "Characteristics by Name" — same
+// re-fetch/re-extraction as above; both appear on page 83 of 446, directly
+// above the two Mesh Proxy characteristics this module already cites.
+export const MESH_PROVISIONING_DATA_IN_UUID = 0x2adb;
+export const MESH_PROVISIONING_DATA_OUT_UUID = 0x2adc;
 
 // Table 7.8 "Identification Type values": 0x00 is the Network ID type: the
 // only one this module can check without a live connection (see the module
@@ -103,24 +137,45 @@ const NETWORK_ID_LENGTH = 8;
 // choice) rather than imported.
 const NET_KEY_LENGTH = 16;
 
+/** One Service Data advertising entry — the Service Data VALUE a peripheral
+ *  advertised for ONE service UUID (Table 7.7's envelope, Identification
+ *  Type followed by its parameters, for the Mesh Proxy/Provisioning
+ *  Services — opaque bytes for any other service this module never
+ *  interprets), with the UUID itself and the surrounding AD structure bytes
+ *  (AD Length, AD Type) already stripped. */
+export interface ServiceDataEntry {
+  readonly serviceUuid: number;
+  readonly data: Buffer;
+}
+
 /**
- * One BLE advertisement observed during a scan window. `proxyServiceData`
- * is exactly the Service Data VALUE this peripheral advertised for the Mesh
- * Proxy Service UUID (0x1828) — Table 7.7's envelope, Identification Type
- * followed by its parameters — with the UUID itself and the surrounding AD
- * structure bytes (AD Length, AD Type) already stripped, which is the shape
- * a real platform BLE scan API hands back (it keys service data by UUID
- * already); `null` when this advertisement carried no Mesh Proxy Service
- * data at all, which is most advertisements from devices that are not mesh
- * nodes and is exactly as "not ours" as any other identification this
- * module cannot recognise.
+ * One BLE advertisement observed during a scan window. `serviceData` is
+ * every Service Data entry this peripheral advertised, keyed by service
+ * UUID — the shape a real platform BLE scan API hands back (Homey's own
+ * `BleAdvertisement.serviceData` is exactly `{uuid, data}[]`, see the module
+ * header's SCAN RESULT SHAPE note), general enough for every caller of
+ * `scan()` to look up the ONE service UUID it cares about
+ * (`findServiceData` below) without this interface hardcoding which
+ * service that is. An advertisement carrying no service data at all is
+ * simply an empty array — see the module header's NULLISH CONVENTION note.
  */
 export interface ScanResult {
   readonly peripheralId: string;
   /** Received Signal Strength Indicator, in dBm. Less negative is stronger
    *  (e.g. -40 is a stronger signal than -70). */
   readonly rssi: number;
-  readonly proxyServiceData: Buffer | null;
+  readonly serviceData: ReadonlyArray<ServiceDataEntry>;
+}
+
+/** Looks up ONE service's Service Data value in a scan result, or `null` if
+ *  the advertisement carried none for that service UUID — the one place
+ *  this lookup is written, shared by this module's own `isOurNetworkId` and
+ *  by `drivers/light/pairing.ts` (which looks up
+ *  `MESH_PROVISIONING_SERVICE_UUID` instead of this module's
+ *  `MESH_PROXY_SERVICE_UUID`). */
+export function findServiceData(result: ScanResult, serviceUuid: number): Buffer | null {
+  const entry = result.serviceData.find((candidate) => candidate.serviceUuid === serviceUuid);
+  return entry === undefined ? null : entry.data;
 }
 
 /** Opaque handle to an open GATT connection, returned by `connect` and
@@ -465,7 +520,7 @@ export class ProxyConnectionManager {
   private selectStrongestOurs(results: ScanResult[]): ScanResult | null {
     let best: ScanResult | null = null;
     for (const result of results) {
-      if (!this.isOurNetworkId(result.proxyServiceData)) continue;
+      if (!this.isOurNetworkId(findServiceData(result, MESH_PROXY_SERVICE_UUID))) continue;
       if (best === null || result.rssi > best.rssi) {
         best = result;
       }
