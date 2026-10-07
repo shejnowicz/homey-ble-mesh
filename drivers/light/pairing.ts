@@ -4,8 +4,10 @@ import {
   encodeProxyPdus,
   PROXY_MESSAGE_TYPE_NETWORK_PDU,
   PROXY_MESSAGE_TYPE_PROVISIONING_PDU,
+  PROXY_SAR_TIMEOUT_MS,
   type ProxyReassemblyState,
 } from '../../lib/mesh/packet/proxyPdu';
+import { withTimeout } from '../../lib/adapter/timeout';
 import {
   MAX_PROXY_PDU_LENGTH,
   MESH_PROVISIONING_DATA_IN_UUID,
@@ -255,36 +257,6 @@ export function createRealClock(): ClockPort {
     setTimeout: (callback: () => void, delayMs: number): TimerHandle => setTimeout(callback, delayMs),
     clearTimeout: (handle: TimerHandle): void => clearTimeout(handle as ReturnType<typeof setTimeout>),
   };
-}
-
-/** Races `promise` against a `clock`-driven timer; rejects with an error
- *  naming `what` if `timeoutMs` elapses first. Whichever settles first wins
- *  cleanly — the loser's own eventual settlement (a late reply arriving
- *  after a timeout, or the timer that never gets to fire because the reply
- *  arrived first) is a no-op, never a second resolve/reject. */
-function withTimeout<T>(promise: Promise<T>, clock: ClockPort, timeoutMs: number, what: string): Promise<T> {
-  return new Promise<T>((resolve, reject) => {
-    let settled = false;
-    const timer = clock.setTimeout(() => {
-      if (settled) return;
-      settled = true;
-      reject(new Error(`${what}: no reply from the node within ${timeoutMs}ms`));
-    }, timeoutMs);
-    promise.then(
-      (value) => {
-        if (settled) return;
-        settled = true;
-        clock.clearTimeout(timer);
-        resolve(value);
-      },
-      (err: unknown) => {
-        if (settled) return;
-        settled = true;
-        clock.clearTimeout(timer);
-        reject(err instanceof Error ? err : new Error(String(err)));
-      },
-    );
-  });
 }
 
 // ===========================================================================
