@@ -1,5 +1,6 @@
 import {
   pairNode,
+  pairNodes,
   scanForUnprovisionedNodes,
   connectForProvisioning,
   parseBleUuid,
@@ -8,7 +9,9 @@ import {
   filterKnownServiceData,
   filterKnownCharacteristics,
   DEFAULT_PAIRING_STEP_TIMEOUT_MS,
+  type MultiPairingProgress,
   type PairingDeps,
+  type PairingOutcome,
   type ProvisioningRandomSource,
 } from '../pairing';
 import { NetworkStore, type SettingsPort } from '../../../lib/adapter/store';
@@ -1829,5 +1832,333 @@ describe('the Proxy PDU Client rules apply to this session too (final re-review,
 
     await session.disconnect();
     expect(clock.pendingCount()).toBe(0);
+  });
+});
+
+// ===========================================================================
+// THE CAPABILITY PROBE, end to end through the real pairing flow — the
+// hardware round's own measurement, driven here against a fake node that
+// behaves the way the owner's bulb actually does.
+//
+// `modelProbe.test.ts` enumerates node BEHAVIOURS against the narrow
+// transport seam; these tests prove the probe is wired into the real
+// sequence at all: after the AppKey binds, over the application key, with
+// its result reaching both the store and the device's capabilities.
+// ===========================================================================
+
+/** A composition declaring every lighting model this project probes — the
+ *  published sample declares only Generic OnOff, which is not enough to show
+ *  one model being told apart from another. Header fields are all zero (this
+ *  test is about the probe, not composition.ts's own decoding, which has its
+ *  own tests); element 0 declares five SIG models. */
+const ALL_LIGHTING_MODELS_COMPOSITION = Buffer.from([
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // header
+  0x00, 0x00, 0x05, 0x00, // loc=0x0000, NumS=5, NumV=0
+  0x00, 0x10, // Generic OnOff Server
+  0x00, 0x13, // Light Lightness Server
+  0x03, 0x13, // Light CTL Server
+  0x06, 0x13, // Light CTL Temperature Server
+  0x07, 0x13, // Light HSL Server
+]);
+
+const ALL_MODELS_COMPOSITION_PAYLOAD = Buffer.concat([Buffer.from([0x02, 0x00]), ALL_LIGHTING_MODELS_COMPOSITION]);
+
+/**
+ * Short probe timings for the tests below, injected rather than waited on.
+ * The production numbers (1500 ms per probe, 9000 ms total) are pinned in
+ * `modelProbe.test.ts`; what matters here is only that the probe's own
+ * timeouts fire far inside the 30 s pairing step timeout, so a test
+ * exercising a silent model is measuring the probe rather than the stage
+ * bound around it.
+ */
+const PROBE_TEST_TIMING = { probeTimeoutMs: 100, probeBudgetMs: 3000 };
+
+/**
+ * Runs a pairing to completion while VIRTUAL TIME moves, which a silent
+ * capability probe needs and nothing before it did.
+ *
+ * Every earlier wait in this file resolves because something ANSWERS; the
+ * probe's does not — its negative result IS a timeout, and a `FakeClock`
+ * fires no timer until a test advances it. So a test exercising a node that
+ * stays silent for one model has to drive the clock alongside the pairing
+ * rather than simply awaiting it.
+ *
+ * THE MACROTASK DRAIN IS NOT DECORATION. `FakeClock.advance` yields a full
+ * macrotask after each timer it FIRES, but returns almost immediately when
+ * nothing is due — so a bare `advance` loop lets the pairing's own promise
+ * chain progress by only a tick or two per iteration, and a pairing that
+ * needs dozens of GATT round trips crawls (measured: one write per seven
+ * virtual seconds, never finishing). Draining first, advancing second, is
+ * what makes each iteration mean "let everything that can happen happen,
+ * then release the next timeout."
+ */
+async function pairWhileAdvancing(deps: PairingDeps, peripheralId: string, clock: FakeClock): Promise<PairingOutcome> {
+  let settled = false;
+  const pairing = pairNode({ ...deps, ...PROBE_TEST_TIMING }, peripheralId).finally(() => {
+    settled = true;
+  });
+  for (let step = 0; step < 200 && !settled; step++) {
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    if (settled) break;
+    await clock.advance(PROBE_TEST_TIMING.probeTimeoutMs);
+  }
+  return pairing;
+}
+
+describe('the capability probe, through a real pairing', () => {
+  test("THE OWNER'S OWN BULB: declares both colour-temperature models, answers only 0x8264 — and keeps light_temperature", async () => {
+    const { bluetooth, store, clock, deps } = setUp();
+    addUnprovisionedNode(bluetooth, 'tuya-cct', -50);
+    installSuccessfulNodeBehaviour(bluetooth, 'tuya-cct', 1, 2, {
+      compositionAccessPayload: ALL_MODELS_COMPOSITION_PAYLOAD,
+      silentModels: ['lightCtl'],
+    });
+
+    const outcome = await pairWhileAdvancing(deps, 'tuya-cct', clock);
+
+    expect(outcome.kind).toBe('paired');
+    if (outcome.kind !== 'paired') return;
+    const probe = store.getState().nodes[0]?.probe;
+    expect(probe?.models).toEqual({
+      genericOnOff: 'supported',
+      lightLightness: 'supported',
+      // Declared, bound, written to — and silent. Measured, not assumed.
+      lightCtl: 'unsupported',
+      lightCtlTemperature: 'supported',
+      lightHsl: 'supported',
+    });
+    // The lamp can plainly change colour temperature, so the capability
+    // stays even though one of the two declared models is a lie.
+    expect(outcome.device.capabilities).toContain('light_temperature');
+  });
+
+  test('a node that answers NEITHER colour-temperature model loses light_temperature, and light_mode with it', async () => {
+    const { bluetooth, store, clock, deps } = setUp();
+    addUnprovisionedNode(bluetooth, 'no-cct', -50);
+    installSuccessfulNodeBehaviour(bluetooth, 'no-cct', 1, 2, {
+      compositionAccessPayload: ALL_MODELS_COMPOSITION_PAYLOAD,
+      silentModels: ['lightCtl', 'lightCtlTemperature'],
+    });
+
+    const outcome = await pairWhileAdvancing(deps, 'no-cct', clock);
+
+    expect(outcome.kind).toBe('paired');
+    if (outcome.kind !== 'paired') return;
+    expect(outcome.device.capabilities).not.toContain('light_temperature');
+    expect(outcome.device.capabilities).not.toContain('light_mode');
+    // ...and the models it DID answer are untouched.
+    expect(outcome.device.capabilities).toEqual(['onoff', 'dim', 'light_hue', 'light_saturation']);
+    expect(store.getState().nodes[0]?.probe?.models.lightCtlTemperature).toBe('unsupported');
+  });
+
+  test('the probe leaves the lamp exactly as it found it — every write is the value its own read returned', async () => {
+    const { bluetooth, clock, deps } = setUp();
+    addUnprovisionedNode(bluetooth, 'untouched', -50);
+    installSuccessfulNodeBehaviour(bluetooth, 'untouched', 1, 2, {
+      compositionAccessPayload: ALL_MODELS_COMPOSITION_PAYLOAD,
+    });
+    // The fake lamp's starting state, written out rather than snapshotted:
+    // the responder (and with it the lamp) only comes into existence once
+    // provisioning completes, so there is nothing to snapshot beforehand —
+    // and a literal is the stronger assertion anyway, since it cannot be
+    // satisfied by an empty object.
+    const untouched = { onOff: 0x01, lightness: 0x8000, temperature: 4500, deltaUv: 0x0000, hue: 0x4000, saturation: 0x2000 };
+
+    await pairWhileAdvancing(deps, 'untouched', clock);
+
+    expect(lampStateByPeripheral.get('untouched')).toEqual(untouched);
+  });
+
+  test("a node that reports its colour-temperature range has it stored, and seeds the device's own settings", async () => {
+    const { bluetooth, store, deps } = setUp();
+    addUnprovisionedNode(bluetooth, 'reports-range', -50);
+    installSuccessfulNodeBehaviour(bluetooth, 'reports-range', 1, 2, {
+      compositionAccessPayload: ALL_MODELS_COMPOSITION_PAYLOAD,
+      temperatureRangeReply: { min: 2200, max: 6500 },
+    });
+
+    const outcome = await pairNode(deps, 'reports-range');
+
+    expect(outcome.kind).toBe('paired');
+    if (outcome.kind !== 'paired') return;
+    expect(store.getState().nodes[0]?.probe?.temperatureRange).toEqual({ minKelvin: 2200, maxKelvin: 6500 });
+    expect(outcome.device.settings).toEqual({ temperature_min_kelvin: 2200, temperature_max_kelvin: 6500 });
+  });
+
+  test("a node that never answers Range Get (the owner's own bulb) falls back to the documented default in its settings", async () => {
+    const { bluetooth, store, clock, deps } = setUp();
+    addUnprovisionedNode(bluetooth, 'silent-range', -50);
+    installSuccessfulNodeBehaviour(bluetooth, 'silent-range', 1, 2, {
+      compositionAccessPayload: ALL_MODELS_COMPOSITION_PAYLOAD,
+      temperatureRangeReply: 'silent',
+    });
+
+    const outcome = await pairWhileAdvancing(deps, 'silent-range', clock);
+
+    expect(outcome.kind).toBe('paired');
+    if (outcome.kind !== 'paired') return;
+    expect(store.getState().nodes[0]?.probe?.temperatureRange).toBeNull();
+    expect(outcome.device.settings).toEqual({ temperature_min_kelvin: 3000, temperature_max_kelvin: 6000 });
+  });
+
+  test("a node answering Table 6.8's own 0xFFFF \"unknown\" row is treated as having said nothing, not as a 65535 K bulb", async () => {
+    const { bluetooth, store, deps } = setUp();
+    addUnprovisionedNode(bluetooth, 'unknown-range', -50);
+    installSuccessfulNodeBehaviour(bluetooth, 'unknown-range', 1, 2, {
+      compositionAccessPayload: ALL_MODELS_COMPOSITION_PAYLOAD,
+      temperatureRangeReply: 'unknown',
+    });
+
+    const outcome = await pairNode(deps, 'unknown-range');
+
+    expect(outcome.kind).toBe('paired');
+    if (outcome.kind !== 'paired') return;
+    expect(store.getState().nodes[0]?.probe?.temperatureRange).toBeNull();
+    expect(outcome.device.settings).toEqual({ temperature_min_kelvin: 3000, temperature_max_kelvin: 6000 });
+  });
+});
+
+// ===========================================================================
+// pairNodes — several bulbs in one run of the pairing wizard.
+// ===========================================================================
+
+describe('pairNodes', () => {
+  test('pairs every selected bulb and gives each its own address, one after another', async () => {
+    // Three attempts need three RandomProvisioner values after the
+    // network's own two keys — see `FixedRandomSource`.
+    const { bluetooth, store, deps } = setUp([TEST_NET_KEY, TEST_APP_KEY, KAT_RANDOM_PROVISIONER, KAT_RANDOM_PROVISIONER, KAT_RANDOM_PROVISIONER]);
+    for (const [index, id] of ['bulb-1', 'bulb-2', 'bulb-3'].entries()) {
+      addUnprovisionedNode(bluetooth, id, -50 - index);
+      installSuccessfulNodeBehaviour(bluetooth, id, 1, 2 + index);
+    }
+
+    const result = await pairNodes(deps, ['bulb-1', 'bulb-2', 'bulb-3']);
+
+    expect(result.entries.map((e) => e.outcome.kind)).toEqual(['paired', 'paired', 'paired']);
+    expect(result.paired).toHaveLength(3);
+    // THE DISCRIMINATING ASSERTION for the one shared store: three distinct,
+    // consecutive addresses. A loop that cached state across iterations
+    // would reissue the first one.
+    expect(result.paired.map((d) => d.data.id)).toEqual(['2', '3', '4']);
+    expect(store.getState().nodes.map((n) => n.address)).toEqual([2, 3, 4]);
+    expect(store.getState().nextUnicastAddress).toBe(5);
+  });
+
+  test('ONE AT A TIME: the next bulb is not even connected to until the previous one has finished', async () => {
+    const { bluetooth, deps } = setUp();
+    for (const [index, id] of ['bulb-1', 'bulb-2'].entries()) {
+      addUnprovisionedNode(bluetooth, id, -50 - index);
+      installSuccessfulNodeBehaviour(bluetooth, id, 1, 2 + index);
+    }
+
+    await pairNodes(deps, ['bulb-1', 'bulb-2']);
+
+    // Every write to bulb-2 comes after every write to bulb-1 — i.e. the
+    // two attempts never interleave. Two simultaneous GATT connections from
+    // one Homey radio are unverified (app.ts's own note), and a
+    // `Promise.all` here would be a correctness bug, not a speed-up.
+    const order = bluetooth.writesReceived.map((w) => w.peripheralId);
+    expect(order.lastIndexOf('bulb-1')).toBeLessThan(order.indexOf('bulb-2'));
+  });
+
+  test('ONE FAILURE DOES NOT ABANDON THE REST: the bulbs after it are still paired, and the failure is named', async () => {
+    const { bluetooth, store, deps } = setUp([TEST_NET_KEY, TEST_APP_KEY, KAT_RANDOM_PROVISIONER, KAT_RANDOM_PROVISIONER, KAT_RANDOM_PROVISIONER]);
+    addUnprovisionedNode(bluetooth, 'good-1', -50);
+    addUnprovisionedNode(bluetooth, 'refuses', -51);
+    addUnprovisionedNode(bluetooth, 'good-2', -52);
+    installSuccessfulNodeBehaviour(bluetooth, 'good-1', 1, 2);
+    // Address 3 is consumed by the failed attempt and never reclaimed
+    // (store.ts's own deliberate rule), so the third bulb gets 4.
+    installSuccessfulNodeBehaviour(bluetooth, 'refuses', 1, 3, { appKeyStatus: 0x01 });
+    installSuccessfulNodeBehaviour(bluetooth, 'good-2', 1, 4);
+
+    const result = await pairNodes(deps, ['good-1', 'refuses', 'good-2']);
+
+    expect(result.entries.map((e) => e.outcome.kind)).toEqual(['paired', 'failed', 'paired']);
+    expect(result.paired.map((d) => d.data.id)).toEqual(['2', '4']);
+    const failure = result.entries[1]!;
+    expect(failure.peripheralId).toBe('refuses');
+    if (failure.outcome.kind !== 'failed') throw new Error('test fixture error: expected a failure');
+    expect(failure.outcome.message).toContain('Config AppKey Add was refused');
+    // A partial result is a success for the bulbs that worked: both are in
+    // the store, with their own entries.
+    expect(store.getState().nodes.map((n) => n.address)).toEqual([2, 4]);
+  });
+
+  test('a bulb that is not there at all fails on its own and costs the others nothing', async () => {
+    const { bluetooth, deps } = setUp();
+    addUnprovisionedNode(bluetooth, 'present', -50);
+    // Address 2, not 3: the missing bulb fails while CONNECTING, before
+    // anything allocates an address, so it consumes none.
+    installSuccessfulNodeBehaviour(bluetooth, 'present', 1, 2);
+
+    const result = await pairNodes(deps, ['missing', 'present']);
+
+    expect(result.entries[0]?.outcome.kind).toBe('failed');
+    expect(result.entries[1]?.outcome.kind).toBe('paired');
+    expect(result.paired).toHaveLength(1);
+  });
+
+  test('reports progress before and after each bulb, in order, so a long run is not a frozen screen', async () => {
+    const { bluetooth, deps } = setUp();
+    for (const [index, id] of ['bulb-1', 'bulb-2'].entries()) {
+      addUnprovisionedNode(bluetooth, id, -50 - index);
+      installSuccessfulNodeBehaviour(bluetooth, id, 1, 2 + index);
+    }
+
+    const progress: MultiPairingProgress[] = [];
+    await pairNodes(deps, ['bulb-1', 'bulb-2'], (p) => progress.push(p));
+
+    expect(progress.map((p) => `${p.phase}:${p.peripheralId}`)).toEqual([
+      'start:bulb-1',
+      'done:bulb-1',
+      'start:bulb-2',
+      'done:bulb-2',
+    ]);
+    expect(progress.every((p) => p.total === 2)).toBe(true);
+    expect(progress.map((p) => p.index)).toEqual([0, 0, 1, 1]);
+    const last = progress[3]!;
+    if (last.phase !== 'done') throw new Error('test fixture error: expected a done event');
+    expect(last.outcome.kind).toBe('paired');
+  });
+
+  test('a progress listener that throws does not take the run down with it', async () => {
+    const { bluetooth, deps } = setUp();
+    addUnprovisionedNode(bluetooth, 'bulb-1', -50);
+    installSuccessfulNodeBehaviour(bluetooth, 'bulb-1', 1, 2);
+
+    const result = await pairNodes(deps, ['bulb-1'], () => {
+      throw new Error('the pairing view blew up');
+    });
+
+    expect(result.paired).toHaveLength(1);
+  });
+
+  test('the same bulb selected twice is paired once — never consuming two addresses for one node', async () => {
+    const { bluetooth, store, deps } = setUp();
+    addUnprovisionedNode(bluetooth, 'bulb-1', -50);
+    installSuccessfulNodeBehaviour(bluetooth, 'bulb-1', 1, 2);
+
+    const result = await pairNodes(deps, ['bulb-1', 'bulb-1']);
+
+    expect(result.entries).toHaveLength(1);
+    expect(store.getState().nodes).toHaveLength(1);
+    expect(store.getState().nextUnicastAddress).toBe(3);
+  });
+
+  test('an empty selection is an empty result, not an error', async () => {
+    const { deps } = setUp();
+    await expect(pairNodes(deps, [])).resolves.toEqual({ entries: [], paired: [] });
+  });
+
+  test('the single-bulb path still works, unchanged, alongside the multi-bulb one', async () => {
+    const { bluetooth, store, deps } = setUp();
+    addUnprovisionedNode(bluetooth, 'bulb-1', -50);
+    installSuccessfulNodeBehaviour(bluetooth, 'bulb-1', 1, 2);
+
+    const outcome = await pairNode(deps, 'bulb-1');
+
+    expect(outcome.kind).toBe('paired');
+    expect(store.getState().nodes).toHaveLength(1);
   });
 });

@@ -80,12 +80,15 @@ import {
 } from '../../lib/adapter/connection';
 import {
   pairNode,
+  pairNodes,
   scanForUnprovisionedNodes,
   createNodeCryptoRandomSource,
   createRealClock,
   bleUuidString,
   filterKnownServiceData,
   filterKnownCharacteristics,
+  type MultiPairingProgress,
+  type MultiPairingResult,
   type PairingDeps,
   type PairingOutcome,
   type UnprovisionedNodeCandidate,
@@ -134,17 +137,28 @@ class LightDriver extends Homey.Driver {
       return scanForUnprovisionedNodes(bluetooth);
     });
 
-    session.setHandler('pair_node', async (data: { peripheralId: string }): Promise<PairingOutcome> => {
-      // See app.ts's own "PAIRING PAUSES THE SHARED CONNECTION" note: from
-      // the second bulb onward this app would otherwise hold two
-      // simultaneous GATT connections (the proxy, plus this attempt's own)
-      // from the same Homey radio. A no-op, returning `false`, on the
-      // FIRST-ever pairing (nothing running yet to pause) — `wasRunning`
-      // below is what tells this handler not to call `resumeMeshAfterPairing`
-      // in that case, leaving `ensureMeshStarted` as the only thing that
-      // starts the connection the very first time.
+    // THE MESH IS PAUSED ONCE AROUND THE WHOLE RUN, not once per bulb — see
+    // app.ts's own "PAIRING PAUSES THE SHARED CONNECTION" note. From the
+    // second bulb onward this app would otherwise hold two simultaneous
+    // GATT connections (the proxy, plus this attempt's own) from the same
+    // Homey radio. A no-op, returning `false`, on the FIRST-ever pairing
+    // (nothing running yet to pause) — `wasRunning` is what tells this
+    // handler not to call `resumeMeshAfterPairing` in that case, leaving
+    // `ensureMeshStarted` as the only thing that starts the connection the
+    // very first time. Wrapping the WHOLE multi-bulb run rather than each
+    // bulb also avoids restarting the shared connection between bulbs only
+    // to stop it again a moment later.
+    const withMeshPaused = async <T>(run: () => Promise<T>): Promise<T> => {
       const wasRunning = host.pauseMeshForPairing();
       try {
+        return await run();
+      } finally {
+        if (wasRunning) host.resumeMeshAfterPairing();
+      }
+    };
+
+    session.setHandler('pair_node', async (data: { peripheralId: string }): Promise<PairingOutcome> =>
+      withMeshPaused(async () => {
         const outcome = await pairNode(deps, data.peripheralId);
         if (outcome.kind === 'paired') {
           // First-ever pairing is what creates the network (ensureNetworkInitialized,
@@ -154,10 +168,29 @@ class LightDriver extends Homey.Driver {
           host.ensureMeshStarted();
         }
         return outcome;
-      } finally {
-        if (wasRunning) host.resumeMeshAfterPairing();
-      }
-    });
+      }),
+    );
+
+    // Several bulbs in one run. The single-bulb handler above stays, and
+    // stays working: it is what the view falls back to, and what any other
+    // caller already uses. `pairing.ts#pairNodes` owns the sequencing and
+    // the keep-going-after-a-failure rule; this handler only relays progress
+    // to the view and tells app.ts to start the mesh once anything succeeded.
+    session.setHandler('pair_nodes', async (data: { peripheralIds: string[] }): Promise<MultiPairingResult> =>
+      withMeshPaused(async () => {
+        const result = await pairNodes(deps, data.peripheralIds ?? [], (progress: MultiPairingProgress) => {
+          // Fire-and-forget: `emit` is how a Homey pairing session pushes to
+          // its view, and a view that has already navigated away simply is
+          // not listening. A failure to tell it must never abandon the
+          // bulbs still waiting to be paired.
+          session.emit('pair_progress', progress).catch(() => {
+            // Nothing to do — see above.
+          });
+        });
+        if (result.paired.length > 0) host.ensureMeshStarted();
+        return result;
+      }),
+    );
   }
 }
 

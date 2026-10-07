@@ -1,4 +1,10 @@
-import { mapCompositionToCapabilities } from '../capabilities';
+import {
+  mapCompositionToCapabilities,
+  chooseTemperatureWriteModel,
+  probeVerdict,
+  LIGHTING_SERVER_MODEL_IDS,
+  type NodeProbeResult,
+} from '../capabilities';
 import { CompositionData, ElementDescription, VendorModelId } from '../../mesh/config/composition';
 
 /**
@@ -13,6 +19,10 @@ import { CompositionData, ElementDescription, VendorModelId } from '../../mesh/c
 const GENERIC_ONOFF_SERVER = 0x1000;
 const LIGHT_LIGHTNESS_SERVER = 0x1300;
 const LIGHT_CTL_SERVER = 0x1303;
+// The fifth row of the design table, added in the hardware round: a
+// SEPARATE model from Light CTL Server, and the one that answers the
+// message the owner's bulb actually obeys (Mesh Model Section 6.4.4).
+const LIGHT_CTL_TEMPERATURE_SERVER = 0x1306;
 const LIGHT_HSL_SERVER = 0x1307;
 
 // Two real, but deliberately NON-matching, SIG Model IDs - used to prove
@@ -226,5 +236,171 @@ describe('mapCompositionToCapabilities', () => {
         { capability: 'dim', elementIndex: 2 },
       ]);
     });
+  });
+});
+
+// ===========================================================================
+// THE MEASUREMENT OVERRIDES THE DECLARATION (hardware round). A node's
+// composition data is its own claim about itself, and the owner's bulb
+// proved one can be false: it declares a Light CTL Server and answers no
+// Light CTL Set at all.
+// ===========================================================================
+
+/** Every model probed and found working — the baseline a test varies one row of. */
+const ALL_SUPPORTED: NodeProbeResult = {
+  models: {
+    genericOnOff: 'supported',
+    lightLightness: 'supported',
+    lightCtl: 'supported',
+    lightCtlTemperature: 'supported',
+    lightHsl: 'supported',
+  },
+  temperatureRange: null,
+};
+
+function capabilitiesOf(result: ReturnType<typeof mapCompositionToCapabilities>): string[] {
+  return result.map((assignment) => assignment.capability);
+}
+
+describe('mapCompositionToCapabilities with a probe result', () => {
+  test('Light CTL Temperature Server (0x1306) alone earns light_temperature, exactly as Light CTL Server does', () => {
+    expect(capabilitiesOf(mapCompositionToCapabilities(composition([element([LIGHT_CTL_TEMPERATURE_SERVER])])))).toEqual([
+      'light_temperature',
+    ]);
+  });
+
+  test("THE OWNER'S OWN BULB: declares both colour-temperature models, answers only 0x8264, and KEEPS light_temperature", () => {
+    // The case that matters most: the lamp plainly can change colour
+    // temperature, so dropping the capability because one of the two
+    // declared models is a lie would be the wrong answer.
+    const probe: NodeProbeResult = {
+      models: { ...ALL_SUPPORTED.models, lightCtl: 'unsupported' },
+      temperatureRange: null,
+    };
+    const result = mapCompositionToCapabilities(
+      composition([element([GENERIC_ONOFF_SERVER, LIGHT_LIGHTNESS_SERVER, LIGHT_CTL_SERVER, LIGHT_CTL_TEMPERATURE_SERVER, LIGHT_HSL_SERVER])]),
+      probe,
+    );
+    expect(capabilitiesOf(result)).toContain('light_temperature');
+    // ...and everything else is untouched by that one model's failure.
+    expect(capabilitiesOf(result)).toEqual(['onoff', 'dim', 'light_temperature', 'light_hue', 'light_saturation', 'light_mode']);
+  });
+
+  test('light_temperature is dropped only when BOTH declared colour-temperature models were measured unsupported', () => {
+    const probe: NodeProbeResult = {
+      models: { ...ALL_SUPPORTED.models, lightCtl: 'unsupported', lightCtlTemperature: 'unsupported' },
+      temperatureRange: null,
+    };
+    const result = mapCompositionToCapabilities(
+      composition([element([LIGHT_CTL_SERVER, LIGHT_CTL_TEMPERATURE_SERVER, LIGHT_HSL_SERVER])]),
+      probe,
+    );
+    expect(capabilitiesOf(result)).not.toContain('light_temperature');
+    // ...and light_mode goes with it, since it only exists alongside both
+    // colour models.
+    expect(capabilitiesOf(result)).toEqual(['light_hue', 'light_saturation']);
+  });
+
+  test('a measured-unsupported Generic OnOff or Light Lightness loses its own capability and nothing else', () => {
+    const probe: NodeProbeResult = {
+      models: { ...ALL_SUPPORTED.models, genericOnOff: 'unsupported', lightLightness: 'unsupported' },
+      temperatureRange: null,
+    };
+    const result = mapCompositionToCapabilities(
+      composition([element([GENERIC_ONOFF_SERVER, LIGHT_LIGHTNESS_SERVER, LIGHT_CTL_SERVER])]),
+      probe,
+    );
+    expect(capabilitiesOf(result)).toEqual(['light_temperature']);
+  });
+
+  test('`unknown` NEVER removes anything — a node this app could not measure behaves exactly as it did before the probe existed', () => {
+    const declared = composition([
+      element([GENERIC_ONOFF_SERVER, LIGHT_LIGHTNESS_SERVER, LIGHT_CTL_SERVER, LIGHT_HSL_SERVER]),
+    ]);
+    const allUnknown: NodeProbeResult = {
+      models: { genericOnOff: 'unknown', lightLightness: 'unknown', lightCtl: 'unknown', lightCtlTemperature: 'unknown', lightHsl: 'unknown' },
+      temperatureRange: null,
+    };
+    // Byte for byte the same as no probe at all, and as an empty one.
+    expect(mapCompositionToCapabilities(declared, allUnknown)).toEqual(mapCompositionToCapabilities(declared));
+    expect(mapCompositionToCapabilities(declared, { models: {}, temperatureRange: null })).toEqual(
+      mapCompositionToCapabilities(declared),
+    );
+    expect(mapCompositionToCapabilities(declared, null)).toEqual(mapCompositionToCapabilities(declared));
+  });
+
+  test('the probe can only ever SUBTRACT: a model measured supported but never declared still earns nothing', () => {
+    const probe: NodeProbeResult = { models: { lightHsl: 'supported', lightCtl: 'supported' }, temperatureRange: null };
+    expect(capabilitiesOf(mapCompositionToCapabilities(composition([element([GENERIC_ONOFF_SERVER])]), probe))).toEqual(['onoff']);
+  });
+
+  test('HSL IS DELIBERATELY NOT PROBE-GATED: a measured-unsupported Light HSL keeps its capabilities', () => {
+    // A bulb with no colour emitters at all still answers Light HSL Set
+    // with a correct echo, so the probe's verdict on this model means less
+    // than it appears to - and the owner's planned per-device
+    // monocolor/multicolor/warm setting is where that actually gets
+    // resolved. Pinned so the asymmetry is a decision, not an oversight.
+    const probe: NodeProbeResult = { models: { lightHsl: 'unsupported' }, temperatureRange: null };
+    const result = mapCompositionToCapabilities(composition([element([LIGHT_HSL_SERVER])]), probe);
+    expect(capabilitiesOf(result)).toEqual(['light_hue', 'light_saturation']);
+  });
+
+  test('the probe is node-wide while the declaration stays per-element: a verdict does not move a capability between elements', () => {
+    const probe: NodeProbeResult = { models: { lightCtl: 'unsupported', lightCtlTemperature: 'unsupported' }, temperatureRange: null };
+    const result = mapCompositionToCapabilities(
+      composition([element([GENERIC_ONOFF_SERVER]), element([LIGHT_CTL_SERVER]), element([LIGHT_LIGHTNESS_SERVER])]),
+      probe,
+    );
+    expect(result).toEqual([
+      { capability: 'onoff', elementIndex: 0 },
+      { capability: 'dim', elementIndex: 2 },
+    ]);
+  });
+});
+
+describe('LIGHTING_SERVER_MODEL_IDS', () => {
+  test('binds the Light CTL Temperature Server too — without it the one message the owner\'s bulb obeys would never be accepted', () => {
+    // An application key is bound per MODEL. A Light CTL Temperature Server
+    // that was never bound would silently reject every Light CTL
+    // Temperature Set, which would look exactly like a bulb that does not
+    // implement the model at all.
+    expect([...LIGHTING_SERVER_MODEL_IDS]).toEqual([0x1000, 0x1300, 0x1303, 0x1306, 0x1307]);
+  });
+});
+
+describe('chooseTemperatureWriteModel', () => {
+  test('defaults to the Light CTL Temperature model when there is no measurement at all', () => {
+    expect(chooseTemperatureWriteModel(null)).toBe('lightCtlTemperature');
+    expect(chooseTemperatureWriteModel(undefined)).toBe('lightCtlTemperature');
+    expect(chooseTemperatureWriteModel({ models: {}, temperatureRange: null })).toBe('lightCtlTemperature');
+  });
+
+  test('moves off the default ONLY on a positive measurement both ways', () => {
+    expect(
+      chooseTemperatureWriteModel({ models: { lightCtlTemperature: 'unsupported', lightCtl: 'supported' }, temperatureRange: null }),
+    ).toBe('lightCtl');
+  });
+
+  test.each([
+    ['the Temperature model unsupported but the composite one merely unknown', { lightCtlTemperature: 'unsupported' as const }],
+    ['the Temperature model unsupported and the composite one ALSO unsupported', { lightCtlTemperature: 'unsupported' as const, lightCtl: 'unsupported' as const }],
+    ['both supported', { lightCtlTemperature: 'supported' as const, lightCtl: 'supported' as const }],
+    ['only the composite one supported, the Temperature one unknown', { lightCtl: 'supported' as const }],
+  ])('keeps the default when the measurement does not positively contradict it: %s', (_label, models) => {
+    expect(chooseTemperatureWriteModel({ models, temperatureRange: null })).toBe('lightCtlTemperature');
+  });
+});
+
+describe('probeVerdict', () => {
+  test('an absent entry, an absent probe and an explicit unknown all read as `unknown` — the conservative direction', () => {
+    expect(probeVerdict(null, 'lightCtl')).toBe('unknown');
+    expect(probeVerdict(undefined, 'lightCtl')).toBe('unknown');
+    expect(probeVerdict({ models: {}, temperatureRange: null }, 'lightCtl')).toBe('unknown');
+    expect(probeVerdict({ models: { lightCtl: 'unknown' }, temperatureRange: null }, 'lightCtl')).toBe('unknown');
+  });
+
+  test('a recorded verdict is returned as recorded', () => {
+    expect(probeVerdict({ models: { lightCtl: 'unsupported' }, temperatureRange: null }, 'lightCtl')).toBe('unsupported');
+    expect(probeVerdict(ALL_SUPPORTED, 'lightHsl')).toBe('supported');
   });
 });

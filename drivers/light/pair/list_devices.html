@@ -12,71 +12,224 @@
         border: 1px solid #ccc;
         border-radius: 8px;
         cursor: pointer;
+        display: flex;
+        align-items: center;
+        gap: 10px;
       }
       li.disabled { opacity: 0.5; cursor: default; }
+      li.selected { border-color: #0082fc; }
+      li .label { flex: 1; }
+      li .state { font-size: 12px; opacity: 0.75; white-space: nowrap; }
+      li .state.ok { color: #0a7d2c; }
+      li .state.bad { color: #b00020; }
+      .controls { display: flex; align-items: center; gap: 12px; margin-bottom: 12px; }
+      button { font: inherit; padding: 8px 14px; border-radius: 8px; border: 1px solid #0082fc; background: #0082fc; color: #fff; }
+      button.secondary { background: transparent; color: #0082fc; }
+      button[disabled] { opacity: 0.5; }
       #status { margin-top: 12px; }
       #error { color: #b00020; margin-top: 12px; white-space: pre-wrap; }
+      #summary { margin-top: 12px; white-space: pre-wrap; }
     </style>
   </head>
   <body>
-    <h1 data-i18n="pair.list_devices.title">Select a bulb to pair</h1>
+    <h1 data-i18n="pair.list_devices.title">Select the bulbs to pair</h1>
+    <div class="controls">
+      <button id="select-all" class="secondary" type="button">Select all</button>
+      <button id="pair" type="button" disabled>Pair selected</button>
+    </div>
     <div id="status">Scanning…</div>
     <ul id="devices"></ul>
+    <div id="summary"></div>
     <div id="error"></div>
 
     <script>
       // Design (docs/superpowers/specs/2026-10-06-ble-mesh-provisioner-
       // design.md, "Pairing"): list unprovisioned nodes with signal
-      // strength, then provision ONLY the one the user selects — never
+      // strength, then provision ONLY the ones the user selects — never
       // every node seen while scanning. This page is deliberately thin:
-      // 'list_devices' and 'pair_node' (drivers/light/driver.ts's own
-      // onPair handlers) do all the real work; this script only renders
-      // their results and reports a failed/unsupported outcome in place,
-      // per the design's "A failed provisioning ends with a clear message
-      // in the pairing wizard, leaves the node untouched and can be
-      // retried."
+      // 'list_devices', 'pair_node' and 'pair_nodes'
+      // (drivers/light/driver.ts's own onPair handlers) do all the real
+      // work; this script only renders their results and reports a
+      // failed/unsupported outcome in place, per the design's "A failed
+      // provisioning ends with a clear message in the pairing wizard,
+      // leaves the node untouched and can be retried."
+      //
+      // NO FRAMEWORK, DELIBERATELY: a Homey pairing view is a plain page
+      // with `Homey.emit`/`Homey.on`, so selection is a `Set` of peripheral
+      // ids and rendering is a loop. A tap toggles a row rather than
+      // immediately provisioning it; the explicit "Pair selected" button is
+      // what starts the run, so selecting several bulbs cannot be mistaken
+      // for pairing the first one touched.
+      //
+      // ONE BULB AT A TIME, AND NOT THIS PAGE'S CHOICE TO MAKE: the whole
+      // selection goes to 'pair_nodes' in ONE call, which pairs them
+      // sequentially on the driver side. This page never issues several
+      // 'pair_node' calls in parallel — two simultaneous GATT connections
+      // from one Homey radio are unverified (see app.ts's own "PAIRING
+      // PAUSES THE SHARED CONNECTION" note), and a view that fanned out
+      // would quietly undo that.
+      //
+      // A PARTIAL RESULT IS A SUCCESS: if three of five bulbs paired, those
+      // three are created and the run ends with a summary naming the two
+      // that did not and why. The failures stay on screen, still selected,
+      // so the user can simply press Pair again for a retry.
       const statusEl = document.getElementById('status');
       const listEl = document.getElementById('devices');
       const errorEl = document.getElementById('error');
-      let pairing = false;
+      const summaryEl = document.getElementById('summary');
+      const pairButton = document.getElementById('pair');
+      const selectAllButton = document.getElementById('select-all');
 
-      function renderDevices(candidates) {
+      let pairing = false;
+      let candidates = [];
+      const selected = new Set();
+      /** peripheralId -> short text shown on its own row during/after a run. */
+      const rowState = new Map();
+
+      function describeOutcome(outcome) {
+        if (!outcome) return { text: 'No result', ok: false };
+        if (outcome.kind === 'paired') return { text: 'Paired', ok: true };
+        if (outcome.kind === 'unsupported') return { text: `Cannot be paired: ${outcome.reason}`, ok: false };
+        return { text: `Failed: ${outcome.message}`, ok: false };
+      }
+
+      function render() {
         listEl.innerHTML = '';
         for (const candidate of candidates) {
           const li = document.createElement('li');
-          li.textContent = `${candidate.peripheralId} (${candidate.rssi} dBm)`;
-          li.addEventListener('click', () => onSelect(candidate, li));
+          li.className = [
+            selected.has(candidate.peripheralId) ? 'selected' : '',
+            pairing ? 'disabled' : '',
+          ]
+            .filter(Boolean)
+            .join(' ');
+
+          const box = document.createElement('input');
+          box.type = 'checkbox';
+          box.checked = selected.has(candidate.peripheralId);
+          box.disabled = pairing;
+
+          const label = document.createElement('span');
+          label.className = 'label';
+          label.textContent = `${candidate.peripheralId} (${candidate.rssi} dBm)`;
+
+          const state = document.createElement('span');
+          const current = rowState.get(candidate.peripheralId);
+          if (current) {
+            state.className = `state ${current.ok ? 'ok' : 'bad'}`;
+            state.textContent = current.text;
+          } else {
+            state.className = 'state';
+          }
+
+          li.appendChild(box);
+          li.appendChild(label);
+          li.appendChild(state);
+          // One handler on the row, so the checkbox and the text behave the
+          // same way — the checkbox's own click bubbles here, and its
+          // `checked` is reset by the re-render below, so the two can never
+          // disagree.
+          li.addEventListener('click', () => toggle(candidate.peripheralId));
           listEl.appendChild(li);
         }
+        pairButton.disabled = pairing || selected.size === 0;
+        selectAllButton.disabled = pairing || candidates.length === 0;
+        selectAllButton.textContent = allSelected() ? 'Select none' : 'Select all';
+        pairButton.textContent = selected.size > 1 ? `Pair ${selected.size} bulbs` : 'Pair selected';
       }
 
-      async function onSelect(candidate, li) {
+      function allSelected() {
+        return candidates.length > 0 && candidates.every((c) => selected.has(c.peripheralId));
+      }
+
+      function toggle(peripheralId) {
         if (pairing) return;
+        if (selected.has(peripheralId)) selected.delete(peripheralId);
+        else selected.add(peripheralId);
+        render();
+      }
+
+      selectAllButton.addEventListener('click', () => {
+        if (pairing) return;
+        if (allSelected()) selected.clear();
+        else for (const candidate of candidates) selected.add(candidate.peripheralId);
+        render();
+      });
+
+      pairButton.addEventListener('click', () => {
+        pairSelected().catch((err) => {
+          errorEl.textContent = `Pairing failed: ${err && err.message ? err.message : err}`;
+        });
+      });
+
+      // Progress as it goes — emitted by the driver before and after each
+      // bulb, so a run of five does not look like a frozen screen.
+      Homey.on('pair_progress', (progress) => {
+        if (!progress) return;
+        const position = `${progress.index + 1}/${progress.total}`;
+        if (progress.phase === 'start') {
+          rowState.set(progress.peripheralId, { text: 'Pairing…', ok: true });
+          statusEl.textContent = `Pairing ${progress.peripheralId} (${position})…`;
+        } else {
+          rowState.set(progress.peripheralId, describeOutcome(progress.outcome));
+        }
+        render();
+      });
+
+      async function pairSelected() {
+        if (pairing || selected.size === 0) return;
         pairing = true;
         errorEl.textContent = '';
-        statusEl.textContent = `Pairing ${candidate.peripheralId}…`;
-        for (const el of listEl.querySelectorAll('li')) el.classList.add('disabled');
+        summaryEl.textContent = '';
+        rowState.clear();
+        statusEl.textContent = 'Pairing…';
+        render();
 
         try {
-          const outcome = await Homey.emit('pair_node', { peripheralId: candidate.peripheralId });
-          if (outcome.kind === 'paired') {
-            statusEl.textContent = 'Paired — adding device…';
-            await Homey.createDevice(outcome.device);
+          const peripheralIds = candidates.map((c) => c.peripheralId).filter((id) => selected.has(id));
+          const result = await Homey.emit('pair_nodes', { peripheralIds });
+          const entries = (result && result.entries) || [];
+          const paired = (result && result.paired) || [];
+
+          for (const entry of entries) rowState.set(entry.peripheralId, describeOutcome(entry.outcome));
+
+          // Devices are created only once every bulb has been attempted, so
+          // a creation failure cannot interrupt a run that is still going.
+          const created = [];
+          const failures = entries
+            .filter((entry) => entry.outcome && entry.outcome.kind !== 'paired')
+            .map((entry) => `${entry.peripheralId}: ${describeOutcome(entry.outcome).text}`);
+          for (const device of paired) {
+            try {
+              await Homey.createDevice(device);
+              created.push(device.name);
+              selected.delete(device.store && device.store.peripheralId);
+            } catch (err) {
+              failures.push(`${device.name}: could not be added to Homey (${err && err.message ? err.message : err})`);
+            }
+          }
+
+          summaryEl.textContent = [
+            created.length > 0 ? `Paired ${created.length} of ${entries.length}: ${created.join(', ')}` : '',
+            failures.length > 0 ? `Not paired:\n${failures.map((f) => `  • ${f}`).join('\n')}` : '',
+          ]
+            .filter(Boolean)
+            .join('\n');
+
+          if (failures.length === 0 && created.length > 0) {
+            statusEl.textContent = 'Done';
             await Homey.done();
             return;
           }
-          if (outcome.kind === 'unsupported') {
-            errorEl.textContent = `This node cannot be paired: ${outcome.reason}`;
-          } else {
-            errorEl.textContent = `Pairing failed: ${outcome.message}`;
-          }
-          statusEl.textContent = 'Select a bulb to pair';
+          // Something did not work: stay on the page so the user can see
+          // what, and retry the ones still selected.
+          statusEl.textContent = created.length > 0 ? 'Finished with some failures' : 'Nothing was paired';
         } catch (err) {
           errorEl.textContent = `Pairing failed: ${err && err.message ? err.message : err}`;
-          statusEl.textContent = 'Select a bulb to pair';
+          statusEl.textContent = 'Select the bulbs to pair';
         } finally {
           pairing = false;
-          for (const el of listEl.querySelectorAll('li')) el.classList.remove('disabled');
+          render();
         }
       }
 
@@ -84,9 +237,13 @@
         statusEl.textContent = 'Scanning…';
         errorEl.textContent = '';
         try {
-          const candidates = await Homey.emit('list_devices', {});
-          renderDevices(candidates);
-          statusEl.textContent = candidates.length > 0 ? 'Select a bulb to pair' : 'No unpaired bulbs found nearby';
+          candidates = await Homey.emit('list_devices', {});
+          // A bulb that is no longer being advertised cannot stay selected.
+          for (const id of Array.from(selected)) {
+            if (!candidates.some((c) => c.peripheralId === id)) selected.delete(id);
+          }
+          render();
+          statusEl.textContent = candidates.length > 0 ? 'Select the bulbs to pair' : 'No unpaired bulbs found nearby';
         } catch (err) {
           errorEl.textContent = `Scan failed: ${err && err.message ? err.message : err}`;
           statusEl.textContent = '';

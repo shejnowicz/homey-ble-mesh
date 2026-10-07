@@ -1343,6 +1343,119 @@ export async function pairNode(deps: PairingDeps, peripheralId: string): Promise
   }
 }
 
+// ===========================================================================
+// pairNodes — several bulbs in one run of the pairing wizard.
+// ===========================================================================
+
+/** One bulb's outcome within a multi-bulb run, carrying the peripheral it
+ *  belongs to so a partial result can name exactly which bulbs worked. */
+export interface MultiPairingEntry {
+  readonly peripheralId: string;
+  readonly outcome: PairingOutcome;
+}
+
+export interface MultiPairingResult {
+  /** In the order they were attempted - the same order the caller supplied. */
+  readonly entries: ReadonlyArray<MultiPairingEntry>;
+  /** The descriptors Homey should actually create devices for. A convenience view of `entries`, not a second source of truth. */
+  readonly paired: ReadonlyArray<PairedDeviceDescriptor>;
+}
+
+/** Progress for the pairing view, emitted BEFORE each attempt and again
+ *  AFTER it - so a user watching a run of five bulbs sees which one is
+ *  being worked on, not a frozen screen. */
+export type MultiPairingProgress =
+  | { readonly phase: 'start'; readonly index: number; readonly total: number; readonly peripheralId: string }
+  | {
+      readonly phase: 'done';
+      readonly index: number;
+      readonly total: number;
+      readonly peripheralId: string;
+      readonly outcome: PairingOutcome;
+    };
+
+/**
+ * Pairs several bulbs, ONE AFTER ANOTHER, and reports what happened to each.
+ *
+ * STRICTLY SEQUENTIAL, AND THAT IS NOT A STYLE CHOICE. `pairNode` holds its
+ * own GATT connection to the bulb it is provisioning, and `driver.ts`
+ * already pauses the shared proxy connection around one attempt precisely
+ * because two simultaneous GATT connections from the one Homey radio are
+ * unverified (see `app.ts`'s own "PAIRING PAUSES THE SHARED CONNECTION"
+ * note). Running two `pairNode` calls concurrently would do exactly what
+ * that pause exists to prevent, from inside this app, so this loop awaits
+ * each attempt in full before starting the next - including its
+ * disconnects. `Promise.all` here would be a correctness bug, not a speed-up.
+ *
+ * ONE FAILURE DOES NOT ABANDON THE REST. Every outcome is recorded and the
+ * loop continues: a bulb that was out of range, or refused its AppKey Add,
+ * costs its own entry and nothing else. A run in which three of five
+ * succeeded is a SUCCESS for those three - they are paired, their store
+ * entries are written, and `paired` carries their descriptors - with the
+ * other two named, each with its own reason.
+ *
+ * NOTHING IS CACHED ACROSS ITERATIONS, deliberately - see this module's own
+ * INHERITED ADDRESS-ADVANCE HAZARD note and `app.ts`'s one-shared-store
+ * rule. Each attempt is a fresh `pairNode` call against the SAME
+ * `deps.store`, and every address and sequence number it uses comes from
+ * that store at the moment it is needed. A loop that read the state once up
+ * front and carried it between bulbs would hand the second bulb an address
+ * the first one already took - which is the exact failure
+ * `store.allocateUnicastAddress`'s own CALLER HAZARD comment warns about,
+ * and which a multi-bulb loop is the first thing in this project able to
+ * trigger.
+ *
+ * DUPLICATES ARE DROPPED, not attempted twice: the same peripheral id
+ * selected twice (a double tap in the pairing view) would otherwise consume
+ * two unicast addresses for one bulb, the second attempt failing because
+ * the node is no longer advertising the provisioning service.
+ *
+ * NEVER THROWS, for the same reason `pairNode` does not: every failure is
+ * an outcome. `onProgress` is called inside a try/catch for the same reason
+ * once more - a view that throws while rendering progress must not take the
+ * rest of the run down with it.
+ */
+export async function pairNodes(
+  deps: PairingDeps,
+  peripheralIds: ReadonlyArray<string>,
+  onProgress?: (progress: MultiPairingProgress) => void,
+): Promise<MultiPairingResult> {
+  const unique: string[] = [];
+  for (const peripheralId of peripheralIds) {
+    if (!unique.includes(peripheralId)) unique.push(peripheralId);
+  }
+
+  const report = (progress: MultiPairingProgress): void => {
+    if (onProgress === undefined) return;
+    try {
+      onProgress(progress);
+    } catch {
+      // A progress listener that throws is the view's problem, not this
+      // run's - the bulbs still get paired.
+    }
+  };
+
+  const entries: MultiPairingEntry[] = [];
+  const paired: PairedDeviceDescriptor[] = [];
+  const total = unique.length;
+  for (const [index, peripheralId] of unique.entries()) {
+    report({ phase: 'start', index, total, peripheralId });
+    // `pairNode` reports an ordinary pairing failure as an outcome rather
+    // than an exception; this catch is for the unforeseen, so one bulb's
+    // bug cannot cost the user the bulbs after it.
+    let outcome: PairingOutcome;
+    try {
+      outcome = await pairNode(deps, peripheralId);
+    } catch (err) {
+      outcome = { kind: 'failed', message: `pairing "${peripheralId}" failed unexpectedly: ${errorMessage(err)}` };
+    }
+    entries.push({ peripheralId, outcome });
+    if (outcome.kind === 'paired') paired.push(outcome.device);
+    report({ phase: 'done', index, total, peripheralId, outcome });
+  }
+  return { entries, paired };
+}
+
 /**
  * Advances the store's next-free unicast address past a multi-element
  * node's EXTRA elements (the node's own primary address was already

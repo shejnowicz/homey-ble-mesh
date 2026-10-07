@@ -39,6 +39,7 @@ import {
   type MeshTrafficPort,
 } from './meshLight';
 import type { NetworkStore } from '../../lib/adapter/store';
+import { rangeFromUnknown, resolveTemperatureRange } from './temperatureRange';
 
 /** What `app.ts`'s `BleMeshApp` exposes in-process. `getMeshContext()`
  *  returning `null` is unreachable in ordinary operation (app.ts starts the
@@ -83,6 +84,11 @@ class LightDevice extends Homey.Device {
     }
 
     const address = Number(this.getData().id);
+    // THE COLOUR-TEMPERATURE RANGE, resolved here because this is the one
+    // file allowed to read a Homey setting — `temperatureRange.ts` owns the
+    // precedence (the user's setting, then what the node reported about
+    // itself at pairing time, then the documented fallback) and
+    // `meshLight.ts` only ever receives the answer, so its maths stays pure.
     const controller = new MeshLightController({
       queue: context.queue,
       store: context.store,
@@ -92,6 +98,7 @@ class LightDevice extends Homey.Device {
       clock: context.clock,
       device: capabilityPort(this),
       address,
+      temperatureRange: this.resolveRange(context.store, address),
     });
     this.controller = controller;
     // ORDER MATTERS (review finding): `start()` subscribes the controller's
@@ -150,6 +157,35 @@ class LightDevice extends Homey.Device {
     this.unregister?.();
     this.unregister = null;
     this.controller?.stop();
+  }
+
+  /** The user's own setting first, then the node's own reported range from
+   *  the pairing-time probe, then the documented fallback. */
+  private resolveRange(store: NetworkStore, address: number): ReturnType<typeof resolveTemperatureRange> {
+    const fromSettings = rangeFromUnknown(this.getSetting('temperature_min_kelvin'), this.getSetting('temperature_max_kelvin'));
+    const fromNode = store.getState().nodes.find((node) => node.address === address)?.probe?.temperatureRange ?? null;
+    return resolveTemperatureRange(fromSettings, fromNode);
+  }
+
+  /**
+   * Homey's own settings hook. A range the user edits takes effect on the
+   * NEXT command rather than on a reload, and an unusable pair (inverted, or
+   * outside the Mesh Model's own legal span) is REJECTED by throwing: Homey
+   * shows the thrown message to the user and does not save the change, which
+   * is the honest outcome — silently clamping a typo into something valid
+   * would leave the slider mapped onto a range the user never chose and
+   * cannot see.
+   */
+  async onSettings(event: { newSettings: Record<string, unknown>; changedKeys: string[] }): Promise<void> {
+    if (!event.changedKeys.includes('temperature_min_kelvin') && !event.changedKeys.includes('temperature_max_kelvin')) {
+      return;
+    }
+    const range = rangeFromUnknown(event.newSettings.temperature_min_kelvin, event.newSettings.temperature_max_kelvin);
+    if (range === null || this.controller === null || !this.controller.setTemperatureRange(range)) {
+      throw new Error(
+        'The warmest value must be below the coolest one, and both must be between 800 K and 20000 K (Mesh Model Table 6.6).',
+      );
+    }
   }
 
   async onDeleted(): Promise<void> {

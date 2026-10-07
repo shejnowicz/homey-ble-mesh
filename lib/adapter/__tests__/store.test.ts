@@ -10,6 +10,7 @@ import {
 import { parseCompositionData, type CompositionData } from '../../mesh/config/composition';
 import { COMPOSITION_DATA_PAGE0_SAMPLE } from '../../mesh/config/__tests__/vectors';
 import { MAX_SEQ } from '../../mesh/packet/ranges';
+import type { NodeProbeResult } from '../../models/capabilities';
 
 /**
  * A faithful stand-in for Homey's own settings manager: a missing key reads
@@ -549,5 +550,106 @@ describe('NetworkStore.allocateSequenceBlock', () => {
     const store = new NetworkStore(settings);
 
     expect(() => store.allocateSequenceBlock()).not.toThrow();
+  });
+});
+
+// ===========================================================================
+// THE PROBE RESULT, persisted beside the composition (hardware round). This
+// is a change to what the store WRITES, so it gets its own round-trip
+// coverage: a stored value that does not survive a restart would silently
+// send every node back to believing its own composition data, which is the
+// very thing the probe exists to stop.
+// ===========================================================================
+
+const SAMPLE_PROBE: NodeProbeResult = {
+  // The owner's own bulb's measured shape: declares both colour-temperature
+  // models, answers only the Temperature one.
+  models: { genericOnOff: 'supported', lightCtl: 'unsupported', lightCtlTemperature: 'supported', lightHsl: 'unknown' },
+  temperatureRange: { minKelvin: 3000, maxKelvin: 6000 },
+};
+
+describe('NodeEntry.probe persistence', () => {
+  test('a probe result written by one instance is read back identically by another', () => {
+    const settings = new FakeSettingsPort();
+    const state: NetworkState = {
+      ...sampleNetworkState(),
+      nodes: [{ ...sampleNode(2), probe: SAMPLE_PROBE }, sampleNode(3)],
+    };
+
+    new NetworkStore(settings).setState(state);
+
+    const reloaded = new NetworkStore(settings).getState();
+    expect(reloaded).toEqual(state);
+    expect(reloaded.nodes[0]?.probe).toEqual(SAMPLE_PROBE);
+    // The node WITHOUT one keeps not having one — "never measured" and
+    // "measured nothing" must stay distinguishable.
+    expect(reloaded.nodes[1]?.probe).toBeUndefined();
+  });
+
+  test('a null temperatureRange survives as null, not as a missing field or an invented range', () => {
+    const settings = new FakeSettingsPort();
+    const probe: NodeProbeResult = { models: { lightCtlTemperature: 'supported' }, temperatureRange: null };
+    new NetworkStore(settings).setState({ ...sampleNetworkState(), nodes: [{ ...sampleNode(2), probe }] });
+
+    expect(new NetworkStore(settings).getState().nodes[0]?.probe).toEqual(probe);
+  });
+
+  test('THE MIGRATION: a node stored before the probe existed reads back with no probe, not a crash and not an empty one', () => {
+    const settings = new FakeSettingsPort();
+    // Exactly the shape the previous version of this module wrote — no
+    // `probe` key anywhere, no version marker to bump.
+    const legacy = new NetworkStore(settings);
+    legacy.setState({ ...sampleNetworkState(), nodes: [sampleNode(2)] });
+    const storedBefore = settings.get('network') as { nodes: Array<Record<string, unknown>> };
+    expect(storedBefore.nodes[0]).not.toHaveProperty('probe');
+
+    const reloaded = new NetworkStore(settings).getState();
+    expect(reloaded.nodes[0]?.probe).toBeUndefined();
+    expect(reloaded.nodes[0]?.composition).toEqual(sampleNode(2).composition);
+  });
+
+  test('a stored probe whose verdict is not one this module knows is corruption, and yields the empty state rather than being accepted', () => {
+    const settings = new FakeSettingsPort();
+    new NetworkStore(settings).setState({ ...sampleNetworkState(), nodes: [{ ...sampleNode(2), probe: SAMPLE_PROBE }] });
+    const stored = settings.get('network') as { nodes: Array<{ probe: { models: Record<string, unknown> } }> };
+    stored.nodes[0]!.probe.models.lightCtl = 'probably';
+    settings.set('network', stored);
+
+    expect(new NetworkStore(settings).getState()).toEqual(EXPECTED_EMPTY_STATE);
+  });
+
+  test('a stored temperatureRange that is not a {minKelvin, maxKelvin} pair is corruption too', () => {
+    const settings = new FakeSettingsPort();
+    new NetworkStore(settings).setState({ ...sampleNetworkState(), nodes: [{ ...sampleNode(2), probe: SAMPLE_PROBE }] });
+    const stored = settings.get('network') as { nodes: Array<{ probe: { temperatureRange: unknown } }> };
+    stored.nodes[0]!.probe.temperatureRange = { minKelvin: 3000 };
+    settings.set('network', stored);
+
+    expect(new NetworkStore(settings).getState()).toEqual(EXPECTED_EMPTY_STATE);
+  });
+
+  test('a verdict for a model this version does not know is DROPPED, not rejected — a newer app\'s settings must not brick an older one', () => {
+    const settings = new FakeSettingsPort();
+    new NetworkStore(settings).setState({ ...sampleNetworkState(), nodes: [{ ...sampleNode(2), probe: SAMPLE_PROBE }] });
+    const stored = settings.get('network') as { nodes: Array<{ probe: { models: Record<string, unknown> } }> };
+    stored.nodes[0]!.probe.models.lightXyl = 'supported'; // a model a later version might add
+    settings.set('network', stored);
+
+    const reloaded = new NetworkStore(settings).getState();
+    expect(reloaded.nodes[0]?.probe?.models).toEqual(SAMPLE_PROBE.models);
+    expect(reloaded.nodes[0]?.probe?.models).not.toHaveProperty('lightXyl');
+  });
+
+  test('the stored probe is a COPY — mutating what was written afterward does not reach what is read back', () => {
+    const settings = new AliasingSettingsPort();
+    const probe: NodeProbeResult = { models: { lightCtl: 'supported' }, temperatureRange: { minKelvin: 3000, maxKelvin: 6000 } };
+    new NetworkStore(settings).setState({ ...sampleNetworkState(), nodes: [{ ...sampleNode(2), probe }] });
+
+    (probe.models as Record<string, string>).lightCtl = 'unsupported';
+    (probe.temperatureRange as { minKelvin: number }).minKelvin = 9999;
+
+    const reloaded = new NetworkStore(settings).getState().nodes[0]?.probe;
+    expect(reloaded?.models.lightCtl).toBe('supported');
+    expect(reloaded?.temperatureRange).toEqual({ minKelvin: 3000, maxKelvin: 6000 });
   });
 });

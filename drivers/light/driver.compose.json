@@ -27,6 +27,48 @@
     "small": "/drivers/light/assets/images/small.png",
     "large": "/drivers/light/assets/images/large.png"
   },
+  "settings": [
+    {
+      "type": "group",
+      "label": {
+        "en": "Colour temperature range"
+      },
+      "children": [
+        {
+          "id": "temperature_min_kelvin",
+          "type": "number",
+          "label": {
+            "en": "Warmest (K)"
+          },
+          "hint": {
+            "en": "The warmest colour temperature this bulb can produce, in kelvin. Filled in from the bulb itself when it reports its range (Light CTL Temperature Range Get); correct it by hand if the bulb does not report one — the value printed on the box or in the manufacturer's app is the one to use."
+          },
+          "value": 3000,
+          "min": 800,
+          "max": 20000,
+          "units": {
+            "en": "K"
+          }
+        },
+        {
+          "id": "temperature_max_kelvin",
+          "type": "number",
+          "label": {
+            "en": "Coolest (K)"
+          },
+          "hint": {
+            "en": "The coolest colour temperature this bulb can produce, in kelvin. Must be above the warmest value. Filled in from the bulb itself when it reports its range; correct it by hand if it does not."
+          },
+          "value": 6000,
+          "min": 800,
+          "max": 20000,
+          "units": {
+            "en": "K"
+          }
+        }
+      ]
+    }
+  ],
   "pair": [
     {
       "id": "list_devices"

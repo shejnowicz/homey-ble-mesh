@@ -95,13 +95,54 @@ describe('device.ts wires meshLight.ts to Homey (source-text, not behaviour)', (
   });
 });
 
+describe('device.ts wires the per-device colour-temperature range (source-text)', () => {
+  const source = readDeviceSource();
+  const onInitBody = sliceBetween(source, 'async onInit(): Promise<void> {', 'async onUninit(): Promise<void> {');
+  const onSettingsBody = sliceBetween(source, 'async onSettings(', 'async onDeleted(): Promise<void> {');
+
+  test('onInit resolves the range and hands it to the controller — never leaving it on the module default', () => {
+    expect(onInitBody).toMatch(/temperatureRange:\s*this\.resolveRange\(/);
+  });
+
+  test('resolveRange reads the per-device SETTING and the node\'s own probed range, in that order', () => {
+    const resolveBody = sliceBetween(source, 'private resolveRange(', 'async onSettings(');
+    expect(resolveBody).toMatch(/getSetting\('temperature_min_kelvin'\)/);
+    expect(resolveBody).toMatch(/getSetting\('temperature_max_kelvin'\)/);
+    expect(resolveBody).toMatch(/probe\?\.temperatureRange/);
+    expect(resolveBody).toMatch(/resolveTemperatureRange\(/);
+  });
+
+  test('onSettings pushes an edited range into the live controller, and throws on one it refuses', () => {
+    // Without the push, a user correcting the range would see no change
+    // until the device was reloaded; without the throw, Homey would save a
+    // range the controller rejected and the two would silently disagree.
+    expect(onSettingsBody).toMatch(/setTemperatureRange\(/);
+    expect(onSettingsBody).toMatch(/throw new Error/);
+  });
+});
+
 describe('driver.ts pauses the shared connection for the duration of pairing (source-text)', () => {
   const source = readFileSync(join(__dirname, '..', 'driver.ts'), 'utf8');
-  const pairNodeBody = sliceBetween(source, "session.setHandler('pair_node'", '});\n  }\n}');
+  const pauseHelper = sliceBetween(source, 'const withMeshPaused =', "session.setHandler('pair_node'");
+  const handlersBody = sliceBetween(source, "session.setHandler('pair_node'", '\n  }\n}\n\nmodule.exports');
 
-  test("pair_node pauses before provisioning and resumes afterward", () => {
-    expect(pairNodeBody).toMatch(/pauseMeshForPairing\(\)/);
-    expect(pairNodeBody).toMatch(/resumeMeshAfterPairing\(\)/);
-    expect(pairNodeBody).toMatch(/finally/);
+  test('the pause/resume pair brackets pairing in a finally', () => {
+    expect(pauseHelper).toMatch(/pauseMeshForPairing\(\)/);
+    expect(pauseHelper).toMatch(/resumeMeshAfterPairing\(\)/);
+    expect(pauseHelper).toMatch(/finally/);
+  });
+
+  test('BOTH pairing handlers go through it — the multi-bulb one is where two live GATT connections would actually happen', () => {
+    // The whole reason the pause exists is the second bulb onward, which is
+    // precisely what `pair_nodes` is for. A multi-bulb handler that skipped
+    // it would reintroduce the hazard the single-bulb one was fixed for.
+    expect(handlersBody).toMatch(/setHandler\('pair_nodes'/);
+    const withMeshPausedCalls = handlersBody.match(/withMeshPaused\(/g) ?? [];
+    expect(withMeshPausedCalls).toHaveLength(2);
+  });
+
+  test('pair_nodes delegates the sequencing to pairing.ts and relays progress to the view', () => {
+    expect(handlersBody).toMatch(/await pairNodes\(deps/);
+    expect(handlersBody).toMatch(/session\.emit\('pair_progress'/);
   });
 });
