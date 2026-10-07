@@ -37,6 +37,7 @@ import {
   type TemperatureRange,
 } from '../../lib/models/capabilities';
 import { DEFAULT_TEMPERATURE_RANGE, isUsableRange } from './temperatureRange';
+import { isMeaningfulProbeResult, probeModels, type ProbeTransport } from './modelProbe';
 
 /**
  * The device layer (docs/superpowers/specs/2026-10-06-ble-mesh-provisioner-
@@ -207,6 +208,23 @@ import { DEFAULT_TEMPERATURE_RANGE, isUsableRange } from './temperatureRange';
  * "current mode" concept to read instead (this comment's own earlier
  * paragraph), so this is the best available proxy, not a true initial read.
  *
+ * MEASURING A BULB THAT PREDATES THE PROBE (`backfillProbe` below). Every
+ * node paired before `modelProbe.ts` existed has a store entry carrying an
+ * address, a device key and a composition and NO measurement — the owner's
+ * own lamp among them. Such a node works today only because
+ * `chooseTemperatureWriteModel`'s fallback happens to be the message it
+ * obeys, which is luck rather than knowledge. This module therefore runs the
+ * SAME probe over the ordinary traffic queue, once per such device per app
+ * run, in the background: never awaited by `device.ts`, never retried in a
+ * loop, never run at all for a node that already has a measurement, and
+ * never STORED unless it actually learned something (a probe that merely
+ * timed out leaves the record unmeasured so a later start can try again).
+ * It reuses `modelProbe.ts` through that module's own transport port rather
+ * than duplicating the probe plan, and it borrows this controller's own
+ * transaction-identifier counter so a probe's no-op write can never collide
+ * with a user's command inside a node's six-second deduplication window.
+ * See `backfillProbe`'s own doc comment for the one risk this accepts.
+ *
  * NULLISH CONVENTION: `null` throughout (matching every other lib/adapter
  * module) — a decode that cannot resolve to a specific status is `null`,
  * never `undefined`.
@@ -249,6 +267,54 @@ export interface MeshClockPort {
   now(): number;
 }
 
+/**
+ * The ONE-AT-A-TIME gate every backfill probe passes through, shared by
+ * every device in the app (`app.ts` owns the single instance, the same way
+ * it owns the single queue).
+ *
+ * WHY IT EXISTS. Homey initialises every device at roughly the same moment,
+ * so several controllers can reach `backfillProbe()` within the same tick.
+ * The mesh carries one command at a time and the queue is shared: two
+ * probes running at once do not go faster, they interleave their messages
+ * onto the same queue, each waiting out the other's attempts, and both
+ * sitting in front of whatever the user is pressing. Serialising them costs
+ * nothing (a probe is a once-per-device-per-run background errand) and
+ * keeps the shared queue's behaviour predictable.
+ *
+ * `run` resolves or rejects with its own task's own outcome, so a caller
+ * still learns what happened to ITS probe and not to somebody else's.
+ */
+export interface ProbeRunnerPort {
+  run<T>(task: () => Promise<T>): Promise<T>;
+}
+
+/**
+ * A `ProbeRunnerPort` that chains tasks onto one promise, so the next starts
+ * only once the previous has settled - WHETHER IT SUCCEEDED OR NOT. The
+ * failure branch is the point: one unreachable bulb takes the queue's full
+ * bounded-retry time to give up, and if that failure broke the chain, every
+ * other bulb behind it would lose its measurement too.
+ */
+export function createSerialProbeRunner(): ProbeRunnerPort {
+  let tail: Promise<unknown> = Promise.resolve();
+  return {
+    run<T>(task: () => Promise<T>): Promise<T> {
+      // `then(task, task)` rather than `finally`/`catch`: the previous
+      // task's REJECTION must start this one just as its fulfilment does,
+      // and neither outcome is otherwise consulted.
+      const result = tail.then(task, task);
+      // The chain itself never carries a rejection forward - a rejected
+      // `tail` would be an unhandled rejection the moment nothing else
+      // attached to it. The caller still gets the real `result`.
+      tail = result.then(
+        () => undefined,
+        () => undefined,
+      );
+      return result;
+    },
+  };
+}
+
 export interface MeshLightControllerDeps {
   readonly queue: MeshTrafficPort;
   readonly store: NetworkStore;
@@ -268,6 +334,12 @@ export interface MeshLightControllerDeps {
    * when the user edits the setting.
    */
   readonly temperatureRange?: TemperatureRange;
+  /**
+   * The shared one-at-a-time gate the backfill probe runs through - see
+   * `ProbeRunnerPort`. Omitted, this controller makes its own, which
+   * serialises nothing but itself; `app.ts` supplies the real shared one.
+   */
+  readonly probeRunner?: ProbeRunnerPort;
 }
 
 // ===========================================================================
@@ -538,6 +610,36 @@ function reReadBackoffMs(failureStreak: number): number {
   return Math.min(scaled, RE_READ_BACKOFF_MAX_MS);
 }
 
+// ===========================================================================
+// The backfill probe's own budget. Not a specification value; an engineering
+// choice, sized against the QUEUE rather than against the probe's own
+// per-message timeout, because the queue is what paces it here (see
+// `queueProbeTransport`).
+// ===========================================================================
+
+/**
+ * 120 seconds for the whole backfill probe, checked before each message is
+ * sent (`modelProbe.ts`'s own `outOfBudget`).
+ *
+ * WHY SO MUCH MORE THAN PAIRING'S OWN 9 SECONDS. There, every message rode a
+ * dedicated GATT connection to the node being configured, with a 1500 ms
+ * timeout and no retry; here each one is a queue entry with the queue's own
+ * per-attempt timeout and bounded retry behind it (`queue.ts`'s
+ * `DEFAULT_TIMEOUT_MS` x `DEFAULT_MAX_ATTEMPTS`), so a single UNANSWERED
+ * message costs tens of seconds rather than one and a half. A budget sized
+ * for pairing would therefore expire during the first silent model and
+ * record every model after it `'unknown'` - which, for a bulb like the
+ * owner's that is silent on exactly one message and answers everything else,
+ * would throw away the whole measurement.
+ *
+ * It costs nothing to be generous. A long-running probe does NOT hold the
+ * queue: each probe message is one entry, and a user's command enqueued
+ * meanwhile is served between them, never behind all of them. And a node
+ * that answers nothing at all still finishes well inside this, because every
+ * one of its reads fails and each failed read skips its own write.
+ */
+export const BACKFILL_PROBE_BUDGET_MS = 120_000;
+
 /**
  * Owns one provisioned node's commands, status and availability — the
  * design's "Commands and state"/"Availability" sections for exactly one
@@ -574,6 +676,14 @@ export class MeshLightController {
   private reReadFailureStreak = 0;
   /** The earliest `clock.now()` at which another re-read may start. */
   private nextReReadAtMs = 0;
+  /** The shared one-at-a-time gate for the backfill probe - see
+   *  `ProbeRunnerPort`. */
+  private readonly probeRunner: ProbeRunnerPort;
+  /** Set the moment `backfillProbe()` is entered, BEFORE its first `await`:
+   *  "at most once per device per app run" has to hold against two
+   *  overlapping calls as well as two sequential ones, and `device.ts`
+   *  starts this fire-and-forget. */
+  private backfillAttempted = false;
 
   constructor(deps: MeshLightControllerDeps) {
     this.queue = deps.queue;
@@ -582,6 +692,7 @@ export class MeshLightController {
     this.clock = deps.clock;
     this.address = deps.address;
     this.temperatureRange = isUsableRange(deps.temperatureRange) ? deps.temperatureRange : DEFAULT_TEMPERATURE_RANGE;
+    this.probeRunner = deps.probeRunner ?? createSerialProbeRunner();
   }
 
   /**
@@ -787,6 +898,165 @@ export class MeshLightController {
     });
     const status = this.tryDecodeModel(HSL_MODEL, reply);
     if (status !== null) await this.applyDecodedStatus(HSL_MODEL, status);
+  }
+
+  /**
+   * MEASURES A NODE THAT WAS PAIRED BEFORE THE PROBE EXISTED, once, in the
+   * background, and stores the result. A no-op for every node that already
+   * has a measurement, and for every call after the first in this app run.
+   *
+   * WHY THIS IS NEEDED AT ALL. The owner's own lamp was paired before
+   * `modelProbe.ts` was written, so its stored node record carries an
+   * address, a device key and a composition and nothing else. It works
+   * today only because `chooseTemperatureWriteModel`'s FALLBACK happens to
+   * be the message that bulb obeys - luck, not knowledge, and the wrong
+   * message for a node that runs the composite model instead. Re-pairing
+   * every bulb to fix that would be a worse answer than measuring them
+   * where they stand.
+   *
+   * NEVER THROWS AND NEVER BLOCKS ANYTHING. `device.ts` starts this without
+   * awaiting it, and a failure costs the measurement and nothing else: the
+   * record simply stays unmeasured and the NEXT app start tries again. It
+   * is never retried in a loop, and never retried within one run.
+   *
+   * SILENCE IS NOT STORED. A probe whose every verdict came back
+   * `'unknown'` - a node that is merely unreachable right now - is
+   * discarded rather than written (`modelProbe.ts#isMeaningfulProbeResult`),
+   * because storing it would mark the node measured forever and end every
+   * future attempt. A probe that learned even one thing is kept.
+   *
+   * THE CAPABILITIES ARE NOT RE-DERIVED from the new measurement, and that
+   * is deliberate rather than an omission: this must be invisible to the
+   * user, and silently taking a control off a lamp someone is using would
+   * be the opposite of invisible. What the measurement DOES change is which
+   * colour-temperature message this controller sends (`nodeProbe()` is read
+   * fresh on every command) and what the user's own colour-mode setting was
+   * seeded from, which is where capability changes belong.
+   *
+   * IT STARTS BEFORE THE MESH IS NECESSARILY CONNECTED, and survives that
+   * on the queue's own bounded retry rather than on a wait of its own.
+   * Homey runs this app's `onInit` (which starts the connection manager
+   * scanning) to completion before any device's `onInit`, so a cold start
+   * reaches here with the proxy connection still coming up and the first
+   * probe message's `write` rejecting outright. `queue.ts#attempt` treats
+   * that as a reason to WAIT, not to fail: the attempt's own timer paces a
+   * retry, and three attempts at `DEFAULT_TIMEOUT_MS` give roughly
+   * twenty-four seconds for a scan (`SCAN_DURATION_MS`, four) plus connect,
+   * discover and subscribe to finish — comfortable, but it IS the margin
+   * this depends on. A bulb that is genuinely out of range instead costs
+   * that same budget once and then stays unmeasured until a later start,
+   * which is the intended outcome.
+   *
+   * ONE DISCLOSED RISK, stated rather than glossed. Every probe message is a
+   * no-op write - the value is READ and the same value written straight
+   * back (`modelProbe.ts`'s own "EVERY PROBE IS A NO-OP WRITE" note). At
+   * pairing time the lamp was in the user's hands and nothing else was
+   * driving it. Here it is in service, so a probe write can in principle
+   * land just after the user changed something by other means and put the
+   * lamp back by a fraction of a second. The window is one queue round trip,
+   * it happens at most once per bulb per app run, and the alternative -
+   * leaving every pre-probe bulb permanently unmeasured - is worse. Sharing
+   * the controller's own transaction-identifier counter (see
+   * `allocateTid` below) is what keeps the probe from going further than
+   * that and actually SWALLOWING a user's command as a duplicate.
+   */
+  async backfillProbe(): Promise<void> {
+    if (this.backfillAttempted) return;
+    this.backfillAttempted = true;
+    const node = this.store.getState().nodes.find((n) => n.address === this.address);
+    if (node === undefined || node.probe !== undefined) return;
+    const composition = node.composition;
+
+    await this.probeRunner.run(async () => {
+      let result: NodeProbeResult;
+      try {
+        result = await probeModels(
+          {
+            transport: this.queueProbeTransport(),
+            clock: this.clock,
+            probeBudgetMs: BACKFILL_PROBE_BUDGET_MS,
+            // The controller's own counter, shared with every command this
+            // device sends - see `ModelProbeDeps.allocateTid`'s own note for
+            // the collision this prevents.
+            allocateTid: () => this.allocateTid(),
+          },
+          composition,
+        );
+      } catch {
+        // `probeModels` turns an unanswered message and a lost link into
+        // ordinary verdicts, so reaching here means something else went
+        // wrong entirely (a mesh that is not initialized, say). Leave the
+        // record unmeasured; the next start tries again.
+        return;
+      }
+      if (!isMeaningfulProbeResult(result)) return;
+      this.storeProbeResult(result);
+    });
+  }
+
+  /** Writes the measurement into this node's store entry, re-reading the
+   *  state immediately before the one `setState` (the discipline every
+   *  writer in this project follows) and refusing to resurrect a node that
+   *  has been removed meanwhile, or to overwrite a measurement that appeared
+   *  while this probe was running. */
+  private storeProbeResult(probe: NodeProbeResult): void {
+    const fresh = this.store.getState();
+    const index = fresh.nodes.findIndex((n) => n.address === this.address);
+    if (index === -1) return;
+    const current = fresh.nodes[index];
+    if (current === undefined || current.probe !== undefined) return;
+    const nodes = [...fresh.nodes];
+    nodes[index] = { ...current, probe };
+    this.store.setState({ ...fresh, nodes });
+  }
+
+  /**
+   * `modelProbe.ts`'s own transport, over the ORDINARY shared traffic queue
+   * rather than a dedicated connection - the probe already takes a transport
+   * port precisely so it can be driven either way, and duplicating it here
+   * would mean a second copy of the probe plan to keep in step.
+   *
+   * THE QUEUE OWNS THE PACING, not the probe. `request`'s own `timeoutMs`
+   * argument is therefore ignored: the queue has its own per-attempt timeout
+   * and its own bounded retry, and nothing here may shorten them without
+   * reaching inside a shared object every other device is using too. What
+   * this costs is that an unanswered probe message takes the queue's full
+   * retry budget rather than `DEFAULT_PROBE_TIMEOUT_MS`, which is what
+   * `BACKFILL_PROBE_BUDGET_MS` is sized for.
+   *
+   * A QUEUE REJECTION BECOMES `null`, NOT A THROW. `ProbeTransport`'s own
+   * contract reserves rejection for "the link itself is gone", which ends
+   * the probe; here, every attempt being exhausted is exactly the SILENCE
+   * the probe is trying to measure, and reporting it as a lost link would
+   * turn one model's silence into "stop, we learned nothing" for all the
+   * models after it.
+   */
+  private queueProbeTransport(): ProbeTransport {
+    return {
+      request: async (accessPayload: Buffer, accept: (pdu: Buffer) => boolean): Promise<Buffer | null> => {
+        const description = `capability probe 0x${accessPayload.subarray(0, 2).toString('hex')} (node ${this.address})`;
+        let reply: Buffer;
+        try {
+          reply = await this.queue.send({
+            build: () => this.buildApplicationPdu(accessPayload),
+            // The SAME reshape every command's own `isStatus` performs:
+            // decrypt, re-encode as Opcode || Parameters, and let the
+            // probe's own predicate decide. `acceptIncomingPdu`'s
+            // `expectedSrc` check inside `decodeApplicationMessage` is what
+            // keeps another bulb's status off this request.
+            isStatus: (pdu) => {
+              const message = this.decodeApplicationMessage(pdu);
+              return message !== null && accept(encodeAccessMessage(message));
+            },
+            description,
+          });
+        } catch {
+          return null;
+        }
+        const message = this.decodeApplicationMessage(reply);
+        return message === null ? null : encodeAccessMessage(message);
+      },
+    };
   }
 
   /**

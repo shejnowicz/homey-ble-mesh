@@ -2,8 +2,10 @@ import { randomBytes } from 'node:crypto';
 import {
   MeshLightController,
   CONNECTION_UNAVAILABLE_MESSAGE,
+  createSerialProbeRunner,
   __testing,
   type DeviceCapabilityPort,
+  type ProbeRunnerPort,
 } from '../meshLight';
 import { NetworkStore, EMPTY_NETWORK_STATE, type SettingsPort } from '../../../lib/adapter/store';
 import { ProxyConnectionManager, SCAN_DURATION_MS } from '../../../lib/adapter/connection';
@@ -96,6 +98,8 @@ const OP_CTL_SET = 0x825e;
 const OP_CTL_STATUS = 0x8260;
 const OP_CTL_TEMPERATURE_SET = 0x8264;
 const OP_CTL_TEMPERATURE_STATUS = 0x8266;
+const OP_CTL_TEMPERATURE_RANGE_GET = 0x8262;
+const OP_CTL_TEMPERATURE_RANGE_STATUS = 0x8263;
 const OP_HSL_GET = 0x826d;
 const OP_HSL_SET = 0x8276;
 const OP_HSL_STATUS = 0x8278;
@@ -186,6 +190,12 @@ function statusPayload(opcode: number, fields: number[]): Buffer {
   return encodeAccessMessage({ opcode, parameters });
 }
 
+function u16le(value: number): Buffer {
+  const buffer = Buffer.alloc(2);
+  buffer.writeUInt16LE(value, 0);
+  return buffer;
+}
+
 function onOffStatusPayload(presentOnOff: number): Buffer {
   return encodeAccessMessage({ opcode: OP_ONOFF_STATUS, parameters: Buffer.from([presentOnOff & 0xff]) });
 }
@@ -206,6 +216,10 @@ interface LightingResponderOptions {
   readonly silentOpcodes?: ReadonlySet<number>;
   /** Config Node Reset gets no reply at all. */
   readonly failReset?: boolean;
+  /** What this node answers `Light CTL Temperature Range Get` with, or
+   *  `undefined` for a node that never answers it (the owner's own bulb).
+   *  Only the backfill probe asks. */
+  readonly temperatureRangeReply?: { readonly min: number; readonly max: number };
   /** Config Node Reset is answered with a DIFFERENT status type (Config
    *  AppKey Status) instead of Node Reset Status — a node that is reachable
    *  but misbehaves, as opposed to one that is merely unreachable. */
@@ -318,6 +332,20 @@ function installLightingResponder(bluetooth: FakeBluetoothPort, peripheralId: st
             'application',
           );
         }
+        case OP_CTL_TEMPERATURE_RANGE_GET: {
+          const range = opts.temperatureRangeReply;
+          if (range === undefined) return undefined;
+          // Table 6.83: Status Code || Range Min || Range Max, the Status
+          // Code a single octet ahead of the two 2-octet fields.
+          return sendAsNode(
+            encodeAccessMessage({
+              opcode: OP_CTL_TEMPERATURE_RANGE_STATUS,
+              parameters: Buffer.concat([Buffer.from([0x00]), u16le(range.min), u16le(range.max)]),
+            }),
+            opts.appKey,
+            'application',
+          );
+        }
         case OP_HSL_GET:
           return sendAsNode(
             statusPayload(OP_HSL_STATUS, [opts.state.lightness, opts.state.hue, opts.state.saturation]),
@@ -426,6 +454,13 @@ function setUp(
      *  the documented fallback, exactly as a device with no setting and no
      *  reported range gets. */
     temperatureRange?: TemperatureRange;
+    /** The SIG models this node's stored composition declares. Omitted = a
+     *  node declaring nothing, which is what every test that is not about
+     *  the backfill probe wants (nothing to probe). */
+    declaredModels?: ReadonlyArray<number>;
+    /** The shared, one-at-a-time runner the backfill probe goes through —
+     *  omitted means the controller's own default. */
+    probeRunner?: ProbeRunnerPort;
     responderOptions?: Partial<Omit<LightingResponderOptions, 'ourAddress' | 'nodeAddress' | 'netKey' | 'appKey' | 'deviceKey' | 'state'>>;
   } = {},
 ): Harness {
@@ -449,7 +484,8 @@ function setUp(
     vid: 0,
     crpl: 0,
     features: { relay: false, proxy: false, friend: false, lowPower: false },
-    elements: [],
+    elements:
+      options.declaredModels === undefined ? [] : [{ loc: 0x0000, sigModels: options.declaredModels, vendorModels: [] }],
   };
   store.setState({
     ...EMPTY_NETWORK_STATE,
@@ -481,6 +517,7 @@ function setUp(
     device,
     address: NODE_ADDRESS,
     temperatureRange: options.temperatureRange,
+    probeRunner: options.probeRunner,
   });
 
   const nodeState: FakeNodeState = { ...defaultNodeState(), ...options.nodeState };
@@ -1607,5 +1644,332 @@ describe('optimistic writes respect capability presence', () => {
     await connectManager(h.manager, h.clock);
     await h.controller.setColor(0.3, 0.6);
     expect(h.device.setCalls.filter((c) => c.capability === 'light_hue' || c.capability === 'light_saturation')).toEqual([]);
+  });
+});
+
+// ===========================================================================
+// THE BACKFILL PROBE — measuring the bulbs that were paired before the probe
+// existed.
+//
+// The owner's own lamp is exactly this case: its stored node record carries
+// an address, a device key and a composition, and no measurement at all. It
+// works today only because `chooseTemperatureWriteModel`'s FALLBACK happens
+// to be the message that bulb obeys — which is luck, not knowledge, and
+// would be the wrong message for a node that runs the composite model
+// instead. Every bulb should end up with a real measurement.
+//
+// `modelProbe.test.ts` owns the probe's own behaviour against node
+// behaviours; these tests own the three things only this layer can get
+// wrong: WHEN it runs, WHETHER its result is kept, and that it goes through
+// the one shared queue one message at a time.
+// ===========================================================================
+
+/** Every lighting model this project probes, as the stored composition of a
+ *  bulb that claims to do everything — transcribed independently of
+ *  `capabilities.ts`/`modelProbe.ts` (Assigned Numbers, Section 4.1.1 "by
+ *  Value" / 4.1.2 "by Name"), the same discipline every other file in this
+ *  suite states for its own copies. */
+const DECLARES_EVERYTHING = [0x1000, 0x1300, 0x1303, 0x1306, 0x1307];
+
+/** A node that answers EVERY probe message, the range query included — so a
+ *  test about what the probe does with an answer never has to wait out a
+ *  timeout it is not measuring. A node that stays silent on something is
+ *  always configured explicitly, per test. */
+const ANSWERS_EVERYTHING = { temperatureRangeReply: { min: 2700, max: 6500 } } as const;
+
+/** Runs `work` to completion while VIRTUAL TIME moves — needed by every
+ *  backfill test against a node that stays SILENT, where nothing resolves
+ *  until the queue's own attempt timer fires. The same shape, and the same
+ *  reason, as `pairing.test.ts`'s own `pairWhileAdvancing`. */
+async function runWhileAdvancing<T>(work: Promise<T>, clock: FakeClock, stepMs: number): Promise<T> {
+  let settled = false;
+  const tracked = work.then(
+    (value) => {
+      settled = true;
+      return value;
+    },
+    (err) => {
+      settled = true;
+      throw err;
+    },
+  );
+  // Swallow a rejection here so the loop below never sees an unhandled one;
+  // `tracked` is still what the caller awaits, so a real failure is not lost.
+  tracked.catch(() => undefined);
+  for (let step = 0; step < 400 && !settled; step++) {
+    await flushMicrotasks();
+    if (settled) break;
+    await clock.advance(stepMs);
+  }
+  return tracked;
+}
+
+describe('backfillProbe', () => {
+  const SILENT_QUEUE = { timeoutMs: 50, maxAttempts: 1 };
+
+  test('a node with NO stored measurement is probed, and the measurement is stored', async () => {
+    const h = setUp({ declaredModels: DECLARES_EVERYTHING, responderOptions: ANSWERS_EVERYTHING });
+    await connectManager(h.manager, h.clock);
+
+    await h.controller.backfillProbe();
+
+    expect(h.store.getState().nodes[0]?.probe?.models).toEqual({
+      genericOnOff: 'supported',
+      lightLightness: 'supported',
+      lightCtl: 'supported',
+      lightCtlTemperature: 'supported',
+      lightHsl: 'supported',
+    });
+  });
+
+  test("THE OWNER'S OWN BULB, backfilled: the composite Light CTL Set is measured dead and 0x8264 alive", async () => {
+    // The whole point of measuring a bulb that predates the probe: this is
+    // the measurement that turns `chooseTemperatureWriteModel`'s lucky
+    // default into a decision backed by evidence.
+    const h = setUp({
+      declaredModels: DECLARES_EVERYTHING,
+      queueOptions: SILENT_QUEUE,
+      responderOptions: { silentOpcodes: new Set([OP_CTL_SET]) },
+    });
+    await connectManager(h.manager, h.clock);
+
+    await runWhileAdvancing(h.controller.backfillProbe(), h.clock, SILENT_QUEUE.timeoutMs);
+
+    const probe = h.store.getState().nodes[0]?.probe;
+    expect(probe?.models.lightCtl).toBe('unsupported');
+    expect(probe?.models.lightCtlTemperature).toBe('supported');
+  });
+
+  test('a node that reports its own colour-temperature range has it stored too', async () => {
+    const h = setUp({
+      declaredModels: DECLARES_EVERYTHING,
+      responderOptions: { temperatureRangeReply: { min: 2700, max: 6500 } },
+    });
+    await connectManager(h.manager, h.clock);
+
+    await h.controller.backfillProbe();
+
+    expect(h.store.getState().nodes[0]?.probe?.temperatureRange).toEqual({ minKelvin: 2700, maxKelvin: 6500 });
+  });
+
+  test('a node that ALREADY has a measurement is never probed — not one message', async () => {
+    const h = setUp({
+      declaredModels: DECLARES_EVERYTHING,
+      responderOptions: ANSWERS_EVERYTHING,
+      probe: { models: { genericOnOff: 'supported' }, temperatureRange: null },
+    });
+    await connectManager(h.manager, h.clock);
+
+    await h.controller.backfillProbe();
+
+    expect(h.queueSends()).toBe(0);
+    expect(h.bluetooth.writesReceived).toHaveLength(0);
+    // ...and the stored measurement is left exactly as it was.
+    expect(h.store.getState().nodes[0]?.probe?.models).toEqual({ genericOnOff: 'supported' });
+  });
+
+  test('AT MOST ONCE PER APP RUN: a second call sends nothing, even though a measurement is now present', async () => {
+    const h = setUp({ declaredModels: DECLARES_EVERYTHING, responderOptions: ANSWERS_EVERYTHING });
+    await connectManager(h.manager, h.clock);
+
+    await h.controller.backfillProbe();
+    const afterFirst = h.queueSends();
+    expect(afterFirst).toBeGreaterThan(0);
+
+    await h.controller.backfillProbe();
+
+    expect(h.queueSends()).toBe(afterFirst);
+  });
+
+  test('two calls that OVERLAP still probe only once', async () => {
+    // The guard has to be set before the first `await`, not after it:
+    // `device.ts` starts this fire-and-forget, and nothing stops a second
+    // start arriving while the first is still in flight.
+    const h = setUp({ declaredModels: DECLARES_EVERYTHING, responderOptions: ANSWERS_EVERYTHING });
+    await connectManager(h.manager, h.clock);
+
+    const first = h.controller.backfillProbe();
+    const second = h.controller.backfillProbe();
+    await Promise.all([first, second]);
+
+    const probe = h.store.getState().nodes[0]?.probe;
+    expect(probe?.models.genericOnOff).toBe('supported');
+    // One probe's worth of traffic: five reads collapse to four (the two
+    // colour-temperature models share `Light CTL Get`) plus five writes plus
+    // the range query.
+    expect(h.queueSends()).toBe(10);
+  });
+
+  test('A PROBE THAT MEASURES NOTHING LEAVES THE RECORD UNMEASURED, so a later start retries it', async () => {
+    // The brief's own rule. Storing an all-`unknown` result would mark the
+    // node measured forever and quietly end every future attempt — the exact
+    // opposite of what a node that was merely unreachable right now deserves.
+    const h = setUp({
+      declaredModels: DECLARES_EVERYTHING,
+      queueOptions: SILENT_QUEUE,
+      responderOptions: {
+        silentOpcodes: new Set([OP_ONOFF_GET, OP_LIGHTNESS_GET, OP_CTL_GET, OP_HSL_GET]),
+      },
+    });
+    await connectManager(h.manager, h.clock);
+
+    await runWhileAdvancing(h.controller.backfillProbe(), h.clock, SILENT_QUEUE.timeoutMs);
+
+    expect(h.store.getState().nodes[0]?.probe).toBeUndefined();
+  });
+
+  test('a node that is gone from the store by the time the probe finishes is not resurrected', async () => {
+    const h = setUp({ declaredModels: DECLARES_EVERYTHING, responderOptions: ANSWERS_EVERYTHING });
+    await connectManager(h.manager, h.clock);
+
+    const probing = h.controller.backfillProbe();
+    const fresh = h.store.getState();
+    h.store.setState({ ...fresh, nodes: [] });
+    await probing;
+
+    expect(h.store.getState().nodes).toEqual([]);
+  });
+
+  test('IT NEVER THROWS, whatever the mesh does — device start must not depend on it', async () => {
+    // `device.ts` starts this without awaiting it; an exception escaping
+    // here would be an unhandled rejection in the app's own log at best.
+    const h = setUp({ declaredModels: DECLARES_EVERYTHING, queueOptions: SILENT_QUEUE });
+    // Deliberately NOT connected: every queue send fails outright.
+    await expect(runWhileAdvancing(h.controller.backfillProbe(), h.clock, SILENT_QUEUE.timeoutMs)).resolves.toBeUndefined();
+    expect(h.store.getState().nodes[0]?.probe).toBeUndefined();
+  });
+
+  test('a node declaring NOTHING is recorded as unmeasured rather than as measured-empty', async () => {
+    const h = setUp(); // no declaredModels: the composition declares no lighting model at all
+    await connectManager(h.manager, h.clock);
+
+    await h.controller.backfillProbe();
+
+    expect(h.queueSends()).toBe(0);
+    expect(h.store.getState().nodes[0]?.probe).toBeUndefined();
+  });
+
+  test('THE LAMP IS LEFT EXACTLY AS IT WAS FOUND — every write is the value its own read returned', async () => {
+    // The pairing-time probe could rely on the lamp being in the user's
+    // hands. This one runs while the lamp is in use, so "invisible to the
+    // user" is the requirement, not a nicety.
+    const before = { onOff: 1, lightness: 0x8000, temperature: 4200, deltaUv: 0, hue: 0x4000, saturation: 0x2000 };
+    const h = setUp({ declaredModels: DECLARES_EVERYTHING, nodeState: before, responderOptions: ANSWERS_EVERYTHING });
+    await connectManager(h.manager, h.clock);
+
+    await h.controller.backfillProbe();
+
+    expect(h.nodeState).toEqual(before);
+  });
+
+  test('the probe\'s own writes share the CONTROLLER\'s transaction-identifier counter', async () => {
+    // Two independent counters both starting near zero would let a probe
+    // write and a user's button press collide on (SRC, DST, TID) inside the
+    // node's own six-second window, where the second is discarded as a
+    // retransmission rather than applied.
+    const h = setUp({ declaredModels: DECLARES_EVERYTHING, responderOptions: ANSWERS_EVERYTHING });
+    await connectManager(h.manager, h.clock);
+
+    await h.controller.setOnOff(true); // consumes TID 0
+    h.bluetooth.writesReceived.length = 0;
+    await h.controller.backfillProbe();
+
+    // Table 3.37: Opcode(2) || OnOff(1) || TID(1).
+    const onOffSet = h.bluetooth.writesReceived
+      .map((w) => decodeOurCommand(w.data, h.netKey, h.appKey))
+      .find((m) => m?.opcode === OP_ONOFF_SET);
+    expect(onOffSet).toBeDefined();
+    expect(onOffSet?.parameters[1]).toBe(1); // NOT 0 — the controller's counter continued
+  });
+
+  test('it goes through the shared, one-at-a-time runner rather than straight onto the queue', async () => {
+    const order: string[] = [];
+    const runner: ProbeRunnerPort = {
+      async run<T>(task: () => Promise<T>): Promise<T> {
+        order.push('enter');
+        try {
+          return await task();
+        } finally {
+          order.push('leave');
+        }
+      },
+    };
+    const h = setUp({ declaredModels: DECLARES_EVERYTHING, probeRunner: runner, responderOptions: ANSWERS_EVERYTHING });
+    await connectManager(h.manager, h.clock);
+
+    await h.controller.backfillProbe();
+
+    expect(order).toEqual(['enter', 'leave']);
+  });
+});
+
+describe('createSerialProbeRunner', () => {
+  test('SEVERAL DEVICES INITIALISING TOGETHER DO NOT PROBE CONCURRENTLY', async () => {
+    // The mesh carries one command at a time and the queue is shared: two
+    // probes running at once interleave their messages, which is both slower
+    // for each and a worse neighbour to a user's own command.
+    const runner = createSerialProbeRunner();
+    const log: string[] = [];
+    const task = (name: string) => async (): Promise<void> => {
+      log.push(`${name}:start`);
+      await flushMicrotasks();
+      await flushMicrotasks();
+      log.push(`${name}:end`);
+    };
+
+    await Promise.all([runner.run(task('a')), runner.run(task('b')), runner.run(task('c'))]);
+
+    expect(log).toEqual(['a:start', 'a:end', 'b:start', 'b:end', 'c:start', 'c:end']);
+  });
+
+  test('a task that FAILS does not block the ones behind it', async () => {
+    // One unreachable bulb must not cost every other bulb its measurement.
+    const runner = createSerialProbeRunner();
+    const log: string[] = [];
+
+    const failing = runner.run(async () => {
+      log.push('failing');
+      throw new Error('boom');
+    });
+    const following = runner.run(async () => {
+      log.push('following');
+      return 'done';
+    });
+
+    await expect(failing).rejects.toThrow('boom');
+    await expect(following).resolves.toBe('done');
+    expect(log).toEqual(['failing', 'following']);
+  });
+
+  test('a rejection the caller never looked at does not become an unhandled rejection on the CHAIN', async () => {
+    // `backfillProbe` always awaits its own `run`, so this is defensive —
+    // but the chain this runner keeps internally is its own promise, and if
+    // it were simply the last task's result, a caller that discarded a
+    // rejecting task (with nothing queued behind it to absorb it) would
+    // leave Node with an unhandled rejection that nothing in this project
+    // could have handled.
+    const seen: unknown[] = [];
+    const listener = (reason: unknown): void => {
+      seen.push(reason);
+    };
+    process.on('unhandledRejection', listener);
+    try {
+      const runner = createSerialProbeRunner();
+      // Deliberately no `await`, no `.catch` — that is the whole point.
+      void runner.run(async () => {
+        throw new Error('nobody is listening');
+      });
+      await flushMicrotasks();
+      await flushMicrotasks();
+      await flushMicrotasks();
+    } finally {
+      process.off('unhandledRejection', listener);
+    }
+    expect(seen).toEqual([]);
+  });
+
+  test('each task\'s own result reaches its own caller', async () => {
+    const runner = createSerialProbeRunner();
+    expect(await Promise.all([runner.run(async () => 1), runner.run(async () => 2)])).toEqual([1, 2]);
   });
 });

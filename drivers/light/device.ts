@@ -37,6 +37,7 @@ import {
   type DeviceCapabilityPort,
   type MeshClockPort,
   type MeshTrafficPort,
+  type ProbeRunnerPort,
 } from './meshLight';
 import type { NetworkStore } from '../../lib/adapter/store';
 import type { HomeyCapability } from '../../lib/models/capabilities';
@@ -57,7 +58,16 @@ import {
  *  app.ts/device.ts already rely on) — handled defensively here anyway
  *  rather than assumed away. */
 export interface BleMeshAppHost {
-  getMeshContext(): { readonly store: NetworkStore; readonly queue: MeshTrafficPort; readonly clock: MeshClockPort } | null;
+  getMeshContext(): {
+    readonly store: NetworkStore;
+    readonly queue: MeshTrafficPort;
+    readonly clock: MeshClockPort;
+    /** The app's ONE backfill-probe runner — see
+     *  `meshLight.ts#ProbeRunnerPort`. Shared for the same reason the queue
+     *  is: the mesh carries one command at a time, so several devices
+     *  initialising together must not probe concurrently. */
+    readonly probeRunner: ProbeRunnerPort;
+  } | null;
   /** Registers a controller to receive `onConnectionStateChange` calls
    *  whenever the shared proxy connection's status changes. Returns an
    *  unsubscribe function — called from `onUninit` below so a removed or
@@ -114,6 +124,7 @@ class LightDevice extends Homey.Device {
       device: capabilityPort(this),
       address,
       temperatureRange: this.resolveRange(context.store, address),
+      probeRunner: context.probeRunner,
     });
     this.controller = controller;
     // ORDER MATTERS (review finding): `start()` subscribes the controller's
@@ -140,6 +151,16 @@ class LightDevice extends Homey.Device {
     this.unregister = host.registerDeviceController(controller);
 
     this.wireCapabilityListeners(controller);
+
+    // MEASURE A BULB THAT PREDATES THE PROBE, in the background. Deliberately
+    // NOT awaited: this is a radio errand against a node that may simply be
+    // unreachable right now, and `onInit` must not wait out the queue's
+    // bounded retry before Homey considers this device started. It runs at
+    // most once per device per app run, does nothing at all for a node that
+    // already has a measurement, and leaves the record unmeasured (to be
+    // retried on a LATER start, never in a loop) if it learns nothing — see
+    // `meshLight.ts#backfillProbe`.
+    void controller.backfillProbe().catch((err) => this.error('background capability probe failed', err));
   }
 
   async onUninit(): Promise<void> {

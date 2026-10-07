@@ -56,7 +56,13 @@ import Homey from 'homey';
 import { NetworkStore, type SettingsPort } from './lib/adapter/store';
 import { ProxyConnectionManager, type ProxyConnectionState } from './lib/adapter/connection';
 import { TrafficQueue } from './lib/adapter/queue';
-import { type MeshLightController, type MeshClockPort, type MeshTrafficPort } from './drivers/light/meshLight';
+import {
+  createSerialProbeRunner,
+  type MeshLightController,
+  type MeshClockPort,
+  type MeshTrafficPort,
+  type ProbeRunnerPort,
+} from './drivers/light/meshLight';
 import { createRealClock } from './drivers/light/pairing';
 import { HomeyBluetoothPort } from './drivers/light/homeyBluetooth';
 
@@ -100,6 +106,14 @@ class BleMeshApp extends Homey.App {
    *  the traffic queue and every device controller, so "now" means the same
    *  thing everywhere. Constructed lazily with the mesh itself. */
   private clock: MeshClockPort | null = null;
+  /** The ONE backfill-probe runner for the whole app, for the same reason
+   *  the queue and the store are singletons: the mesh carries one command at
+   *  a time, and Homey initialises every device at roughly the same moment,
+   *  so without a shared gate several bulbs would interleave their probes
+   *  onto the one queue and sit in front of whatever the user is pressing.
+   *  Constructed here, once, and handed to every controller through
+   *  `getMeshContext()` — a per-device runner would serialise nothing. */
+  private readonly probeRunner: ProbeRunnerPort = createSerialProbeRunner();
   private pollTimer: NodeJS.Timeout | null = null;
   private lastConnectionStatus: ProxyConnectionState['status'] | null = null;
   private readonly controllers = new Set<MeshLightController>();
@@ -135,9 +149,14 @@ class BleMeshApp extends Homey.App {
   /** `device.ts#BleMeshAppHost`'s own requirement. `null` only when the
    *  mesh has never been started (no network key yet) — see this file's own
    *  module header. */
-  getMeshContext(): { readonly store: NetworkStore; readonly queue: MeshTrafficPort; readonly clock: MeshClockPort } | null {
+  getMeshContext(): {
+    readonly store: NetworkStore;
+    readonly queue: MeshTrafficPort;
+    readonly clock: MeshClockPort;
+    readonly probeRunner: ProbeRunnerPort;
+  } | null {
     if (this.store === null || this.queue === null || this.clock === null) return null;
-    return { store: this.store, queue: this.queue, clock: this.clock };
+    return { store: this.store, queue: this.queue, clock: this.clock, probeRunner: this.probeRunner };
   }
 
   /** `device.ts#BleMeshAppHost`'s own requirement — registers `controller`

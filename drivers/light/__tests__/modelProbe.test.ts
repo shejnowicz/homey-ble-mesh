@@ -1,4 +1,11 @@
-import { probeModels, toTemperatureRange, DEFAULT_PROBE_TIMEOUT_MS, DEFAULT_PROBE_BUDGET_MS, type ProbeTransport } from '../modelProbe';
+import {
+  probeModels,
+  toTemperatureRange,
+  isMeaningfulProbeResult,
+  DEFAULT_PROBE_TIMEOUT_MS,
+  DEFAULT_PROBE_BUDGET_MS,
+  type ProbeTransport,
+} from '../modelProbe';
 import { createFakeClock } from '../../../lib/adapter/__tests__/fakeClock';
 import { decodeAccessMessage, encodeAccessMessage } from '../../../lib/mesh/packet/access';
 import type { CompositionData, ElementDescription } from '../../../lib/mesh/config/composition';
@@ -421,5 +428,129 @@ describe('toTemperatureRange', () => {
 
   test('the boundary values themselves are accepted', () => {
     expect(toTemperatureRange(800, 20000)).toEqual({ minKelvin: 800, maxKelvin: 20000 });
+  });
+});
+
+// ===========================================================================
+// THE TRANSACTION IDENTIFIER'S OWN SOURCE. The probe runs at pairing time
+// against a node that has no controller yet, and (since the backfill) also
+// at DEVICE INIT, against a node whose controller is live and allocating
+// identifiers of its own. The two must not collide: a Set reaching a node
+// with the same (SRC, DST, TID) inside six seconds is discarded as a
+// retransmission, so a probe write landing on a number the user's own
+// button press is about to use would silently swallow one of them.
+// ===========================================================================
+
+describe('the transaction identifier', () => {
+  /** Table 3.37/6.53/6.69/6.73/6.87: every Set this module sends carries its
+   *  TID as the LAST parameter octet. */
+  function tidsOfSets(requests: ReadonlyArray<{ opcode: number; parameters: Buffer }>): number[] {
+    const sets = new Set([OP_ONOFF_SET, OP_LIGHTNESS_SET, OP_CTL_SET, OP_CTL_TEMPERATURE_SET, OP_HSL_SET]);
+    return requests.filter((r) => sets.has(r.opcode)).map((r) => r.parameters[r.parameters.length - 1] as number);
+  }
+
+  test('with no allocator supplied, the probe counts from its own zero (the pairing-time case, unchanged)', async () => {
+    const clock = createFakeClock();
+    const node = fakeNode(clock, defaultLamp());
+
+    await probeModels({ transport: node.transport, clock }, DECLARES_EVERYTHING);
+
+    expect(tidsOfSets(node.requests)).toEqual([0, 1, 2, 3, 4]);
+  });
+
+  test('an injected allocator is used instead, so a live controller\'s own counter covers the probe too', async () => {
+    const clock = createFakeClock();
+    const node = fakeNode(clock, defaultLamp());
+    // Exactly the shape `MeshLightController#allocateTid` has: one shared,
+    // incrementing, wrapping counter per node.
+    let next = 200;
+    const allocateTid = (): number => {
+      const tid = next;
+      next = (next + 1) & 0xff;
+      return tid;
+    };
+
+    await probeModels({ transport: node.transport, clock, allocateTid }, DECLARES_EVERYTHING);
+
+    expect(tidsOfSets(node.requests)).toEqual([200, 201, 202, 203, 204]);
+    // ...and the allocator really was consumed, rather than merely offered.
+    expect(next).toBe(205);
+  });
+
+  test('an allocator is only consulted for messages that HAVE a transaction identifier', async () => {
+    // Gets and the Range Get carry none (Table 6.50/6.64/6.66/6.84 are
+    // empty messages), so a probe against a node that answers no Set at all
+    // must not burn identifiers on them.
+    const clock = createFakeClock();
+    const node = fakeNode(clock, defaultLamp(), {
+      silentOpcodes: new Set([OP_ONOFF_GET, OP_LIGHTNESS_GET, OP_CTL_GET, OP_HSL_GET]),
+    });
+    let calls = 0;
+    const allocateTid = (): number => {
+      calls += 1;
+      return 7;
+    };
+
+    await probeModels({ transport: node.transport, clock, allocateTid, probeBudgetMs: 1_000_000 }, DECLARES_EVERYTHING);
+
+    expect(tidsOfSets(node.requests)).toEqual([]);
+    expect(calls).toBe(0);
+  });
+});
+
+// ===========================================================================
+// WAS ANYTHING ACTUALLY MEASURED? The backfill needs this question answered
+// and the pairing path never had to ask it: a probe where every single
+// verdict came back `'unknown'` (a node that answered nothing, or a budget
+// that ran out before the first reply) has learned nothing, and storing it
+// would mark the node "measured" forever and stop any later retry.
+// ===========================================================================
+
+describe('isMeaningfulProbeResult', () => {
+  test('a probe that measured one model either way is meaningful', () => {
+    expect(isMeaningfulProbeResult({ models: { genericOnOff: 'supported' }, temperatureRange: null })).toBe(true);
+    expect(isMeaningfulProbeResult({ models: { lightCtl: 'unsupported' }, temperatureRange: null })).toBe(true);
+  });
+
+  test('a range is a measurement too, even with every model unknown', () => {
+    expect(
+      isMeaningfulProbeResult({ models: { lightCtl: 'unknown' }, temperatureRange: { minKelvin: 2700, maxKelvin: 6500 } }),
+    ).toBe(true);
+  });
+
+  test('all-unknown with no range is a probe that failed, not a measurement', () => {
+    expect(isMeaningfulProbeResult({ models: {}, temperatureRange: null })).toBe(false);
+    expect(
+      isMeaningfulProbeResult({
+        models: { genericOnOff: 'unknown', lightLightness: 'unknown', lightCtl: 'unknown' },
+        temperatureRange: null,
+      }),
+    ).toBe(false);
+  });
+
+  test('a node that answers NOTHING produces a result this rejects — end to end, not by construction', async () => {
+    const clock = createFakeClock();
+    const node = fakeNode(clock, defaultLamp(), {
+      silentOpcodes: new Set([
+        OP_ONOFF_GET,
+        OP_LIGHTNESS_GET,
+        OP_CTL_GET,
+        OP_HSL_GET,
+        OP_CTL_TEMPERATURE_RANGE_GET,
+      ]),
+    });
+
+    const result = await probeModels({ transport: node.transport, clock, probeBudgetMs: 1_000_000 }, DECLARES_EVERYTHING);
+
+    expect(isMeaningfulProbeResult(result)).toBe(false);
+  });
+
+  test('...while the owner\'s own bulb produces one this accepts', async () => {
+    const clock = createFakeClock();
+    const node = fakeNode(clock, defaultLamp(), { silentOpcodes: new Set([OP_CTL_SET]) });
+
+    const result = await probeModels({ transport: node.transport, clock }, DECLARES_EVERYTHING);
+
+    expect(isMeaningfulProbeResult(result)).toBe(true);
   });
 });

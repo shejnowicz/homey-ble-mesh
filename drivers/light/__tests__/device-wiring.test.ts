@@ -217,6 +217,37 @@ describe('device.ts applies the per-device colour mode (source-text)', () => {
   });
 });
 
+describe('device.ts starts the backfill probe (source-text)', () => {
+  const source = readDeviceSource();
+  const onInitBody = sliceBetween(source, 'async onInit(): Promise<void> {', 'async onUninit(): Promise<void> {');
+
+  test('onInit starts it', () => {
+    // A bulb paired before the probe existed is unmeasured forever
+    // otherwise — it works today only because the fallback happens to pick
+    // the right command.
+    expect(onInitBody).toMatch(/backfillProbe\(\)/);
+  });
+
+  test('onInit does NOT await it — device start must never wait on a radio errand', () => {
+    // The brief's own hard rule. An awaited probe would make every device's
+    // start wait out the queue's full bounded retry against any bulb that is
+    // currently unreachable.
+    expect(onInitBody).not.toMatch(/await\s+controller\.backfillProbe\(\)/);
+    expect(onInitBody).toMatch(/void\s+controller\.backfillProbe\(\)/);
+  });
+
+  test('its failure is caught rather than left as an unhandled rejection', () => {
+    expect(onInitBody).toMatch(/backfillProbe\(\)\s*\n?\s*\.catch\(|backfillProbe\(\)\.catch\(/);
+  });
+
+  test('the controller is given the app\'s SHARED probe runner, not one of its own', () => {
+    // One mesh, one queue, one command at a time: several devices
+    // initialising together must not probe concurrently, and a per-device
+    // runner would serialise nothing.
+    expect(onInitBody).toMatch(/probeRunner:\s*context\.probeRunner/);
+  });
+});
+
 describe('driver.ts pauses the shared connection for the duration of pairing (source-text)', () => {
   const source = readFileSync(join(__dirname, '..', 'driver.ts'), 'utf8');
   const pauseHelper = sliceBetween(source, 'const withMeshPaused =', "session.setHandler('pair_node'");

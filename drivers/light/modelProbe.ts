@@ -93,9 +93,17 @@ import type { CompositionData } from '../../lib/mesh/config/composition';
  *
  * PURE, LIKE `pairing.ts` NEXT TO IT: this module imports no `homey` and
  * performs no I/O. It takes a `ProbeTransport` - one bounded
- * request/response over the configuration session, which `pairing.ts`
- * supplies - and a clock, so `__tests__/modelProbe.test.ts` can drive the
- * whole thing against a fake node that answers some models and not others.
+ * request/response - and a clock, so `__tests__/modelProbe.test.ts` can
+ * drive the whole thing against a fake node that answers some models and not
+ * others.
+ *
+ * TWO CALLERS, ONE PLAN. `pairing.ts` supplies a transport over the
+ * still-open configuration session, at pairing time. `meshLight.ts`
+ * supplies one over the ordinary shared traffic queue, at device init, for
+ * a node paired before this module existed (its `backfillProbe`). That
+ * second caller is why `ModelProbeDeps.allocateTid` exists and why the
+ * no-op-write note above matters more than it did: there, the lamp is in
+ * service rather than in the user's hands.
  *
  * NULLISH CONVENTION: `null` throughout, matching every neighbouring
  * module - `temperatureRange` is `null` when nothing was measured, never
@@ -138,6 +146,26 @@ export interface ModelProbeDeps {
   readonly probeTimeoutMs?: number;
   /** Overrides `DEFAULT_PROBE_BUDGET_MS` - injected so tests drive it. */
   readonly probeBudgetMs?: number;
+  /**
+   * Where each probe Set's transaction identifier comes from. Omitted, this
+   * module counts from its own `PROBE_FIRST_TID` - correct at PAIRING time,
+   * where the node has no controller yet and nothing else is addressing it.
+   *
+   * IT IS NOT CORRECT WHEN A CONTROLLER IS LIVE, which is why this hook
+   * exists. `drivers/light/meshLight.ts`'s backfill runs this probe against
+   * a node whose `MeshLightController` is already allocating identifiers
+   * from its own counter, and a Set reaching a node with the same
+   * (SRC, DST, TID) inside six seconds is discarded as a retransmission
+   * rather than applied (Section 3.3.1.2.2, restated per model in
+   * `lighting.ts`'s own JSDoc). Two independent counters both starting near
+   * zero would therefore make a probe write and a user's button press
+   * capable of swallowing one another - rare, invisible, and exactly the
+   * "I pressed it and nothing happened" class of defect this project keeps
+   * paying for. Passing the controller's own allocator makes the probe
+   * share the ONE counter per node that `meshLight.ts`'s module header
+   * already argues for.
+   */
+  readonly allocateTid?: () => number;
 }
 
 // ===========================================================================
@@ -375,7 +403,14 @@ export async function probeModels(deps: ModelProbeDeps, composition: Composition
   const models: Partial<Record<ProbedModel, ModelProbeVerdict>> = {};
   const readCache = new Map<ReadKind, ReadValue | null>();
   let temperatureRange: TemperatureRange | null = null;
-  let tid = PROBE_FIRST_TID;
+  let localTid = PROBE_FIRST_TID;
+  const allocateTid =
+    deps.allocateTid ??
+    ((): number => {
+      const tid = localTid;
+      localTid = (localTid + 1) & 0xff;
+      return tid;
+    });
   let linkLost = false;
 
   const outOfBudget = (): boolean => deps.clock.now() >= deadline;
@@ -417,12 +452,20 @@ export async function probeModels(deps: ModelProbeDeps, composition: Composition
       models[step.model] = 'unknown';
       continue;
     }
-    const setPayload = step.buildSet(value, tid);
+    // One identifier per step that has a value to write. A step whose
+    // `buildSet` then returns `null` still consumes it - harmless, because
+    // identifiers only ever have to be DISTINCT within a node's six-second
+    // window, never contiguous, and because that branch is defensive rather
+    // than reachable (every `READS` entry supplies exactly the fields its
+    // own step's `buildSet` asks for). The allocation is NOT hoisted above
+    // the `readOnce` above it, which is the part that matters: a step that
+    // could not read anything sends nothing and must not burn a number the
+    // controller sharing this allocator is about to need.
+    const setPayload = step.buildSet(value, allocateTid());
     if (setPayload === null) {
       models[step.model] = 'unknown';
       continue;
     }
-    tid = (tid + 1) & 0xff;
     if (outOfBudget()) {
       models[step.model] = 'unknown';
       continue;
@@ -474,4 +517,31 @@ export function toTemperatureRange(rangeMin: number, rangeMax: number): Temperat
   if (!legal(rangeMin) || !legal(rangeMax)) return null;
   if (rangeMin >= rangeMax) return null;
   return { minKelvin: rangeMin, maxKelvin: rangeMax };
+}
+
+/**
+ * Did this probe actually MEASURE anything?
+ *
+ * `probeModels` never throws for a probe that simply did not work out: an
+ * unanswered message, a read that could not be parsed and a budget that ran
+ * out are all recorded as `'unknown'` verdicts and returned as an ordinary
+ * result. At pairing time nothing had to tell those apart from a real
+ * measurement - the result was stored either way, and `'unknown'` already
+ * means "believe the declaration", so storing an empty one changed nothing.
+ *
+ * THE BACKFILL CHANGES THAT. `drivers/light/meshLight.ts` re-probes a node
+ * that has no stored measurement, once per app run, and a node that is
+ * merely unreachable right now produces a result that is entirely
+ * `'unknown'`. Storing THAT would mark the node measured forever and stop
+ * every later retry, which is the opposite of the brief's own rule: "A probe
+ * that fails or times out leaves the record unmeasured and is retried on a
+ * later start". This predicate is where that distinction lives.
+ *
+ * A single verdict either way is enough, and so is a reported temperature
+ * range on its own - both are things the node told us that it did not have
+ * to.
+ */
+export function isMeaningfulProbeResult(result: NodeProbeResult): boolean {
+  if (result.temperatureRange !== null) return true;
+  return Object.values(result.models).some((verdict) => verdict !== undefined && verdict !== 'unknown');
 }
