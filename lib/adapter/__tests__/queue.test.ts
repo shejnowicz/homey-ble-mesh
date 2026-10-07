@@ -102,6 +102,17 @@ describe('defaults', () => {
     expect(DEFAULT_TIMEOUT_MS).toBe(SCAN_DURATION_MS * 2);
   });
 
+  /**
+   * Review finding: the test below pins the BEHAVIOUR of
+   * `DEFAULT_MAX_ATTEMPTS` (paced, bounded) but only against itself --
+   * it loops `DEFAULT_MAX_ATTEMPTS` times and asserts `DEFAULT_MAX_ATTEMPTS`
+   * writes happened, which is true no matter what the constant is set to.
+   * This pins the actual VALUE, the half the other test cannot.
+   */
+  test('DEFAULT_MAX_ATTEMPTS is 3', () => {
+    expect(DEFAULT_MAX_ATTEMPTS).toBe(3);
+  });
+
   test('with no options given, retries are paced by DEFAULT_TIMEOUT_MS and bounded by DEFAULT_MAX_ATTEMPTS', async () => {
     const { bluetooth, clock, manager, queue } = setUp(); // no overrides at all
     await connect(manager, clock);
@@ -204,7 +215,12 @@ describe('serialisation', () => {
     await connect(manager, clock);
 
     const a = queue.send({ data: Buffer.from([0xa1]), description: 'A', isStatus: () => false });
-    const aRejection = expect(a).rejects.toThrow('A: no status received after 1 attempt');
+    // `toThrow` with a plain string is a SUBSTRING match -- "after 1 attempt"
+    // is itself a substring of "after 1 attempts", so that form cannot tell
+    // the singular grammar apart from a mutation that leaves it always
+    // plural (review finding). Anchored with `$` so only the exact,
+    // singular ending matches.
+    const aRejection = expect(a).rejects.toThrow(/^A: no status received after 1 attempt$/);
     const b = queue.send({ data: Buffer.from([0xa2]), description: 'B', isStatus: (n) => n.equals(Buffer.from([0xf2])) });
 
     expect(bluetooth.writesReceived.map((w) => w.data.toString('hex'))).toEqual(['a1']); // B still waiting behind A
@@ -348,6 +364,60 @@ describe('bounded retries', () => {
     await clock.advance(1000); // attempt 2's own timeout -> bounded, gives up
 
     await rejection;
+  });
+
+  /**
+   * Unpinned behaviour the fix itself introduced, review finding: `attempt()`
+   * resets `entry.lastError = null` at the start of every attempt (see its
+   * own doc comment), but nothing checked that this actually happens.
+   * Without the reset, a cause recorded by an EARLIER, already-superseded
+   * attempt would wrongly survive into the final message even when the
+   * LAST attempt never rejected at all -- a failure message naming a cause
+   * that did not apply to the attempt that actually ran out the clock.
+   *
+   * Attempt 1's write is configured to reject outright (a fixed, named
+   * cause); attempt 2's write is switched to succeed BEFORE it is ever
+   * attempted, so attempt 2 fails only by timing out -- no cause applies to
+   * it. The message must therefore carry no "(last attempt: ...)" detail
+   * at all, not attempt 1's stale one.
+   *
+   * MUTATION: removed `entry.lastError = null;` from `attempt()`. Verified
+   * this failed: the final message carried
+   * `(last attempt: FakeBluetoothPort.write: configured to fail for "A")`
+   * even though attempt 2 -- the one that actually exhausted the budget --
+   * never rejected. Restored.
+   */
+  test('the per-attempt failure reason is reset for each new attempt, not carried over from an earlier one', async () => {
+    const { bluetooth, clock, manager, queue } = setUp({ timeoutMs: 1000, maxAttempts: 2 });
+    await connect(manager, clock);
+    bluetooth.setWriteBehavior('A', 'fail'); // attempt 1's write rejects immediately, with a fixed, named cause
+
+    const promise = queue.send({ data: Buffer.from([0x01]), description: 'test command', isStatus: () => false });
+    let caught: Error | undefined;
+    promise.catch((err: Error) => {
+      caught = err;
+    });
+
+    // Attempt 1's write() rejects through TWO microtask hops
+    // (FakeBluetoothPort.write -> ProxyConnectionManager.write's own
+    // `await` -> this module's `.catch()`), so without giving it a chance
+    // to drain, the FIRST `clock.advance` below fires attempt 1's timeout
+    // (synchronously, before any microtask runs) and starts attempt 2
+    // BEFORE attempt 1's own rejection is ever recorded -- at which point
+    // the EXISTING stale-token guard discards it regardless of whether the
+    // reset under test is present, hiding the very bug this test exists to
+    // catch. Flushing here lets attempt 1's `entry.lastError` actually get
+    // set first, which is the only way the reset (or its absence) becomes
+    // observable.
+    await flushMicrotasks();
+
+    // Switched BEFORE attempt 2 is ever attempted: it must succeed and
+    // then fail ONLY by timing out, carrying no cause of its own.
+    bluetooth.setWriteBehavior('A', 'succeed');
+    await clock.advance(1000); // attempt 1 times out -> retry (attempt 2), whose write succeeds
+    await clock.advance(1000); // attempt 2 times out -> bounded, gives up -- with no cause of ITS OWN
+
+    expect(caught?.message).toBe('test command: no status received after 2 attempts');
   });
 });
 
@@ -626,7 +696,10 @@ describe('the subtle case: a late status for an abandoned command', () => {
     queue.onUnsolicited((data) => received.push(data));
 
     const a = queue.send({ data: Buffer.from([0x01]), description: 'command A', isStatus: () => false });
-    const aRejection = expect(a).rejects.toThrow('command A: no status received after 1 attempt');
+    // Anchored regex, not a plain substring -- see the identical note on
+    // the "not stranded forever" test above; "after 1 attempt" is a
+    // substring of "after 1 attempts" either way.
+    const aRejection = expect(a).rejects.toThrow(/^command A: no status received after 1 attempt$/);
     await clock.advance(1000); // A's only attempt times out -> gives up
     await aRejection;
 
@@ -725,7 +798,11 @@ describe('defensive copying', () => {
 
     const original = Buffer.from([0x01, 0x02]);
     const promise = queue.send({ data: original, description: 'test command', isStatus: () => false });
-    const rejection = expect(promise).rejects.toThrow();
+    // Review finding: this was a bare `toThrow()` (an assertion that cannot
+    // fail on message content) in the very round that reported eliminating
+    // those. This transport's `write()` always resolves, so the failure is
+    // a pure timeout with no recorded cause -- the exact message, asserted.
+    const rejection = expect(promise).rejects.toThrow('test command: no status received after 2 attempts');
 
     await clock.advance(1000); // attempt 1 times out -> retry (attempt 2)
     expect(written.map((b) => b.toString('hex'))).toEqual(['0102', '0102']); // NOT ['0102', 'eeee']

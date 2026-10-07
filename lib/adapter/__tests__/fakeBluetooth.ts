@@ -34,6 +34,23 @@
  * rather than none, which is the only way to tell "retries paced correctly
  * against a slow reconnect" apart from "retries that happened to work
  * because nothing ever took any time at all".
+ *
+ * SCAN TIMING IS PARTIAL (review finding, not fixed here): only `scan()`
+ * consumes clock time in this mode — `connect`/`discover`/`subscribe`
+ * still resolve on the next microtask regardless, exactly as in the
+ * default, fully-instant mode. A real reconnect costs "at least one full
+ * scan window PLUS connect/discover/subscribe" (connection.ts's own
+ * module header, and `queue.ts`'s account of the defect this was built to
+ * reproduce) — this fixture can only demonstrate the SCAN half of that
+ * sum. `DEFAULT_TIMEOUT_MS` being double `SCAN_DURATION_MS` is still the
+ * right constant (it needs to clear the scan plus whatever
+ * connect/discover/subscribe cost in reality, and doubling leaves
+ * headroom for that unmodelled remainder too) — it is this FIXTURE that
+ * proves less than a comment claiming "a reconnect costs scan plus
+ * connect" would suggest, not the constant that is wrong. A future task
+ * needing to exercise that fuller cost would need connect/discover/
+ * subscribe to accept their own simulated delay the same way `scan` now
+ * does.
  */
 
 import { k3 } from '../../mesh/crypto/derive';
@@ -101,6 +118,22 @@ interface FakeNode {
   missingCharacteristic: 'dataIn' | 'dataOut' | null;
 }
 
+/**
+ * KNOWN GAP, written down for the next task rather than fixed here (review
+ * finding, task 5's second round): `releaseWrite` never prunes a settled
+ * entry out of the per-peripheral array it reads from. Two consequences
+ * worth knowing before extending this: indices keep accumulating across a
+ * whole test (the Nth call to `write()` in 'hold' mode is always held at
+ * index N-1 within that peripheral, never index 0 again, even after
+ * earlier ones were released), and releasing the SAME index twice is
+ * silently a no-op (resolving/rejecting an already-settled promise does
+ * nothing) rather than an error. This is the OPPOSITE stance this file
+ * already takes for "nothing to act on" elsewhere (`releaseWrite` itself
+ * throws when the index was never held at all; `simulateDisconnect`/
+ * `simulateNotification` throw on their own "nothing to act on" cases) --
+ * a double-release should arguably throw too, for the same reason, but
+ * does not.
+ */
 interface HeldWrite {
   readonly resolve: () => void;
   readonly reject: (err: Error) => void;
@@ -262,7 +295,13 @@ export class FakeBluetoothPort implements BluetoothPort {
    *  end losing power, a radio error — anything other than this module's
    *  own `disconnect()`): invokes the `onDisconnect` callback `connect()`
    *  was given for it, exactly once. Throws if `id` is not currently
-   *  connected — a misconfigured test, not a thing to paper over. */
+   *  connected — a misconfigured test, not a thing to paper over.
+   *
+   *  KNOWN GAP (review finding): does NOT settle any write currently held
+   *  open for `id` (see `write()`'s own 'hold' branch) — a real GATT stack
+   *  would error an in-flight write when the link drops; this fake instead
+   *  leaves it pending forever. A test combining a held write with a
+   *  disconnect needs to `releaseWrite` it explicitly first. */
   simulateDisconnect(id: string): void {
     const open = this.openConnections.get(id);
     if (!open) {
@@ -383,6 +422,18 @@ export class FakeBluetoothPort implements BluetoothPort {
     return Buffer.from(value ?? Buffer.alloc(0));
   }
 
+  /**
+   * ASYMMETRY, written down for whoever next extends this (review finding,
+   * task 5's second round): `dropWrites` returns BEFORE recording anything
+   * in `writesReceived`, while `writeBehavior: 'fail'` records FIRST and
+   * THEN throws. Defensible as written -- `dropWrites` models a write that
+   * never reached the GATT layer at all (nothing to record), while 'fail'
+   * models one that WAS handed to the stack and only then rejected (the
+   * radio tried and failed, so the attempt genuinely happened) -- but the
+   * two were never stated side by side before now, and a future failure
+   * mode should pick one of these two shapes deliberately rather than by
+   * accident.
+   */
   async write(characteristic: CharacteristicHandle, data: Buffer): Promise<void> {
     const handle = this.requireConnectedCharacteristic(characteristic);
     const node = this.node(handle.peripheralId);
@@ -396,6 +447,17 @@ export class FakeBluetoothPort implements BluetoothPort {
       throw new Error(`FakeBluetoothPort.write: configured to fail for "${handle.peripheralId}"`);
     }
     if (node.writeBehavior === 'hold') {
+      // KNOWN GAP (review finding): a held write is NOT settled by
+      // `simulateDisconnect`/`simulateNodePoweredOff` below. A real GATT
+      // stack would error an in-flight write when the link drops; this
+      // fixture instead leaves it pending forever, so a test that holds a
+      // write and then disconnects gets a promise that never settles
+      // rather than one that rejects. The reviewer flagged this as the
+      // most likely of this fixture's asymmetries to bite a future task
+      // (the pairing flow inherits this file) -- not fixed here because
+      // task 5 never needed a disconnect-while-held scenario, but the next
+      // task that does will need `simulateDisconnect` to also reject every
+      // currently-held write for that peripheral.
       return new Promise<void>((resolve, reject) => {
         const held = this.heldWrites.get(handle.peripheralId) ?? [];
         held.push({ resolve, reject });
