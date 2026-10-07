@@ -39,7 +39,16 @@ import {
   type MeshTrafficPort,
 } from './meshLight';
 import type { NetworkStore } from '../../lib/adapter/store';
+import type { HomeyCapability } from '../../lib/models/capabilities';
 import { rangeFromUnknown, resolveTemperatureRange } from './temperatureRange';
+import {
+  COLOUR_MODES,
+  COLOUR_MODE_SETTING,
+  colourModeFromUnknown,
+  planCapabilityChange,
+  seedColourMode,
+  type ColourMode,
+} from './colourMode';
 
 /** What `app.ts`'s `BleMeshApp` exposes in-process. `getMeshContext()`
  *  returning `null` is unreachable in ordinary operation (app.ts starts the
@@ -73,6 +82,12 @@ function capabilityPort(device: LightDevice): DeviceCapabilityPort {
 class LightDevice extends Homey.Device {
   private controller: MeshLightController | null = null;
   private unregister: (() => void) | null = null;
+  /** Which capabilities already have a listener. `wireCapabilityListeners`
+   *  runs again after every colour-mode change (a capability ADDED at
+   *  runtime has no listener until one is registered for it), and without
+   *  this set, flipping the setting back and forth would stack a second,
+   *  third, fourth listener on the same capability. */
+  private readonly registeredCapabilityListeners = new Set<HomeyCapability>();
 
   async onInit(): Promise<void> {
     const host = this.homey.app as unknown as BleMeshAppHost;
@@ -111,18 +126,51 @@ class LightDevice extends Homey.Device {
     // delivery happens after an `await` inside an async call this file never
     // awaited — correct by accident of scheduling, not by this file's own
     // guarantee. `start()` first removes the accident.
+    // WHAT THIS LAMP PHYSICALLY HAS, applied BEFORE anything starts asking
+    // the node about it. `registerDeviceController` below can deliver an
+    // immediate `onConnectionStateChange('connected')`, which runs
+    // `reReadState()` — and that picks which Gets to send from
+    // `hasCapability`. Applying the mode first means it never asks a
+    // monocolor lamp for its colour, and never skips a slider the user has
+    // just restored. This touches only Homey's own device record; it sends
+    // nothing to the mesh.
+    await this.applyColourMode(await this.resolveColourMode());
+
     controller.start();
     this.unregister = host.registerDeviceController(controller);
 
-    if (this.hasCapability('onoff')) {
+    this.wireCapabilityListeners(controller);
+  }
+
+  async onUninit(): Promise<void> {
+    this.unregister?.();
+    this.unregister = null;
+    this.controller?.stop();
+  }
+
+  /**
+   * Registers a capability listener for every capability this device has
+   * and does not already have one for. Idempotent (see
+   * `registeredCapabilityListeners`), because it runs again whenever
+   * `applyColourMode` adds a capability at runtime.
+   */
+  private wireCapabilityListeners(controller: MeshLightController): void {
+    const once = (capability: HomeyCapability, register: () => void): void => {
+      if (!this.hasCapability(capability)) return;
+      if (this.registeredCapabilityListeners.has(capability)) return;
+      this.registeredCapabilityListeners.add(capability);
+      register();
+    };
+
+    once('onoff', () => {
       this.registerCapabilityListener('onoff', async (value: boolean) => controller.setOnOff(value));
-    }
-    if (this.hasCapability('dim')) {
+    });
+    once('dim', () => {
       this.registerCapabilityListener('dim', async (value: number) => controller.setDim(value));
-    }
-    if (this.hasCapability('light_temperature')) {
+    });
+    once('light_temperature', () => {
       this.registerCapabilityListener('light_temperature', async (value: number) => controller.setLightTemperature(value));
-    }
+    });
     if (this.hasCapability('light_hue') && this.hasCapability('light_saturation')) {
       // Hue and saturation travel together (Light HSL Set's own single
       // message — see meshLight.ts#setColor). Homey's own
@@ -132,31 +180,81 @@ class LightDevice extends Homey.Device {
       // each other with stale values for whichever field did not change
       // this time. The debounce window (500 ms) matches the example in
       // `@types/homey`'s own `Device#registerMultipleCapabilityListener`
-      // doc comment.
-      this.registerMultipleCapabilityListener(
-        ['light_hue', 'light_saturation'],
-        async (values: Record<string, unknown>) => {
-          const hue = typeof values.light_hue === 'number' ? values.light_hue : (this.getCapabilityValue('light_hue') as number);
-          const saturation =
-            typeof values.light_saturation === 'number'
-              ? values.light_saturation
-              : (this.getCapabilityValue('light_saturation') as number);
-          await controller.setColor(hue, saturation);
-        },
-        500,
-      );
+      // doc comment. Keyed on `light_hue` alone because ONE registration
+      // covers the pair — and the pair always arrives and leaves together
+      // (`colourMode.ts`'s own nesting).
+      once('light_hue', () => {
+        this.registerMultipleCapabilityListener(
+          ['light_hue', 'light_saturation'],
+          async (values: Record<string, unknown>) => {
+            const hue = typeof values.light_hue === 'number' ? values.light_hue : (this.getCapabilityValue('light_hue') as number);
+            const saturation =
+              typeof values.light_saturation === 'number'
+                ? values.light_saturation
+                : (this.getCapabilityValue('light_saturation') as number);
+            await controller.setColor(hue, saturation);
+          },
+          500,
+        );
+      });
     }
-    if (this.hasCapability('light_mode')) {
+    once('light_mode', () => {
       this.registerCapabilityListener('light_mode', async (value: string) => {
         await this.setCapabilityValue('light_mode', value);
       });
-    }
+    });
   }
 
-  async onUninit(): Promise<void> {
-    this.unregister?.();
-    this.unregister = null;
-    this.controller?.stop();
+  /**
+   * This device's colour mode: the user's own stored answer, or — for a
+   * bulb paired before this setting existed — one SEEDED from the
+   * capabilities pairing already gave it, and written back so the dropdown
+   * shows the truth rather than a blank.
+   *
+   * SEEDING FROM THE DEVICE'S OWN CAPABILITIES IS PROVABLY A NO-OP
+   * (`__tests__/colourMode.test.ts` pins exactly that), which is what makes
+   * it safe to do unprompted on a device nobody has said anything about. A
+   * manifest DEFAULT would not have been: Homey would hand it back from
+   * `getSetting` indistinguishably from a real answer, and applying it
+   * would add or remove capabilities on the strength of a guess — which is
+   * why `driver.compose.json`'s dropdown deliberately carries none.
+   *
+   * A failed write is logged and otherwise ignored: the mode still applies
+   * this run, and the next start seeds it again.
+   */
+  private async resolveColourMode(): Promise<ColourMode> {
+    const stored = colourModeFromUnknown(this.getSetting(COLOUR_MODE_SETTING));
+    if (stored !== null) return stored;
+    const seeded = seedColourMode(this.getCapabilities());
+    try {
+      await this.setSettings({ [COLOUR_MODE_SETTING]: seeded });
+    } catch (err) {
+      this.error('could not seed the colour-mode setting', err);
+    }
+    return seeded;
+  }
+
+  /**
+   * Brings this device's capabilities into line with `mode`, adding and
+   * removing them in place — no re-pairing, and no reload.
+   *
+   * REMOVE FIRST, THEN ADD, THEN RE-WIRE. Removing first is what keeps
+   * `light_mode` from ever being visible without both pickers it switches
+   * between (`colourMode.ts#planCapabilityChange` orders its own removals
+   * for the same reason). Re-wiring last is not optional: a capability
+   * Homey has just been given has no listener until one is registered for
+   * it, so without it a user correcting `monocolor` back to `multicolor`
+   * would get pickers that do nothing at all.
+   *
+   * Homey's own `addCapability`/`removeCapability` are documented as
+   * expensive, which is why the plan is computed first and the common case
+   * (nothing to change) performs no calls whatsoever.
+   */
+  private async applyColourMode(mode: ColourMode): Promise<void> {
+    const plan = planCapabilityChange(mode, this.getCapabilities());
+    for (const capability of plan.remove) await this.removeCapability(capability);
+    for (const capability of plan.add) await this.addCapability(capability);
+    if (this.controller !== null) this.wireCapabilityListeners(this.controller);
   }
 
   /** The user's own setting first, then the node's own reported range from
@@ -177,13 +275,26 @@ class LightDevice extends Homey.Device {
    * cannot see.
    */
   async onSettings(event: { newSettings: Record<string, unknown>; changedKeys: string[] }): Promise<void> {
+    // THE COLOUR MODE TAKES EFFECT IMMEDIATELY, which is the whole point of
+    // it: the user looks at the lamp, says what it is, and the capabilities
+    // follow without a re-pair. `event.newSettings`, not `getSetting`:
+    // Homey has not persisted the change yet at this point, and throwing
+    // below is what refuses it.
+    if (event.changedKeys.includes(COLOUR_MODE_SETTING)) {
+      const mode = colourModeFromUnknown(event.newSettings[COLOUR_MODE_SETTING]);
+      if (mode === null) {
+        throw new Error(`The colour mode must be one of: ${COLOUR_MODES.join(', ')}.`);
+      }
+      await this.applyColourMode(mode);
+    }
+
     if (!event.changedKeys.includes('temperature_min_kelvin') && !event.changedKeys.includes('temperature_max_kelvin')) {
       return;
     }
     const range = rangeFromUnknown(event.newSettings.temperature_min_kelvin, event.newSettings.temperature_max_kelvin);
     if (range === null || this.controller === null || !this.controller.setTemperatureRange(range)) {
       throw new Error(
-        'The warmest value must be below the coolest one, and both must be between 800 K and 20000 K (Mesh Model Table 6.6).',
+        'The lowest value must be below the highest one, and both must be between 800 K and 20000 K (Mesh Model Table 6.6).',
       );
     }
   }

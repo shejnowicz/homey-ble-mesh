@@ -47,29 +47,39 @@ describe('device.ts wires meshLight.ts to Homey (source-text, not behaviour)', (
   const source = readDeviceSource();
   const onInitBody = sliceBetween(source, 'async onInit(): Promise<void> {', 'async onUninit(): Promise<void> {');
   const onDeletedBody = sliceBetween(source, 'async onDeleted(): Promise<void> {', 'module.exports');
+  // The listener registrations moved out of `onInit` into a named method
+  // when the colour-mode setting arrived: a capability ADDED at runtime
+  // needs its listener registered then too, so the registrations had to be
+  // callable more than once. They are still checked here, in their new
+  // home, plus the call from `onInit` that reaches them at all.
+  const wireBody = sliceBetween(source, 'private wireCapabilityListeners(', '\n  }\n');
 
-  test('onInit registers a capability listener calling controller.setOnOff', () => {
-    expect(onInitBody).toMatch(/registerCapabilityListener\(\s*'onoff'/);
-    expect(onInitBody).toMatch(/controller\.setOnOff\(/);
+  test('onInit actually calls the thing that registers the capability listeners', () => {
+    expect(onInitBody).toMatch(/this\.wireCapabilityListeners\(controller\)/);
   });
 
-  test('onInit registers a capability listener calling controller.setDim', () => {
-    expect(onInitBody).toMatch(/registerCapabilityListener\(\s*'dim'/);
-    expect(onInitBody).toMatch(/controller\.setDim\(/);
+  test('a capability listener calls controller.setOnOff', () => {
+    expect(wireBody).toMatch(/registerCapabilityListener\(\s*'onoff'/);
+    expect(wireBody).toMatch(/controller\.setOnOff\(/);
   });
 
-  test('onInit registers a capability listener calling controller.setLightTemperature', () => {
-    expect(onInitBody).toMatch(/registerCapabilityListener\(\s*'light_temperature'/);
-    expect(onInitBody).toMatch(/controller\.setLightTemperature\(/);
+  test('a capability listener calls controller.setDim', () => {
+    expect(wireBody).toMatch(/registerCapabilityListener\(\s*'dim'/);
+    expect(wireBody).toMatch(/controller\.setDim\(/);
   });
 
-  test('onInit registers a MULTIPLE capability listener calling controller.setColor', () => {
-    expect(onInitBody).toMatch(/registerMultipleCapabilityListener\(/);
-    expect(onInitBody).toMatch(/controller\.setColor\(/);
+  test('a capability listener calls controller.setLightTemperature', () => {
+    expect(wireBody).toMatch(/registerCapabilityListener\(\s*'light_temperature'/);
+    expect(wireBody).toMatch(/controller\.setLightTemperature\(/);
   });
 
-  test('onInit registers a capability listener for light_mode', () => {
-    expect(onInitBody).toMatch(/registerCapabilityListener\(\s*'light_mode'/);
+  test('a MULTIPLE capability listener calls controller.setColor', () => {
+    expect(wireBody).toMatch(/registerMultipleCapabilityListener\(/);
+    expect(wireBody).toMatch(/controller\.setColor\(/);
+  });
+
+  test('a capability listener is registered for light_mode', () => {
+    expect(wireBody).toMatch(/registerCapabilityListener\(\s*'light_mode'/);
   });
 
   test('onInit wires the device into the availability mechanism: start() AND registration with the app', () => {
@@ -130,6 +140,80 @@ describe('device.ts wires the per-device colour-temperature range (source-text)'
     // range the controller rejected and the two would silently disagree.
     expect(onSettingsBody).toMatch(/setTemperatureRange\(/);
     expect(onSettingsBody).toMatch(/throw new Error/);
+  });
+});
+
+describe('device.ts applies the per-device colour mode (source-text)', () => {
+  const source = readDeviceSource();
+  const onInitBody = sliceBetween(source, 'async onInit(): Promise<void> {', 'async onUninit(): Promise<void> {');
+  const onSettingsBody = sliceBetween(source, 'async onSettings(', 'async onDeleted(): Promise<void> {');
+
+  test('onInit resolves the mode and applies it', () => {
+    // Without this, the setting would only take effect on a re-pair — and
+    // a device seeded `multicolor` by a guess would keep its colour pickers
+    // whatever the user said.
+    expect(onInitBody).toMatch(/resolveColourMode\(/);
+    expect(onInitBody).toMatch(/applyColourMode\(/);
+  });
+
+  test('onInit applies the mode BEFORE registering with the app, so a re-read never asks about a capability that is about to go', () => {
+    const applyIndex = onInitBody.indexOf('applyColourMode(');
+    const registerIndex = onInitBody.indexOf('registerDeviceController(');
+    expect(applyIndex).toBeGreaterThan(-1);
+    expect(registerIndex).toBeGreaterThan(-1);
+    expect(applyIndex).toBeLessThan(registerIndex);
+  });
+
+  test('onSettings reacts to the colour-mode setting, not only to the range', () => {
+    // The key test is that it looks at `changedKeys` for THIS setting:
+    // merely mentioning the constant somewhere in the method would also be
+    // true of a version that never acts on it.
+    expect(onSettingsBody).toMatch(/changedKeys\.includes\(COLOUR_MODE_SETTING\)/);
+    expect(onSettingsBody).toMatch(/applyColourMode\(/);
+    // ...and from `newSettings`, because Homey has not persisted the change
+    // yet at the point `onSettings` runs.
+    expect(onSettingsBody).toMatch(/newSettings\[COLOUR_MODE_SETTING\]/);
+  });
+
+  test('applying a mode goes through planCapabilityChange and actually adds AND removes capabilities', () => {
+    const applyBody = sliceBetween(source, 'private async applyColourMode(', '\n  }\n');
+    expect(applyBody).toMatch(/planCapabilityChange\(/);
+    expect(applyBody).toMatch(/this\.removeCapability\(/);
+    expect(applyBody).toMatch(/this\.addCapability\(/);
+  });
+
+  test('applying a mode removes BEFORE it adds, and re-wires the listeners afterwards', () => {
+    // A capability added at runtime has no listener until one is registered
+    // for it; without the re-wire, a user correcting monocolor to multicolor
+    // would get pickers that do nothing.
+    const applyBody = sliceBetween(source, 'private async applyColourMode(', '\n  }\n');
+    const removeIndex = applyBody.indexOf('this.removeCapability(');
+    const addIndex = applyBody.indexOf('this.addCapability(');
+    const wireIndex = applyBody.indexOf('wireCapabilityListeners(');
+    expect(removeIndex).toBeLessThan(addIndex);
+    expect(addIndex).toBeLessThan(wireIndex);
+  });
+
+  test('an ABSENT setting is seeded from the device\'s own capabilities, never from a guess', () => {
+    // A bulb paired before this setting existed has nothing stored. Seeding
+    // from its own capability list is provably a no-op (colourMode.test.ts
+    // pins that), where acting on a manifest default would not be.
+    const resolveBody = sliceBetween(source, 'private async resolveColourMode(', '\n  }\n');
+    expect(resolveBody).toMatch(/colourModeFromUnknown\(this\.getSetting\(COLOUR_MODE_SETTING\)\)/);
+    expect(resolveBody).toMatch(/seedColourMode\(this\.getCapabilities\(\)\)/);
+    expect(resolveBody).toMatch(/setSettings\(/);
+  });
+
+  test('each capability listener is registered at most once, however often the mode changes', () => {
+    // `wireCapabilityListeners` runs again on every mode change; without the
+    // guard, flipping the setting back and forth would stack duplicate
+    // listeners on the same capability.
+    const wireBody = sliceBetween(source, 'private wireCapabilityListeners(', '\n  }\n');
+    // BOTH halves, because either one alone is useless: a set that is added
+    // to but never consulted guards nothing, and one consulted but never
+    // added to guards everything out.
+    expect(wireBody).toMatch(/if \(this\.registeredCapabilityListeners\.has\(capability\)\) return;/);
+    expect(wireBody).toMatch(/this\.registeredCapabilityListeners\.add\(capability\);/);
   });
 });
 

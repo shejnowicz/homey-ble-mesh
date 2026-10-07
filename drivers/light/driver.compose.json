@@ -29,6 +29,36 @@
   },
   "settings": [
     {
+      "id": "colour_mode",
+      "type": "dropdown",
+      "label": {
+        "en": "What this bulb can do"
+      },
+      "hint": {
+        "en": "Colour cannot be measured over the mesh, so a bulb added as multicolor is a guess made from what it claims about itself, and you should correct it here if your lamp has no colour LEDs."
+      },
+      "values": [
+        {
+          "id": "monocolor",
+          "label": {
+            "en": "White only — on/off and brightness"
+          }
+        },
+        {
+          "id": "warm",
+          "label": {
+            "en": "Tunable white — on/off, brightness and colour temperature"
+          }
+        },
+        {
+          "id": "multicolor",
+          "label": {
+            "en": "Colour — on/off, brightness, colour temperature, hue and saturation"
+          }
+        }
+      ]
+    },
+    {
       "type": "group",
       "label": {
         "en": "Colour temperature values this app sends"

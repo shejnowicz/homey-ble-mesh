@@ -1863,6 +1863,20 @@ const ALL_LIGHTING_MODELS_COMPOSITION = Buffer.from([
 
 const ALL_MODELS_COMPOSITION_PAYLOAD = Buffer.concat([Buffer.from([0x02, 0x00]), ALL_LIGHTING_MODELS_COMPOSITION]);
 
+/** A tunable-white bulb with no colour emitters AND no HSL declaration —
+ *  the shape that seeds the colour-mode setting to `warm`. Same header as
+ *  above; element 0 declares four SIG models, the Light HSL Server omitted. */
+const CTL_ONLY_COMPOSITION = Buffer.from([
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // header
+  0x00, 0x00, 0x04, 0x00, // loc=0x0000, NumS=4, NumV=0
+  0x00, 0x10, // Generic OnOff Server
+  0x00, 0x13, // Light Lightness Server
+  0x03, 0x13, // Light CTL Server
+  0x06, 0x13, // Light CTL Temperature Server
+]);
+
+const CTL_ONLY_COMPOSITION_PAYLOAD = Buffer.concat([Buffer.from([0x02, 0x00]), CTL_ONLY_COMPOSITION]);
+
 /**
  * Short probe timings for the tests below, injected rather than waited on.
  * The production numbers (1500 ms per probe, 9000 ms total) are pinned in
@@ -1982,7 +1996,11 @@ describe('the capability probe, through a real pairing', () => {
     expect(outcome.kind).toBe('paired');
     if (outcome.kind !== 'paired') return;
     expect(store.getState().nodes[0]?.probe?.temperatureRange).toEqual({ minKelvin: 2200, maxKelvin: 6500 });
-    expect(outcome.device.settings).toEqual({ temperature_min_kelvin: 2200, temperature_max_kelvin: 6500 });
+    expect(outcome.device.settings).toEqual({
+      temperature_min_kelvin: 2200,
+      temperature_max_kelvin: 6500,
+      colour_mode: 'multicolor',
+    });
   });
 
   test("a node that never answers Range Get (the owner's own bulb) falls back to the documented default in its settings", async () => {
@@ -2001,7 +2019,11 @@ describe('the capability probe, through a real pairing', () => {
     // The full legal span, not any particular lamp's output — see
     // temperatureRange.ts's own header for why a bulb that rescales makes a
     // measured-from-one-bulb default the wrong choice.
-    expect(outcome.device.settings).toEqual({ temperature_min_kelvin: 800, temperature_max_kelvin: 20000 });
+    expect(outcome.device.settings).toEqual({
+      temperature_min_kelvin: 800,
+      temperature_max_kelvin: 20000,
+      colour_mode: 'multicolor',
+    });
   });
 
   test("a node answering Table 6.8's own 0xFFFF \"unknown\" row is treated as having said nothing, not as a 65535 K bulb", async () => {
@@ -2017,7 +2039,66 @@ describe('the capability probe, through a real pairing', () => {
     expect(outcome.kind).toBe('paired');
     if (outcome.kind !== 'paired') return;
     expect(store.getState().nodes[0]?.probe?.temperatureRange).toBeNull();
-    expect(outcome.device.settings).toEqual({ temperature_min_kelvin: 800, temperature_max_kelvin: 20000 });
+    expect(outcome.device.settings).toEqual({
+      temperature_min_kelvin: 800,
+      temperature_max_kelvin: 20000,
+      colour_mode: 'multicolor',
+    });
+  });
+
+  // =========================================================================
+  // THE COLOUR-MODE SEED. `lib/models/capabilities.ts`'s own "WHAT THE PROBE
+  // CANNOT SETTLE" note: no wire probe can tell whether a lamp has colour
+  // LEDs, because a lamp with none still acknowledges `Light HSL Set` with a
+  // correct echo. Pairing therefore seeds the per-device setting from what
+  // it DOES know, and the user corrects it.
+  // =========================================================================
+
+  test('HSL declared seeds the new device as multicolor — the guess the user corrects', async () => {
+    const { bluetooth, clock, deps } = setUp();
+    addUnprovisionedNode(bluetooth, 'seed-colour', -50);
+    installSuccessfulNodeBehaviour(bluetooth, 'seed-colour', 1, 2, {
+      compositionAccessPayload: ALL_MODELS_COMPOSITION_PAYLOAD,
+    });
+
+    const outcome = await pairWhileAdvancing(deps, 'seed-colour', clock);
+
+    expect(outcome.kind).toBe('paired');
+    if (outcome.kind !== 'paired') return;
+    expect(outcome.device.capabilities).toContain('light_hue');
+    expect(outcome.device.settings.colour_mode).toBe('multicolor');
+  });
+
+  test('a node measured to run NEITHER colour-temperature model, and declaring no HSL, seeds as monocolor', async () => {
+    // COMPOSITION_DATA_PAGE0_SAMPLE declares Generic OnOff Server and
+    // nothing else this design maps — no Lightness, no CTL, no HSL — so
+    // there is neither a temperature nor a colour to seed from.
+    const { bluetooth, deps } = setUp();
+    addUnprovisionedNode(bluetooth, 'seed-mono', -50);
+    installSuccessfulNodeBehaviour(bluetooth, 'seed-mono', 1, 2);
+
+    const outcome = await pairNode(deps, 'seed-mono');
+
+    expect(outcome.kind).toBe('paired');
+    if (outcome.kind !== 'paired') return;
+    expect(outcome.device.capabilities).toEqual(['onoff']);
+    expect(outcome.device.settings.colour_mode).toBe('monocolor');
+  });
+
+  test('a node with colour temperature but no HSL seeds as warm', async () => {
+    const { bluetooth, clock, deps } = setUp();
+    addUnprovisionedNode(bluetooth, 'seed-warm', -50);
+    installSuccessfulNodeBehaviour(bluetooth, 'seed-warm', 1, 2, {
+      compositionAccessPayload: CTL_ONLY_COMPOSITION_PAYLOAD,
+    });
+
+    const outcome = await pairWhileAdvancing(deps, 'seed-warm', clock);
+
+    expect(outcome.kind).toBe('paired');
+    if (outcome.kind !== 'paired') return;
+    expect(outcome.device.capabilities).toContain('light_temperature');
+    expect(outcome.device.capabilities).not.toContain('light_hue');
+    expect(outcome.device.settings.colour_mode).toBe('warm');
   });
 });
 

@@ -1,6 +1,7 @@
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { DEFAULT_TEMPERATURE_RANGE, MAX_LEGAL_KELVIN, MIN_LEGAL_KELVIN } from '../temperatureRange';
+import { COLOUR_MODE_SETTING, COLOUR_MODES } from '../colourMode';
 
 /**
  * THE MANIFEST IS CODE TOO, and nothing was checking it.
@@ -121,6 +122,54 @@ describe('the colour-temperature range settings are the range this app SENDS', (
   test('both hints say the range should only be NARROWED if the bulb misbehaves', () => {
     for (const hint of [englishHint(min), englishHint(max)]) {
       expect(hint).toMatch(/narrow/i);
+    }
+  });
+});
+
+describe('the colour-mode setting', () => {
+  const setting = findSetting(COLOUR_MODE_SETTING);
+
+  test('it is a dropdown offering exactly the three modes the code knows about', () => {
+    expect(setting.type).toBe('dropdown');
+    expect((setting.values ?? []).map((value) => value.id)).toEqual([...COLOUR_MODES]);
+  });
+
+  test('every option is labelled in English', () => {
+    for (const value of setting.values ?? []) {
+      expect(typeof value.label.en).toBe('string');
+      expect(value.label.en?.length ?? 0).toBeGreaterThan(0);
+    }
+  });
+
+  test('it carries NO manifest default', () => {
+    // Load-bearing, not an omission. A bulb paired before this setting
+    // existed has nothing stored for it, and a manifest default would be a
+    // GUESS Homey hands back from `getSetting` as if it were the user's own
+    // answer — `device.ts` would then apply it and add or remove
+    // capabilities on a device nobody has said anything about. With no
+    // default, "nothing stored" stays distinguishable, and `device.ts`
+    // seeds the value from that device's own capabilities instead.
+    expect(setting.value).toBeUndefined();
+  });
+
+  test('the hint says, in one plain sentence, that multicolor is a guess the user corrects', () => {
+    const hint = englishHint(setting);
+    expect(hint).toMatch(/multicolor/i);
+    expect(hint).toMatch(/guess/i);
+    // One sentence: exactly one terminating full stop, at the very end.
+    expect(hint.trimEnd().endsWith('.')).toBe(true);
+    expect(hint.match(/\.(\s|$)/g) ?? []).toHaveLength(1);
+  });
+});
+
+describe('the manifest and the capability mapping still agree', () => {
+  test('every capability the colour-mode setting can add is one the driver declares', () => {
+    // `device.ts` calls `addCapability` for these at runtime; Homey only
+    // accepts a capability the driver itself declares, so a mode naming one
+    // the manifest does not list would fail on the hub and nowhere else.
+    const declared = new Set(readManifest().capabilities);
+    for (const capability of ['onoff', 'dim', 'light_temperature', 'light_hue', 'light_saturation', 'light_mode']) {
+      expect(declared.has(capability)).toBe(true);
     }
   });
 });

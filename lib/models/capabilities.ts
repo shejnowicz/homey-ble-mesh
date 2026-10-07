@@ -52,8 +52,13 @@ import { CompositionData, ElementDescription } from '../mesh/config/composition'
  *      `Light HSL Set` with a correct echo and emits only white; the
  *      manufacturer's own app confirms it is warm-to-cold white only. No
  *      wire probe can see that, so the HSL row stays declaration-driven
- *      until the owner's planned per-device monocolor/multicolor/warm
- *      setting exists to say so directly. Do not try to infer it here.
+ *      here — and that is now only the SEED. The per-device
+ *      monocolor/warm/multicolor setting this note used to call "planned"
+ *      exists (`drivers/light/colourMode.ts`): what this function returns
+ *      is what a lamp STARTS with, and the user's own answer overrides it
+ *      afterward by adding and removing the capabilities directly. Do not
+ *      try to infer colour emitters here; there is now somewhere proper for
+ *      that answer to come from.
  *   2. THE COLOUR-TEMPERATURE RANGE. `Light CTL Temperature Range Get` is
  *      the SIG's own answer and some nodes simply never reply to it (the
  *      owner's does not), which is why `NodeProbeResult.temperatureRange`
@@ -339,8 +344,10 @@ export function mapCompositionToCapabilities(
     // probe's `'supported'` here means only "the model answers", never "the
     // lamp has colour LEDs", and its `'unsupported'` would be the only
     // useful half - too little to justify treating this row differently
-    // from the declaration until the owner's planned per-device
-    // monocolor/multicolor/warm setting exists to resolve it properly.
+    // from the declaration. The per-device monocolor/warm/multicolor
+    // setting (`drivers/light/colourMode.ts`) is what resolves it properly,
+    // one layer up: this row is the SEED that setting starts from, not the
+    // last word on it.
     const hasHsl = element.sigModels.includes(MODEL_ID_LIGHT_HSL_SERVER);
 
     if (hasOnOff) {

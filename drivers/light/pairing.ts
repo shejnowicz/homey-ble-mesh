@@ -59,6 +59,7 @@ import {
 } from '../../lib/models/capabilities';
 import { probeModels, type ProbeTransport } from './modelProbe';
 import { DEFAULT_TEMPERATURE_RANGE } from './temperatureRange';
+import { COLOUR_MODE_SETTING, seedColourMode, type ColourMode } from './colourMode';
 
 /**
  * Pairing (docs/superpowers/specs/2026-10-06-ble-mesh-provisioner-design.md,
@@ -1193,11 +1194,20 @@ export interface PairedDeviceDescriptor {
    *  advertising under, for task 7's connection use. */
   readonly store: { readonly peripheralId: string };
   /** Initial per-device settings (`driver.compose.json`'s own `settings`
-   *  block) - the colour-temperature range, seeded from what the node
-   *  reported about itself at pairing time, or from the documented
-   *  fallback when it reported nothing. The user can correct it afterward;
-   *  see `temperatureRange.ts`. */
-  readonly settings: { readonly temperature_min_kelvin: number; readonly temperature_max_kelvin: number };
+   *  block), seeded from what pairing actually learned and corrected by the
+   *  user afterward:
+   *    - the colour-temperature VALUES THIS APP SENDS, from what the node
+   *      reported about itself, or from the documented full-span fallback
+   *      when it reported nothing (`temperatureRange.ts`);
+   *    - the colour mode, from the capabilities the declaration and the
+   *      probe between them produced (`colourMode.ts#seedColourMode`). This
+   *      one is a GUESS whenever it comes out `'multicolor'`, because no
+   *      wire probe can tell whether a lamp has colour emitters at all. */
+  readonly settings: {
+    readonly temperature_min_kelvin: number;
+    readonly temperature_max_kelvin: number;
+    readonly colour_mode: ColourMode;
+  };
 }
 
 export type PairingOutcome =
@@ -1516,7 +1526,15 @@ function finishPairing(
       data: { id: String(nodeAddress) },
       capabilities,
       store: { peripheralId },
-      settings: { temperature_min_kelvin: range.minKelvin, temperature_max_kelvin: range.maxKelvin },
+      settings: {
+        temperature_min_kelvin: range.minKelvin,
+        temperature_max_kelvin: range.maxKelvin,
+        // Seeded from the capability list computed just above, not from the
+        // composition or the probe directly, so this can never disagree
+        // with what the device is actually given - see
+        // `colourMode.ts#seedColourMode`.
+        [COLOUR_MODE_SETTING]: seedColourMode(capabilities),
+      },
     },
   };
 }
