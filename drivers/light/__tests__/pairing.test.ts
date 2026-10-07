@@ -4,6 +4,9 @@ import {
   connectForProvisioning,
   parseBleUuid,
   bleUuidString,
+  tryParseBleUuid,
+  filterKnownServiceData,
+  filterKnownCharacteristics,
   DEFAULT_PAIRING_STEP_TIMEOUT_MS,
   type PairingDeps,
   type ProvisioningRandomSource,
@@ -15,6 +18,7 @@ import {
   MESH_PROVISIONING_SERVICE_UUID,
   MESH_PROVISIONING_DATA_IN_UUID,
   MESH_PROVISIONING_DATA_OUT_UUID,
+  MESH_PROXY_SERVICE_UUID,
   type BluetoothPort,
   type ScanResult,
   type DiscoveredCharacteristic,
@@ -261,6 +265,14 @@ interface ConfigResponderOptions {
    *  a node that is unreachable for the reset too) — default false
    *  (replies with Node Reset Status and returns to the unowned state). */
   readonly failReset?: boolean;
+  /** When true, a Config Node Reset request is answered with the WRONG
+   *  status message type (an AppKey Status) instead of silence or a
+   *  correct Node Reset Status — a node that is reachable but misbehaves,
+   *  as opposed to one that is merely unreachable (`failReset`). Exercises
+   *  `attemptNodeReset`'s `status.type !== 'nodeReset'` branch, which
+   *  silence alone cannot reach (that path throws/times out before ever
+   *  decoding a reply to check its type). */
+  readonly nodeResetWrongReply?: boolean;
 }
 
 function installConfigResponder(
@@ -343,6 +355,11 @@ function installConfigResponder(
       // model the node's real response: it returns to the unowned state
       // and is scannable again.
       if (options.failReset) return undefined; // modelling a node unreachable for the reset too
+      if (options.nodeResetWrongReply) {
+        // Reachable, but answers with the WRONG status type (an AppKey
+        // Status) — never silently treated as a successful reset.
+        return sendAsNode(Buffer.from([0x80, 0x03, 0x00, 0x00, 0x00, 0x00]));
+      }
       bluetooth.reconfigureAsUnprovisioned(peripheralId, UNPROVISIONED_SERVICE_DATA);
       return sendAsNode(Buffer.from([0x80, 0x4a])); // Config Node Reset Status — no parameters.
     }
@@ -399,13 +416,24 @@ describe('scanForUnprovisionedNodes', () => {
 
 describe('a successful pairing', () => {
   test('produces a device whose capabilities match the composition the node reported, and a store entry with its address/device key/composition', async () => {
-    const { bluetooth, store, deps } = setUp();
+    const { bluetooth, store, clock, deps } = setUp();
     addUnprovisionedNode(bluetooth, 'bulb-1', -55);
     // Deterministic per this project's own allocator (MIN_UNICAST_ADDRESS):
     // our own address is 1 (first-run), the first node paired is 2.
     installSuccessfulNodeBehaviour(bluetooth, 'bulb-1', 1, 2);
 
     const outcome = await pairNode(deps, 'bulb-1');
+
+    // THE LEAK CHECK (review finding, smaller item): every bounded GATT
+    // operation across BOTH GATT sessions (connect/discover/subscribe/
+    // write/next/disconnect, twice over) must have cleared its own timer
+    // on success — `withTimeout` already does (`clock.clearTimeout(timer)`
+    // on both the fulfil and reject branches), but nothing previously
+    // asserted it, the same instrument `lib/adapter/__tests__/queue.test.ts`
+    // already uses for its own analogous check ("a settled command actually
+    // cancels its own timer"). A single skipped `clearTimeout` anywhere in
+    // this whole successful run would leave this above 0.
+    expect(clock.pendingCount()).toBe(0);
 
     expect(outcome.kind).toBe('paired');
     if (outcome.kind !== 'paired') return; // narrows for the type checker; the expect above already fails the test otherwise
@@ -643,6 +671,64 @@ describe('a silent node', () => {
 });
 
 // ===========================================================================
+// The pairing step timeout — review finding (smaller item): the tests above
+// assert a stall message against `DEFAULT_PAIRING_STEP_TIMEOUT_MS` ITSELF,
+// so they cannot tell thirty seconds from one millisecond (whatever the
+// constant equals, the message echoes it, and the assertion always passes);
+// and `PairingDeps.stepTimeoutMs`'s override was never exercised at all —
+// dead in every test. These two tests pin the DEFAULT's actual value as a
+// literal (the same convention `lib/adapter/__tests__/queue.test.ts` uses
+// for its own `DEFAULT_MAX_ATTEMPTS`), and prove the OVERRIDE, not the
+// default, is what actually gates the deadline.
+// ===========================================================================
+
+describe('the pairing step timeout', () => {
+  test('DEFAULT_PAIRING_STEP_TIMEOUT_MS is thirty seconds', () => {
+    expect(DEFAULT_PAIRING_STEP_TIMEOUT_MS).toBe(30_000);
+  });
+
+  test('stepTimeoutMs overrides the default — the actual deadline used, not merely a value echoed in the failure message', async () => {
+    const { bluetooth, clock, deps } = setUp();
+    const customTimeoutMs = 500; // deliberately far from DEFAULT_PAIRING_STEP_TIMEOUT_MS
+    addUnprovisionedNode(bluetooth, 'silent-custom-timeout', -50);
+    bluetooth.setAutoResponder('silent-custom-timeout', () => undefined); // never replies to anything
+
+    const outcomePromise = pairNode({ ...deps, stepTimeoutMs: customTimeoutMs }, 'silent-custom-timeout');
+    let settled = false;
+    void outcomePromise.then(
+      () => {
+        settled = true;
+      },
+      () => {
+        settled = true;
+      },
+    );
+    await waitUntil(() => bluetooth.writesReceived.length >= 1 && clock.pendingCount() >= 1);
+
+    // THE DISCRIMINATING ASSERTION, part 1: advancing by one less than the
+    // OVERRIDE must not settle the attempt yet — a mutation that used the
+    // override as, say, a multiplier instead of a replacement could still
+    // pass part 2 below while failing this one.
+    await clock.advance(customTimeoutMs - 1);
+    expect(settled).toBe(false);
+
+    // THE DISCRIMINATING ASSERTION, part 2: the remaining 1ms crosses the
+    // OVERRIDE's own deadline. If the override were ignored (the real
+    // deadline silently staying at DEFAULT_PAIRING_STEP_TIMEOUT_MS, thirty
+    // seconds away), this would never settle, and the bounded `waitUntil`
+    // below — not jest's own test timeout — is what reports that cleanly.
+    await clock.advance(1);
+    await waitUntil(() => settled, 50);
+    const outcome = await outcomePromise;
+
+    expect(outcome.kind).toBe('failed');
+    if (outcome.kind !== 'failed') return;
+    expect(outcome.message).toContain(`${customTimeoutMs}ms`);
+    expect(outcome.message).not.toContain(`${DEFAULT_PAIRING_STEP_TIMEOUT_MS}ms`);
+  });
+});
+
+// ===========================================================================
 // Composition data that does not parse.
 // ===========================================================================
 
@@ -773,6 +859,34 @@ describe('the node refuses a configuration request', () => {
     expect(outcome.message).toContain('that also failed');
     expect(outcome.message).toContain('manual factory reset');
     expect(store.getState().nodes).toHaveLength(0);
+  });
+
+  test('when the reset is answered with the WRONG status message type, that is reported as a failure too, never treated as a successful reset', async () => {
+    const { bluetooth, store, deps } = setUp();
+    addUnprovisionedNode(bluetooth, 'reset-wrong-reply', -50);
+    installSuccessfulNodeBehaviour(bluetooth, 'reset-wrong-reply', 1, 2, { modelAppStatus: 0x0d, nodeResetWrongReply: true });
+
+    const outcome = await pairNode(deps, 'reset-wrong-reply');
+
+    expect(outcome.kind).toBe('failed');
+    if (outcome.kind !== 'failed') return;
+    expect(outcome.message).toContain('Model App Bind was refused');
+    expect(outcome.message).toContain('attempted to reset the node');
+    expect(outcome.message).toContain('that also failed');
+    expect(outcome.message).toContain('node did not answer Config Node Reset with a Node Reset Status message');
+    expect(outcome.message).toContain('manual factory reset');
+    expect(store.getState().nodes).toHaveLength(0);
+    // THE DISCRIMINATING ASSERTION: a silent-node reset failure
+    // (the test above) and a wrong-reply-type reset failure both produce
+    // "that also failed", so wording alone cannot tell them apart from a
+    // mutation that stops checking `status.type`. This does: a node
+    // answering with the wrong type was never actually moved back to the
+    // unowned state (`reconfigureAsUnprovisioned` is only called on the
+    // CORRECT-reply branch), so it must not show up in a fresh scan — a
+    // mutation that accepted ANY decodable status as "reset successful"
+    // would make this fail while the message assertions above would not.
+    const candidates = await scanForUnprovisionedNodes(bluetooth);
+    expect(candidates.map((c) => c.peripheralId)).not.toContain('reset-wrong-reply');
   });
 });
 
@@ -1022,7 +1136,8 @@ describe('characteristic lookup discriminates by BOTH service and characteristic
       disconnect: async (): Promise<void> => {},
     };
 
-    const session = await connectForProvisioning(port, 'peripheral-x');
+    const clock = createFakeClock();
+    const session = await connectForProvisioning(port, 'peripheral-x', clock, DEFAULT_PAIRING_STEP_TIMEOUT_MS);
     await session.write(Buffer.from([0x00, 0x00]));
 
     // THE DISCRIMINATING ASSERTION: a lookup that dropped the serviceUuid
@@ -1122,5 +1237,268 @@ describe('a GATT connection failure during configuration (after provisioning suc
     expect(outcome.message).toContain('could not reconnect for configuration');
     expect(outcome.message).toContain('manual factory reset');
     expect(store.getState().nodes).toHaveLength(0);
+  });
+});
+
+// ===========================================================================
+// Every GATT operation is bounded by the clock — review finding (HIGH,
+// re-review): the first bounding pass wrapped only the wait for a reply.
+// `connect`, `discover`, `subscribe`, `write` and `disconnect` could each
+// hang a real pairing attempt forever — and two of those (`write`,
+// `disconnect`) were not even disclosed as gaps. The shared fixture's own
+// `writeBehavior: 'hold'` mode (modelling a congested transmit queue,
+// documented in fakeBluetooth.ts) is reused below to prove `write` with the
+// real `pairNode` pipeline; it does not model a HUNG (as opposed to failed)
+// connect/discover/subscribe/disconnect, so those four use a hand-rolled
+// `BluetoothPort` instead — the same reason the characteristic-lookup-
+// discrimination test above uses one.
+// ===========================================================================
+
+/** Deliberately never resolves or rejects — the only way to prove a bound
+ *  actually exists, rather than merely a graceful failure path. */
+function neverSettles<T>(): Promise<T> {
+  return new Promise<T>(() => {});
+}
+
+/** A `BluetoothPort` that completes a provisioning GATT session
+ *  (`connect`→`discover`→`subscribe`) successfully and immediately by
+ *  default — `overrides` replaces exactly one operation, typically with
+ *  `neverSettles()`, to prove THAT operation alone is bounded. */
+function fastProvisioningPort(overrides: Partial<BluetoothPort> = {}): BluetoothPort {
+  return {
+    scan: async (): Promise<ScanResult[]> => [],
+    connect: async (): Promise<unknown> => ({}),
+    discover: async (): Promise<DiscoveredCharacteristic[]> => [
+      { serviceUuid: MESH_PROVISIONING_SERVICE_UUID, characteristicUuid: MESH_PROVISIONING_DATA_IN_UUID, handle: 'in' },
+      { serviceUuid: MESH_PROVISIONING_SERVICE_UUID, characteristicUuid: MESH_PROVISIONING_DATA_OUT_UUID, handle: 'out' },
+    ],
+    read: async (): Promise<Buffer> => Buffer.alloc(0),
+    write: async (): Promise<void> => {},
+    subscribe: async (): Promise<Subscription> => ({ unsubscribe: (): void => {} }),
+    disconnect: async (): Promise<void> => {},
+    ...overrides,
+  };
+}
+
+describe('every GATT operation openSession performs is bounded by the clock', () => {
+  test('a connect() that never settles fails the attempt once the deadline passes, instead of hanging it forever', async () => {
+    const clock = createFakeClock();
+    const port = fastProvisioningPort({ connect: (): Promise<unknown> => neverSettles() });
+
+    const promise = connectForProvisioning(port, 'peripheral-x', clock, 50);
+    promise.catch(() => {}); // a handler must exist before clock.advance() below, or Node reports an unhandled rejection
+    await waitUntil(() => clock.pendingCount() >= 1);
+    await clock.advance(50);
+
+    await expect(promise).rejects.toThrow('provisioning: connecting');
+  });
+
+  test('a discover() that never settles fails the attempt once the deadline passes, instead of hanging it forever', async () => {
+    const clock = createFakeClock();
+    let discoverCalled = false;
+    const port = fastProvisioningPort({
+      discover: (): Promise<DiscoveredCharacteristic[]> => {
+        // Flips SYNCHRONOUSLY the instant discover() is actually invoked —
+        // unlike `clock.pendingCount() >= 1` alone, this cannot be
+        // satisfied by connect()'s OWN still-pending timer (reachable only
+        // AFTER connect's bound has already settled, by construction of
+        // the `await` chain in openSession), so it does not race against
+        // connect's real (fast) resolution.
+        discoverCalled = true;
+        return neverSettles();
+      },
+    });
+
+    const promise = connectForProvisioning(port, 'peripheral-x', clock, 50);
+    promise.catch(() => {});
+    await waitUntil(() => discoverCalled && clock.pendingCount() >= 1);
+    await clock.advance(50);
+
+    await expect(promise).rejects.toThrow('provisioning: discovering services');
+  });
+
+  test('a subscribe() that never settles fails the attempt once the deadline passes, instead of hanging it forever', async () => {
+    const clock = createFakeClock();
+    let subscribeCalled = false;
+    const port = fastProvisioningPort({
+      subscribe: (): Promise<Subscription> => {
+        subscribeCalled = true; // see the discover() test's own comment on why this, not bare pendingCount
+        return neverSettles();
+      },
+    });
+
+    const promise = connectForProvisioning(port, 'peripheral-x', clock, 50);
+    promise.catch(() => {});
+    await waitUntil(() => subscribeCalled && clock.pendingCount() >= 1);
+    await clock.advance(50);
+
+    await expect(promise).rejects.toThrow('provisioning: subscribing to notifications');
+  });
+
+  test('a write() that never settles — the shared fixture\'s own "congested transmit queue" model, and the review\'s own one-line repro — fails the whole pairing attempt instead of hanging the wizard forever', async () => {
+    const { bluetooth, store, clock, deps } = setUp();
+    addUnprovisionedNode(bluetooth, 'write-hangs', -50);
+    bluetooth.setWriteBehavior('write-hangs', 'hold');
+
+    const outcomePromise = pairNode(deps, 'write-hangs');
+    // Invite is the very first write — `writesReceived` only grows once
+    // connect/discover/subscribe have ALL already settled for real, so
+    // this (the same combined condition the existing "silent node" test
+    // uses) cannot fire on an earlier stage's own still-pending timer.
+    await waitUntil(() => bluetooth.writesReceived.length >= 1 && clock.pendingCount() >= 1);
+    await clock.advance(DEFAULT_PAIRING_STEP_TIMEOUT_MS);
+    const outcome = await outcomePromise;
+
+    expect(outcome.kind).toBe('failed');
+    if (outcome.kind !== 'failed') return;
+    expect(outcome.message).toContain('provisioning: writing to the node');
+    expect(store.getState().nodes).toHaveLength(0);
+  });
+
+  test('a disconnect() that never settles on the QUIET post-provisioning disconnect does not hang an otherwise-successful pairing forever', async () => {
+    const { bluetooth: fake, store, clock, deps } = setUp();
+    addUnprovisionedNode(fake, 'disconnect-hangs', -50);
+    installSuccessfulNodeBehaviour(fake, 'disconnect-hangs', 1, 2);
+
+    // THE PATH THE REVIEW NAMED: `disconnectQuietly`'s own try/catch only
+    // reacts to a REJECTION — it does nothing for a promise that simply
+    // never settles. The FIRST disconnect() call is exactly that quiet
+    // call, right after provisioning succeeds (pairNode's own
+    // `disconnectQuietly(provisioningSession)`); the second is the
+    // configuration session's own quiet disconnect once config succeeds,
+    // left to behave normally so the attempt can actually finish.
+    let disconnectCalls = 0;
+    const bluetooth: BluetoothPort = {
+      scan: (durationMs) => fake.scan(durationMs),
+      connect: (peripheralId, onDisconnect) => fake.connect(peripheralId, onDisconnect),
+      discover: (connection) => fake.discover(connection),
+      read: (characteristic) => fake.read(characteristic),
+      write: (characteristic, data) => fake.write(characteristic, data),
+      subscribe: (characteristic, onNotify) => fake.subscribe(characteristic, onNotify),
+      disconnect: (connection): Promise<void> => {
+        disconnectCalls += 1;
+        if (disconnectCalls === 1) {
+          // The underlying connection genuinely closes (so the SECOND
+          // connect(), for the configuration session, does not find the
+          // fixture still thinking it is connected) — only the
+          // ACKNOWLEDGEMENT back to the caller never arrives, which is
+          // exactly what the review named: `disconnectQuietly`'s own
+          // try/catch does nothing for a promise that simply never
+          // settles.
+          void fake.disconnect(connection);
+          return neverSettles();
+        }
+        return fake.disconnect(connection);
+      },
+    };
+
+    const outcomePromise = pairNode({ ...deps, bluetooth }, 'disconnect-hangs');
+    // The held disconnect() never settles on its own — only the clock can
+    // rescue `disconnectQuietly`'s bounded wait for it. Advance past its
+    // deadline once it is actually the one pending.
+    await waitUntil(() => disconnectCalls >= 1 && clock.pendingCount() >= 1);
+    await clock.advance(DEFAULT_PAIRING_STEP_TIMEOUT_MS);
+    const outcome = await outcomePromise;
+
+    expect(outcome.kind).toBe('paired');
+    expect(store.getState().nodes).toHaveLength(1);
+  });
+});
+
+// ===========================================================================
+// tryParseBleUuid / filterKnownServiceData / filterKnownCharacteristics —
+// review finding (smaller item): this filtering logic used to live entirely
+// inside driver.ts, the one file this project's gate cannot see (it imports
+// `homey`) — nothing proved the non-throwing wrapper's SKIP behaviour, as
+// opposed to a THROWING form that would brick every real scan/discover call
+// the moment an unrelated service showed up, was load-bearing (a reviewer
+// demonstrated the entire gate passing with the throwing form substituted
+// in). Moved here, under the gate, as pure functions over already-
+// discovered raw (Homey-shaped) services/characteristics; `driver.ts` keeps
+// nothing but the Homey API calls and a reshape of their results.
+// ===========================================================================
+
+describe('tryParseBleUuid', () => {
+  test('returns the parsed number for a well-formed UUID', () => {
+    expect(tryParseBleUuid('1827')).toBe(0x1827);
+  });
+
+  test('returns null, never throws, for anything parseBleUuid itself throws for', () => {
+    expect(tryParseBleUuid('not-a-uuid')).toBeNull(); // non-hex garbage
+    // A genuine custom (vendor) 128-bit UUID — does NOT embed a 16-bit
+    // short UUID via the Bluetooth Base UUID, the one well-formed shape
+    // parseBleUuid itself throws for (see that function's own tests).
+    expect(tryParseBleUuid('a1b2c3d4-5e6f-4a1b-8c2d-1234567890ab')).toBeNull();
+  });
+});
+
+describe('filterKnownServiceData', () => {
+  test('keeps every well-formed UUID (translated to the numeric convention), dropping only what does not parse at all', () => {
+    // THE MUTATION THIS CLOSES: substituting the throwing `parseBleUuid`
+    // for `tryParseBleUuid` inside this function would make THIS call
+    // throw on the first malformed entry below, instead of returning the
+    // filtered array. Narrowing down to the SPECIFIC two services this
+    // app cares about is a DIFFERENT, later step (`findServiceData` /
+    // `scanForUnprovisionedNodes`) — this function only drops what
+    // `parseBleUuid` itself would throw for.
+    const customVendorUuid = 'a1b2c3d4-5e6f-4a1b-8c2d-1234567890ab'; // does not embed via the Bluetooth Base UUID
+    const result = filterKnownServiceData([
+      { uuid: '180a', data: Buffer.from([0xaa]) }, // Device Information Service — well-formed, but not ours; kept anyway
+      { uuid: bleUuidString(MESH_PROVISIONING_SERVICE_UUID), data: Buffer.from([0x01]) },
+      { uuid: customVendorUuid, data: Buffer.from([0xbb]) }, // malformed for this parser — dropped, not thrown
+      { uuid: 'not-a-uuid', data: Buffer.from([0xcc]) }, // non-hex garbage — also dropped
+      { uuid: bleUuidString(MESH_PROXY_SERVICE_UUID), data: Buffer.from([0x02]) },
+    ]);
+
+    expect(result).toEqual([
+      { serviceUuid: 0x180a, data: Buffer.from([0xaa]) },
+      { serviceUuid: MESH_PROVISIONING_SERVICE_UUID, data: Buffer.from([0x01]) },
+      { serviceUuid: MESH_PROXY_SERVICE_UUID, data: Buffer.from([0x02]) },
+    ]);
+  });
+
+  test('an empty input produces an empty result, not an error', () => {
+    expect(filterKnownServiceData([])).toEqual([]);
+  });
+});
+
+describe('filterKnownCharacteristics', () => {
+  test('drops only a service/characteristic whose UUID does not parse at all, translating everything else, order preserved', () => {
+    // THE MUTATION THIS CLOSES: same as filterKnownServiceData's own test —
+    // a throwing parser substituted in would throw on the first malformed
+    // entry below instead of skipping it.
+    const customVendorServiceUuid = 'a1b2c3d4-5e6f-4a1b-8c2d-1234567890ab'; // does not embed via the Bluetooth Base UUID
+    const result = filterKnownCharacteristics([
+      {
+        uuid: customVendorServiceUuid, // malformed for this parser — entire service dropped
+        characteristics: [{ uuid: bleUuidString(MESH_PROVISIONING_DATA_IN_UUID), handle: 'irrelevant' }],
+      },
+      {
+        // Device Information Service — well-formed, but not one of this
+        // app's two services; kept anyway (narrowing to a SPECIFIC
+        // service/characteristic pair is openSession's own job, a later
+        // step this function does not perform).
+        uuid: '180a',
+        characteristics: [{ uuid: '2a29', handle: 'manufacturer-name' }],
+      },
+      {
+        uuid: bleUuidString(MESH_PROVISIONING_SERVICE_UUID),
+        characteristics: [
+          { uuid: 'not-a-uuid', handle: 'dropped' }, // malformed characteristic — dropped, service kept
+          { uuid: bleUuidString(MESH_PROVISIONING_DATA_IN_UUID), handle: 'in-handle' },
+          { uuid: bleUuidString(MESH_PROVISIONING_DATA_OUT_UUID), handle: 'out-handle' },
+        ],
+      },
+    ]);
+
+    expect(result).toEqual([
+      { serviceUuid: 0x180a, characteristicUuid: 0x2a29, handle: 'manufacturer-name' },
+      { serviceUuid: MESH_PROVISIONING_SERVICE_UUID, characteristicUuid: MESH_PROVISIONING_DATA_IN_UUID, handle: 'in-handle' },
+      { serviceUuid: MESH_PROVISIONING_SERVICE_UUID, characteristicUuid: MESH_PROVISIONING_DATA_OUT_UUID, handle: 'out-handle' },
+    ]);
+  });
+
+  test('an empty input produces an empty result, not an error', () => {
+    expect(filterKnownCharacteristics([])).toEqual([]);
   });
 });

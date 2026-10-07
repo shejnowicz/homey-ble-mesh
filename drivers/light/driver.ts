@@ -34,10 +34,16 @@
 //   numeric convention (`lib/adapter/connection.ts`'s own `0x1828`-style
 //   constants) and Homey's own hex-string convention (`BleAdvertisement`/
 //   `BleService`/`BleCharacteristic`'s `uuid: string`) via `./pairing.ts`'s
-//   own `parseBleUuid`/`bleUuidString` — moved there, under the typecheck/
-//   jest gate, after a review found three real bugs in this file's own
-//   earlier naive `parseInt(uuid, 16)` (see that module's own header for
-//   what they were and why they were real, not merely untested).
+//   own `bleUuidString`/`filterKnownServiceData`/`filterKnownCharacteristics`
+//   — moved there, under the typecheck/jest gate, after a review found
+//   three real bugs in this file's own earlier naive `parseInt(uuid, 16)`
+//   (see that module's own header for what they were and why they were
+//   real, not merely untested), and later found the FILTERING LOOPS that
+//   used the resulting parser were themselves outside the gate too (this
+//   file imports `homey`, so neither `npm run typecheck` nor
+//   `npx jest --ci` ever exercised them) — now moved alongside it, leaving
+//   this file nothing but the direct Homey API calls and a reshape of
+//   their results into those functions' input shape.
 import Homey from 'homey';
 import type { BleAdvertisement, BlePeripheral, BleCharacteristic } from 'homey';
 
@@ -50,7 +56,6 @@ import {
   type ConnectionHandle,
   type DiscoveredCharacteristic,
   type ScanResult,
-  type ServiceDataEntry,
   type Subscription,
 } from '../../lib/adapter/connection';
 import {
@@ -58,8 +63,9 @@ import {
   scanForUnprovisionedNodes,
   createNodeCryptoRandomSource,
   createRealClock,
-  parseBleUuid,
   bleUuidString,
+  filterKnownServiceData,
+  filterKnownCharacteristics,
   type PairingDeps,
   type PairingOutcome,
   type UnprovisionedNodeCandidate,
@@ -94,23 +100,6 @@ interface HomeyCharacteristicHandle {
   readonly characteristic: BleCharacteristic;
 }
 
-/** `parseBleUuid` throws for anything that is not one of this project's own
- *  16-bit short UUIDs (by design — see `pairing.ts`'s own module header).
- *  A REAL peripheral's `discoverAllServicesAndCharacteristics()` has no
- *  filter of its own and routinely returns entirely unrelated services
- *  (Device Information, Battery, GAP/GATT housekeeping, vendor-specific
- *  128-bit UUIDs) alongside the Mesh ones — so a throw here must mean
- *  "not one of ours, skip it", never "crash the whole discover() call".
- *  `null` lets both call sites below filter the one entry out instead of
- *  letting one unrelated service take down pairing entirely. */
-function tryParseBleUuid(uuid: string): number | null {
-  try {
-    return parseBleUuid(uuid);
-  } catch {
-    return null;
-  }
-}
-
 class HomeyBluetoothPort implements BluetoothPort {
   constructor(private readonly ble: BleManager) {}
 
@@ -118,16 +107,15 @@ class HomeyBluetoothPort implements BluetoothPort {
     // See this file's own header: Homey's discover() has no duration
     // parameter, so `_durationMs` cannot be honoured exactly. The service
     // filter, by contrast, WAS previously ignored despite being available —
-    // see SCAN_SERVICE_FILTER's own comment.
+    // see SCAN_SERVICE_FILTER's own comment. The actual UUID filtering logic
+    // is `filterKnownServiceData` (pairing.ts, under the gate) — this method
+    // is nothing but the Homey API call and a reshape of its result.
     const advertisements = await this.ble.discover(SCAN_SERVICE_FILTER);
-    return advertisements.map((advertisement: BleAdvertisement) => {
-      const serviceData: ServiceDataEntry[] = [];
-      for (const entry of advertisement.serviceData) {
-        const serviceUuid = tryParseBleUuid(entry.uuid);
-        if (serviceUuid !== null) serviceData.push({ serviceUuid, data: entry.data });
-      }
-      return { peripheralId: advertisement.uuid, rssi: advertisement.rssi, serviceData };
-    });
+    return advertisements.map((advertisement: BleAdvertisement) => ({
+      peripheralId: advertisement.uuid,
+      rssi: advertisement.rssi,
+      serviceData: filterKnownServiceData(advertisement.serviceData),
+    }));
   }
 
   async connect(peripheralId: string, onDisconnect: () => void): Promise<ConnectionHandle> {
@@ -138,20 +126,21 @@ class HomeyBluetoothPort implements BluetoothPort {
   }
 
   async discover(connection: ConnectionHandle): Promise<DiscoveredCharacteristic[]> {
+    // The actual UUID filtering logic is `filterKnownCharacteristics`
+    // (pairing.ts, under the gate) — this method is nothing but the Homey
+    // API call and a reshape of its result into that function's input
+    // shape.
     const peripheral = connection as BlePeripheral;
     const services = await peripheral.discoverAllServicesAndCharacteristics();
-    const result: DiscoveredCharacteristic[] = [];
-    for (const service of services) {
-      const serviceUuid = tryParseBleUuid(service.uuid);
-      if (serviceUuid === null) continue; // not one of ours — see tryParseBleUuid's own comment
-      for (const characteristic of service.characteristics) {
-        const characteristicUuid = tryParseBleUuid(characteristic.uuid);
-        if (characteristicUuid === null) continue;
-        const handle: HomeyCharacteristicHandle = { characteristic };
-        result.push({ serviceUuid, characteristicUuid, handle });
-      }
-    }
-    return result;
+    return filterKnownCharacteristics(
+      services.map((service) => ({
+        uuid: service.uuid,
+        characteristics: service.characteristics.map((characteristic) => {
+          const handle: HomeyCharacteristicHandle = { characteristic };
+          return { uuid: characteristic.uuid, handle };
+        }),
+      })),
+    );
   }
 
   async read(characteristic: CharacteristicHandle): Promise<Buffer> {

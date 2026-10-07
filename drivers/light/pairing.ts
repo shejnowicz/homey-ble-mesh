@@ -8,8 +8,11 @@ import {
   MESH_PROXY_SERVICE_UUID,
   findServiceData,
   type BluetoothPort,
+  type CharacteristicHandle,
   type ClockPort,
   type ConnectionHandle,
+  type DiscoveredCharacteristic,
+  type ServiceDataEntry,
   type TimerHandle,
 } from '../../lib/adapter/connection';
 import { NetworkStore } from '../../lib/adapter/store';
@@ -189,18 +192,24 @@ export function createNodeCryptoRandomSource(): ProvisioningRandomSource {
 // "Pairing…" and no way back. This project already built exactly the
 // machinery for "the node never answered" — `ClockPort` and
 // `lib/adapter/queue.ts`'s own bounded per-attempt timeout — and pairing
-// bypassed both. `PairingDeps.clock` below, and `withTimeout`'s use of it in
-// `runProvisioningExchange`/`sendConfigRequest`, close that: every wait for a
-// notification is now bounded by `timeoutMs` and fails with a message naming
-// the stall, instead of hanging.
+// bypassed both.
 //
-// SCOPE, STATED PLAINLY: only the "wait for a reply" step is bounded.
-// `BluetoothPort.connect`/`discover`/`subscribe` are not wrapped — nothing in
-// this project's fake port can make those hang (only `write()` has a 'hold'
-// mode), and the review's own demonstration (nine mutations "caught" only as
-// test timeouts) was entirely about notification waits. A real GATT
-// connect() that never resolves is a real, separate risk this task does not
-// close; see the report.
+// EVERY GATT OPERATION IS BOUNDED, NOT ONLY THE REPLY WAIT (review finding,
+// re-review: the first version of this fix bounded `session.next()` only,
+// and disclosed — WRONGLY — that nothing in the fake port could make
+// `connect`/`discover`/`subscribe`/`write`/`disconnect` hang. The fake
+// port's own `writeBehavior: 'hold'` mode, documented in
+// `fakeBluetooth.ts` as modelling a congested transmit queue, does exactly
+// that to `write()` — and pairing calls `write()` on every single PDU it
+// sends, so a held write hangs real pairing attempts, not merely a test
+// double. The conclusion was wrong even though the underlying fact — "the
+// fake can misbehave in ways worth naming" — was the one thing worth
+// checking before writing the disclaimer). `openSession` below now wraps
+// ALL FIVE `BluetoothPort` operations — `connect`, `discover`, `subscribe`,
+// `write` and `disconnect` — through the same `withTimeout` helper the
+// reply wait already used, keyed to a `stage` identifying which GATT
+// session ('provisioning' or 'configuration exchange') is stalling. No new
+// machinery: the clock was already injected, `withTimeout` already existed.
 // ===========================================================================
 
 /** Not a specification value — an engineering choice. Generous because
@@ -318,6 +327,78 @@ export function bleUuidString(uuid: number): string {
   return uuid.toString(16).padStart(4, '0');
 }
 
+/**
+ * Non-throwing wrapper over `parseBleUuid` — a REAL peripheral's discovery
+ * routinely includes entirely unrelated services/characteristics (Device
+ * Information, Battery, GAP/GATT housekeeping, vendor-specific 128-bit
+ * UUIDs) alongside this project's own four, so a throw here must mean "not
+ * one of ours, skip it", never "crash the whole scan()/discover() call".
+ *
+ * MOVED HERE FROM `driver.ts` (review finding, smaller item: the filtering
+ * loop that used this wrapper lived entirely in the one file this project's
+ * gate cannot see — `driver.ts` imports `homey`, so neither
+ * `npm run typecheck` nor `npx jest --ci` ever exercised it — meaning
+ * nothing proved this wrapper's SKIP behaviour, as opposed to a THROWING
+ * form that would brick every real scan/discover call the moment an
+ * unrelated service showed up, was load-bearing. The reviewer demonstrated
+ * the entire gate passing with the throwing form substituted in. Now this
+ * wrapper, and the two filtering loops that use it below, are under the
+ * gate; `driver.ts` keeps nothing but the direct Homey API calls and a
+ * reshape of their results into these functions' input shape.
+ */
+export function tryParseBleUuid(uuid: string): number | null {
+  try {
+    return parseBleUuid(uuid);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Filters a scan's raw, Homey-shaped service-data entries down to the ones
+ * this project recognises, translating each surviving UUID to this
+ * project's numeric convention — the actual logic inside
+ * `HomeyBluetoothPort.scan()`, as opposed to the Homey API call itself.
+ * Order-preserving.
+ */
+export function filterKnownServiceData(
+  entries: ReadonlyArray<{ readonly uuid: string; readonly data: Buffer }>,
+): ServiceDataEntry[] {
+  const result: ServiceDataEntry[] = [];
+  for (const entry of entries) {
+    const serviceUuid = tryParseBleUuid(entry.uuid);
+    if (serviceUuid !== null) result.push({ serviceUuid, data: entry.data });
+  }
+  return result;
+}
+
+/**
+ * Filters a connection's raw, Homey-shaped discovered services/
+ * characteristics down to the ones this project recognises, translating
+ * each surviving UUID pair to this project's numeric convention — the
+ * actual logic inside `HomeyBluetoothPort.discover()`, as opposed to the
+ * Homey API call itself. Order-preserving (service order, then
+ * characteristic order within each service).
+ */
+export function filterKnownCharacteristics(
+  services: ReadonlyArray<{
+    readonly uuid: string;
+    readonly characteristics: ReadonlyArray<{ readonly uuid: string; readonly handle: CharacteristicHandle }>;
+  }>,
+): DiscoveredCharacteristic[] {
+  const result: DiscoveredCharacteristic[] = [];
+  for (const service of services) {
+    const serviceUuid = tryParseBleUuid(service.uuid);
+    if (serviceUuid === null) continue;
+    for (const characteristic of service.characteristics) {
+      const characteristicUuid = tryParseBleUuid(characteristic.uuid);
+      if (characteristicUuid === null) continue;
+      result.push({ serviceUuid, characteristicUuid, handle: characteristic.handle });
+    }
+  }
+  return result;
+}
+
 // ===========================================================================
 // Scanning for unprovisioned nodes.
 // ===========================================================================
@@ -401,23 +482,44 @@ interface GattSession {
   disconnect(): Promise<void>;
 }
 
+/**
+ * Opens one GATT session and bounds ALL FIVE `BluetoothPort` operations it
+ * performs — `connect`, `discover`, `subscribe`, and (via the returned
+ * `GattSession`) `write`/`next`(wait-for-reply)/`disconnect` — through
+ * `withTimeout`, keyed by `stage` (e.g. 'provisioning', 'configuration
+ * exchange') so a stalled attempt names which phase and which operation is
+ * stuck. `next()`'s own `what` is composed as `${stage} stalled` rather
+ * than the generic form the other four use, so existing callers/tests that
+ * check for the literal substrings "provisioning stalled"/"configuration
+ * exchange stalled" keep seeing exactly that wording — see the module
+ * header's "The clock" note for why every one of these needed bounding,
+ * not only the reply wait.
+ */
 async function openSession(
   bluetooth: BluetoothPort,
   peripheralId: string,
   serviceUuid: number,
   dataInUuid: number,
   dataOutUuid: number,
+  clock: ClockPort,
+  timeoutMs: number,
+  stage: string,
 ): Promise<GattSession> {
-  const connection: ConnectionHandle = await bluetooth.connect(peripheralId, () => {
-    // An unexpected mid-session disconnect simply stops this channel from
-    // ever receiving anything further; whatever this module is currently
-    // awaiting (`next()`) then never resolves, and the pairing attempt is
-    // left to the caller's own judgement (there is no retry/backoff here —
-    // pairing is a one-shot, user-initiated action the design says can
-    // simply be retried, not a persistent connection with its own recovery
-    // policy the way `ProxyConnectionManager` is).
-  });
-  const characteristics = await bluetooth.discover(connection);
+  const bounded = <T>(promise: Promise<T>, what: string): Promise<T> => withTimeout(promise, clock, timeoutMs, what);
+
+  const connection: ConnectionHandle = await bounded(
+    bluetooth.connect(peripheralId, () => {
+      // An unexpected mid-session disconnect simply stops this channel from
+      // ever receiving anything further; whatever this module is currently
+      // awaiting (`next()`) then never resolves, and the pairing attempt is
+      // left to the caller's own judgement (there is no retry/backoff here —
+      // pairing is a one-shot, user-initiated action the design says can
+      // simply be retried, not a persistent connection with its own recovery
+      // policy the way `ProxyConnectionManager` is).
+    }),
+    `${stage}: connecting`,
+  );
+  const characteristics = await bounded(bluetooth.discover(connection), `${stage}: discovering services`);
   const dataIn = characteristics.find((c) => c.serviceUuid === serviceUuid && c.characteristicUuid === dataInUuid);
   const dataOut = characteristics.find((c) => c.serviceUuid === serviceUuid && c.characteristicUuid === dataOutUuid);
   if (!dataIn || !dataOut) {
@@ -426,24 +528,56 @@ async function openSession(
     );
   }
   const channel = new NotificationChannel();
-  await bluetooth.subscribe(dataOut.handle, (data) => channel.push(data));
+  await bounded(bluetooth.subscribe(dataOut.handle, (data) => channel.push(data)), `${stage}: subscribing to notifications`);
   return {
-    write: (data: Buffer): Promise<void> => bluetooth.write(dataIn.handle, data),
-    next: (): Promise<Buffer> => channel.next(),
-    disconnect: (): Promise<void> => bluetooth.disconnect(connection),
+    write: (data: Buffer): Promise<void> => bounded(bluetooth.write(dataIn.handle, data), `${stage}: writing to the node`),
+    next: (): Promise<Buffer> => bounded(channel.next(), `${stage} stalled`),
+    disconnect: (): Promise<void> => bounded(bluetooth.disconnect(connection), `${stage}: disconnecting`),
   };
 }
 
-/** Connects for the PROVISIONING phase (Mesh Provisioning Service). */
-export function connectForProvisioning(bluetooth: BluetoothPort, peripheralId: string): Promise<GattSession> {
-  return openSession(bluetooth, peripheralId, MESH_PROVISIONING_SERVICE_UUID, MESH_PROVISIONING_DATA_IN_UUID, MESH_PROVISIONING_DATA_OUT_UUID);
+/** Connects for the PROVISIONING phase (Mesh Provisioning Service). Every
+ *  GATT operation this session performs is bounded by `timeoutMs` — see
+ *  `openSession`'s own doc comment. */
+export function connectForProvisioning(
+  bluetooth: BluetoothPort,
+  peripheralId: string,
+  clock: ClockPort,
+  timeoutMs: number,
+): Promise<GattSession> {
+  return openSession(
+    bluetooth,
+    peripheralId,
+    MESH_PROVISIONING_SERVICE_UUID,
+    MESH_PROVISIONING_DATA_IN_UUID,
+    MESH_PROVISIONING_DATA_OUT_UUID,
+    clock,
+    timeoutMs,
+    'provisioning',
+  );
 }
 
 /** Connects for the CONFIGURATION phase (Mesh Proxy Service) — see the
  *  module header's "TWO GATT SESSIONS" note for why this is a fresh
- *  connection, not the same one. */
-export function connectForConfiguration(bluetooth: BluetoothPort, peripheralId: string): Promise<GattSession> {
-  return openSession(bluetooth, peripheralId, MESH_PROXY_SERVICE_UUID, MESH_PROXY_DATA_IN_UUID, MESH_PROXY_DATA_OUT_UUID);
+ *  connection, not the same one. Every GATT operation this session
+ *  performs is bounded by `timeoutMs` — see `openSession`'s own doc
+ *  comment. */
+export function connectForConfiguration(
+  bluetooth: BluetoothPort,
+  peripheralId: string,
+  clock: ClockPort,
+  timeoutMs: number,
+): Promise<GattSession> {
+  return openSession(
+    bluetooth,
+    peripheralId,
+    MESH_PROXY_SERVICE_UUID,
+    MESH_PROXY_DATA_IN_UUID,
+    MESH_PROXY_DATA_OUT_UUID,
+    clock,
+    timeoutMs,
+    'configuration exchange',
+  );
 }
 
 // ===========================================================================
@@ -454,22 +588,18 @@ export function connectForConfiguration(bluetooth: BluetoothPort, peripheralId: 
  * Drives `machine.ts`'s `beginProvisioning`/`step` to a terminal phase over
  * `session`, writing every PDU the machine produces and feeding back every
  * notification the channel delivers, in order, until the state reaches
- * `'provisioned'`, `'unsupported'` or `'failed'`. Each wait for a reply is
- * bounded by `timeoutMs` (see the module header's "The clock" note) —
+ * `'provisioned'`, `'unsupported'` or `'failed'`. `session` is already
+ * bounded end-to-end (`openSession`/`connectForProvisioning` — see the
+ * module header's "The clock" note), so every `write`/`next` below already
  * throws, naming the stall, rather than hanging forever against a silent
- * node.
+ * node; this function adds no bounding of its own.
  */
-export async function runProvisioningExchange(
-  session: GattSession,
-  input: BeginProvisioningInput,
-  clock: ClockPort,
-  timeoutMs: number = DEFAULT_PAIRING_STEP_TIMEOUT_MS,
-): Promise<ProvisioningState> {
+export async function runProvisioningExchange(session: GattSession, input: BeginProvisioningInput): Promise<ProvisioningState> {
   let { state, send } = beginProvisioning(input);
   for (const pdu of send) await session.write(pdu);
 
   while (state.phase !== 'provisioned' && state.phase !== 'unsupported' && state.phase !== 'failed') {
-    const incoming = await withTimeout(session.next(), clock, timeoutMs, 'provisioning stalled');
+    const incoming = await session.next();
     ({ state, send } = provisioningStep(state, incoming));
     for (const pdu of send) await session.write(pdu);
   }
@@ -491,8 +621,6 @@ interface ConfigExchangeInput {
   readonly nodeAddress: number;
   readonly deviceKey: Buffer;
   readonly allocateSeq: () => number;
-  readonly clock: ClockPort;
-  readonly timeoutMs: number;
 }
 
 /**
@@ -510,8 +638,9 @@ export type ConfigExchangeResult =
   | { readonly kind: 'failed'; readonly message: string; readonly composition: CompositionData | null };
 
 /** Sends one device-key-secured Config message and waits for the (possibly
- *  segmented) reply, decoded all the way to an `AccessMessage`. Bounded by
- *  `input.timeoutMs` — see the module header's "The clock" note. */
+ *  segmented) reply, decoded all the way to an `AccessMessage`.
+ *  `input.session` is already bounded end-to-end (see the module header's
+ *  "The clock" note) — this function adds no bounding of its own. */
 async function sendConfigRequest(input: ConfigExchangeInput, accessPayload: Buffer): Promise<AccessMessage> {
   const pdus = encodeMeshMessage({
     accessPayload,
@@ -534,7 +663,7 @@ async function sendConfigRequest(input: ConfigExchangeInput, accessPayload: Buff
   };
   let state: MeshReceiveState | undefined;
   for (;;) {
-    const incoming = await withTimeout(input.session.next(), input.clock, input.timeoutMs, 'configuration exchange stalled');
+    const incoming = await input.session.next();
     const result = acceptIncomingPdu(state, receiveContext, incoming);
     if (result.kind === 'complete') return result.message;
     state = result.state;
@@ -741,9 +870,13 @@ async function disconnectQuietly(session: GattSession): Promise<void> {
   try {
     await session.disconnect();
   } catch {
-    // A failed disconnect of a session we are already done with is not
-    // worth failing the whole pairing attempt over — the peripheral either
-    // already dropped the link itself or will time it out on its own.
+    // A failed (or, review finding, HUNG) disconnect of a session we are
+    // already done with is not worth failing the whole pairing attempt
+    // over — the peripheral either already dropped the link itself, or
+    // `session.disconnect()`'s own bound (every GATT operation `openSession`
+    // returns is bounded by the clock — see the module header's "The
+    // clock" note) eventually turns a hang into a rejection this catch
+    // swallows the same way it swallows an ordinary failure.
   }
 }
 
@@ -761,7 +894,7 @@ export async function pairNode(deps: PairingDeps, peripheralId: string): Promise
   const timeoutMs = deps.stepTimeoutMs ?? DEFAULT_PAIRING_STEP_TIMEOUT_MS;
   let provisioningSession: GattSession;
   try {
-    provisioningSession = await connectForProvisioning(deps.bluetooth, peripheralId);
+    provisioningSession = await connectForProvisioning(deps.bluetooth, peripheralId, deps.clock, timeoutMs);
   } catch (err) {
     return { kind: 'failed', message: `could not connect to "${peripheralId}" for provisioning: ${errorMessage(err)}` };
   }
@@ -787,7 +920,7 @@ export async function pairNode(deps: PairingDeps, peripheralId: string): Promise
       provisioningData: { netKey, netKeyIndex, flags: 0, ivIndex, unicastAddress: nodeAddress },
     };
 
-    const finalState = await runProvisioningExchange(provisioningSession, provisioningInput, deps.clock, timeoutMs);
+    const finalState = await runProvisioningExchange(provisioningSession, provisioningInput);
     await disconnectQuietly(provisioningSession);
 
     if (finalState.phase === 'unsupported') {
@@ -812,7 +945,7 @@ export async function pairNode(deps: PairingDeps, peripheralId: string): Promise
 
     let configSession: GattSession;
     try {
-      configSession = await connectForConfiguration(deps.bluetooth, peripheralId);
+      configSession = await connectForConfiguration(deps.bluetooth, peripheralId, deps.clock, timeoutMs);
     } catch (err) {
       // No session, no way to send a reset — the node is provisioned but
       // unreachable right now. Said plainly, not hidden behind a generic
@@ -835,8 +968,6 @@ export async function pairNode(deps: PairingDeps, peripheralId: string): Promise
         nodeAddress,
         deviceKey,
         allocateSeq: () => deps.store.allocateSequenceBlock(),
-        clock: deps.clock,
-        timeoutMs,
       });
       await disconnectQuietly(configSession);
 
