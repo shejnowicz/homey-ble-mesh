@@ -153,6 +153,7 @@ import {
   PROXY_SAR_TIMEOUT_MS,
   type ProxyReassemblyState,
 } from '../mesh/packet/proxyPdu';
+import { withTimeout } from './timeout';
 
 // Assigned Numbers, Section 3.4.1 "Services by Name": Mesh Proxy Service.
 export const MESH_PROXY_SERVICE_UUID = 0x1828;
@@ -317,6 +318,11 @@ export interface ProxyConnectionOptions {
    *  injectable at all (a test that wants to observe segmentation, or to
    *  avoid it, says so explicitly instead of depending on the default). */
   readonly maxProxyPduLength?: number;
+  /** How long ONE `BluetoothPort.write` may take before this module stops
+   *  waiting on it. Defaults to `PROXY_WRITE_TIMEOUT_MS`; injectable for
+   *  the same reason `maxProxyPduLength` is — a test that wants to observe
+   *  the bound says which bound rather than depending on the default. */
+  readonly proxyWriteTimeoutMs?: number;
 }
 
 // --- Backoff schedule -------------------------------------------------
@@ -394,6 +400,46 @@ export const SCAN_DURATION_MS = 4000;
  */
 export const MAX_PROXY_PDU_LENGTH = 20;
 
+/**
+ * How long ONE `BluetoothPort.write` may take before this module stops
+ * waiting on it and fails the write that was using it.
+ *
+ * WHY THIS EXISTS AT ALL (final re-review, finding 1 — HIGH). Nothing here
+ * used to bound a GATT write, and `write()` below holds a flag across the
+ * whole segment loop. A single `bluetooth.write` promise that never settles
+ * — which is exactly what a peripheral going out of range mid-write
+ * produces on a stack that does not error the pending operation — therefore
+ * left that flag set forever: the loop's `finally` never ran, and from then
+ * on EVERY message this app sent was refused, on every bulb, until the
+ * Homey app restarted. `drivers/light/pairing.ts` had already learned this
+ * lesson once (commit f6dd4ae, "bound every GATT operation, not only the
+ * reply wait"); the proxy path had not. The helper both now use is
+ * `./timeout.ts#withTimeout`.
+ *
+ * NOT A SPECIFICATION VALUE — an engineering choice, like SCAN_DURATION_MS
+ * and the backoff constants above, and chosen against ONE constraint that
+ * is not arbitrary: it must be short enough that a hung write is abandoned
+ * before the traffic queue's own per-attempt deadline comes round, or the
+ * retry would arrive while the previous attempt still held the flag and be
+ * refused for the same reason the bound exists to remove. That deadline is
+ * `lib/adapter/queue.ts`'s `DEFAULT_TIMEOUT_MS` (8 000 ms). Every message
+ * this app sends is exactly two Proxy PDUs (see `write()` below), so the
+ * worst case one attempt can spend inside `write()` is 2 x 2 000 = 4 000 ms
+ * — half that budget, with the whole margin left for the attempt's own
+ * status wait. The relationship is pinned by a test rather than left to two
+ * separately-chosen numbers staying in agreement.
+ *
+ * It must also be long enough that an ordinarily slow write is not killed:
+ * a GATT Write Without Response (Table 7.15) is queued and sent within one
+ * or two connection intervals, so 2 000 ms is roughly two orders of
+ * magnitude of headroom. UNVERIFIED ON HARDWARE, like everything else about
+ * Homey's BLE write semantics (see drivers/light/driver.ts's own header):
+ * if writes start failing with this module's own timeout message on a link
+ * that is otherwise healthy, this is the number to raise — and
+ * `DEFAULT_TIMEOUT_MS` the one to raise with it.
+ */
+export const PROXY_WRITE_TIMEOUT_MS = 2000;
+
 interface ActiveConnection {
   readonly connection: ConnectionHandle;
   readonly dataInHandle: CharacteristicHandle;
@@ -443,6 +489,9 @@ export class ProxyConnectionManager {
   /** The maximum size of one outgoing Proxy PDU, header included — see
    *  MAX_PROXY_PDU_LENGTH. */
   private readonly maxProxyPduLength: number;
+  /** How long one `BluetoothPort.write` may take — see
+   *  PROXY_WRITE_TIMEOUT_MS. */
+  private readonly proxyWriteTimeoutMs: number;
   /** The reassembly in progress on the Mesh Proxy Data Out characteristic,
    *  if any (`proxyPdu.ts`'s own `undefined` convention). Reset whenever a
    *  connection is established or torn down — a reassembly cannot survive
@@ -473,6 +522,13 @@ export class ProxyConnectionManager {
       );
     }
     this.maxProxyPduLength = maxProxyPduLength;
+    const proxyWriteTimeoutMs = options.proxyWriteTimeoutMs ?? PROXY_WRITE_TIMEOUT_MS;
+    if (!Number.isInteger(proxyWriteTimeoutMs) || proxyWriteTimeoutMs < 1) {
+      throw new Error(
+        `ProxyConnectionManager: proxyWriteTimeoutMs must be an integer >= 1, got ${proxyWriteTimeoutMs}`,
+      );
+    }
+    this.proxyWriteTimeoutMs = proxyWriteTimeoutMs;
     this.bluetooth = bluetooth;
     this.clock = clock;
     // Copy before deriving: this module never retains a view into a buffer
@@ -495,6 +551,7 @@ export class ProxyConnectionManager {
     // A reassembly cannot survive the link it was arriving over.
     this.reassembly = undefined;
     this.clearSarTimer();
+    this.releaseSegmentedWrite();
     if (this.timer !== null) {
       this.clock.clearTimeout(this.timer);
       this.timer = null;
@@ -537,9 +594,44 @@ export class ProxyConnectionManager {
    * refusing would make the retry WAIT on a write that may never settle,
    * silently converting a bounded retry into a hang; refusing hands the
    * caller a rejection, which the queue already treats as "a reason to
-   * wait" and paces on its own timer. Single-PDU writes — every command
-   * this app sends when the link's ATT_MTU is generous — never set the
-   * flag, so this path costs nothing in the ordinary case.
+   * wait" and paces on its own timer.
+   *
+   * THE SEGMENTED PATH IS THE ONLY PATH, which is what makes the flag's
+   * correctness matter (final re-review, finding 1 — this comment used to
+   * claim the opposite: "Single-PDU writes — every command this app sends
+   * when the link's ATT_MTU is generous — never set the flag, so this path
+   * costs nothing in the ordinary case". There is no generous case: the
+   * ATT_MTU is never consulted anywhere in this app, because Homey exposes
+   * none, and `maxProxyPduLength` is fixed at `MAX_PROXY_PDU_LENGTH` = 20
+   * for the reasons that constant gives). At 20, one Proxy PDU carries 19
+   * octets of Data. Every Network PDU this app builds is longer than that:
+   * Table 3.10's fixed fields are 9 octets (IVI+NID, CTL+TTL, SEQ, SRC,
+   * DST) and a CTL=0 Network PDU adds a 4-octet NetMIC, so the floor is 13
+   * octets plus the Lower Transport PDU, and the smallest this app sends —
+   * an Unsegmented Access message carrying a 2-octet opcode Get, Table 3.17
+   * — is 9 + 7 + 4 = 20 octets. The largest, a Light CTL/HSL Set, is 27.
+   * So every message is 2 Proxy PDUs, every message takes this path, and
+   * the single-PDU branch below is reachable only from a test that injects
+   * a larger `maxProxyPduLength`.
+   *
+   * WHICH IS WHY EVERY WRITE IS BOUNDED. `withTimeout` wraps each
+   * individual `bluetooth.write` (both branches — a hung single-PDU write
+   * latches nothing, but it would still hang its caller forever), so the
+   * `finally` below ALWAYS runs and the flag is always released. See
+   * `PROXY_WRITE_TIMEOUT_MS` for the bound and why it is what it is. The
+   * flag is additionally cleared wherever the active connection is dropped
+   * (`stop`, `handleDisconnect`, `disconnectOnProxyProtocolViolation`),
+   * because a write pending against a link that no longer exists may never
+   * settle at all and no timeout can hurry it.
+   *
+   * WHAT A TIMED-OUT SEGMENT LEAVES BEHIND, said plainly: the node is
+   * holding half a SAR transfer. Per Section 6.3.2.2 it discards that and
+   * disconnects us 20 seconds later, and this module then rescans and
+   * reconnects as it does for any other dropped link — so the mesh recovers
+   * on its own, within one SAR window, instead of staying broken until the
+   * app restarts. This module does not pre-emptively drop the link itself;
+   * that would be a second policy for the same recovery the node already
+   * performs.
    */
   async write(data: Buffer): Promise<void> {
     if (this.active === null) {
@@ -548,7 +640,7 @@ export class ProxyConnectionManager {
     const pdus = encodeProxyPdus(PROXY_MESSAGE_TYPE_NETWORK_PDU, data, this.maxProxyPduLength);
     const handle = this.active.dataInHandle;
     if (pdus.length === 1) {
-      await this.bluetooth.write(handle, pdus[0] as Buffer);
+      await this.boundedWrite(handle, pdus[0] as Buffer, 1, 1);
       return;
     }
     if (this.segmentedWriteInFlight) {
@@ -558,12 +650,27 @@ export class ProxyConnectionManager {
     }
     this.segmentedWriteInFlight = true;
     try {
-      for (const pdu of pdus) {
-        await this.bluetooth.write(handle, pdu);
+      for (const [index, pdu] of pdus.entries()) {
+        await this.boundedWrite(handle, pdu, index + 1, pdus.length);
       }
     } finally {
       this.segmentedWriteInFlight = false;
     }
+  }
+
+  /** One GATT write, bounded by `proxyWriteTimeoutMs` — see
+   *  `PROXY_WRITE_TIMEOUT_MS` and `write`'s own comment. The failure names
+   *  WHICH segment stalled, because "segment 1 of 2" and "segment 2 of 2"
+   *  are different problems on hardware: the first means the write never
+   *  reached the radio, the second that the node stopped accepting
+   *  mid-message. */
+  private boundedWrite(handle: CharacteristicHandle, pdu: Buffer, index: number, total: number): Promise<void> {
+    return withTimeout(
+      this.bluetooth.write(handle, pdu),
+      this.clock,
+      this.proxyWriteTimeoutMs,
+      `ProxyConnectionManager.write: Proxy PDU ${index} of ${total} to the Mesh Proxy Data In characteristic`,
+    );
   }
 
   /** The reason for the most recent disconnect this module performed
@@ -645,6 +752,29 @@ export class ProxyConnectionManager {
   }
 
   /**
+   * Releases the segmented-write latch because the connection it was
+   * guarding has gone (final re-review, finding 1). Called from every place
+   * `this.active` is dropped — `stop`, `handleDisconnect` and
+   * `disconnectOnProxyProtocolViolation` — and deliberately NOT only from
+   * `write`'s own `finally`, which is reached only if that write actually
+   * settles. A write still pending against a dead link may never settle at
+   * all (a real stack can simply drop it, and the project's own fake models
+   * exactly that), and `PROXY_WRITE_TIMEOUT_MS` cannot help a link that is
+   * already gone: by the time it fires there is nothing left to abandon,
+   * and until then the next connection would be refused every write.
+   *
+   * A still-running segment loop from the OLD link may later set this flag
+   * back to false in its own `finally`, which is harmless — false is the
+   * value this method just wrote. What that loop cannot do is interleave on
+   * the NEW link: it holds the old connection's `CharacteristicHandle`,
+   * which the port no longer accepts, so its remaining writes fail rather
+   * than reaching the new node.
+   */
+  private releaseSegmentedWrite(): void {
+    this.segmentedWriteInFlight = false;
+  }
+
+  /**
    * Section 6.3.2.2 "Reassembly" — the Proxy PDU Client "shall disconnect".
    * Tears the active connection down exactly as a lost link would (same
    * state, same rescan at the same backoff, so a protocol violation is
@@ -656,6 +786,7 @@ export class ProxyConnectionManager {
     this.lastProxyProtocolDisconnect = reason;
     this.reassembly = undefined;
     this.clearSarTimer();
+    this.releaseSegmentedWrite();
     const active = this.active;
     if (active === null) return;
     this.active = null;
@@ -766,6 +897,7 @@ export class ProxyConnectionManager {
     // "unexpected SAR" state Section 6.3.2.2 disconnects over.
     this.reassembly = undefined;
     this.clearSarTimer();
+    this.releaseSegmentedWrite();
     this.state = { status: 'unavailable', peripheralId: null };
     // failureStreak is 0 here: the connection that just dropped was itself
     // a SUCCESSFUL attempt, which reset it in onAttemptSettled. This is the

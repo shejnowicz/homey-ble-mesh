@@ -7,6 +7,7 @@ import {
   MESH_PROXY_DATA_OUT_UUID,
   MESH_PROVISIONING_SERVICE_UUID,
   MAX_PROXY_PDU_LENGTH,
+  PROXY_WRITE_TIMEOUT_MS,
   SCAN_DURATION_MS,
   findServiceData,
   type BluetoothPort,
@@ -17,6 +18,7 @@ import {
 import { FakeBluetoothPort } from './fakeBluetooth';
 import { createFakeClock } from './fakeClock';
 import { PROXY_SAR_TIMEOUT_MS } from '../../mesh/packet/proxyPdu';
+import { DEFAULT_TIMEOUT_MS } from '../queue';
 import { NETWORK_ID_ADVERTISING_SAMPLE, hex } from './vectors';
 
 /**
@@ -806,6 +808,243 @@ describe('the Proxy PDU envelope (Section 6.3 "Proxy PDU")', () => {
     await manager.write(Buffer.alloc(MAX_PROXY_PDU_LENGTH, 0x7e));
     expect(bluetooth.rawWritesReceived).toHaveLength(2);
     expect(bluetooth.rawWritesReceived[0]?.data).toHaveLength(MAX_PROXY_PDU_LENGTH);
+  });
+});
+
+/**
+ * FINAL RE-REVIEW, FINDING 1 (HIGH). `segmentedWriteInFlight` was set
+ * before the segment loop and cleared in exactly one place — that loop's
+ * `finally`. A single `bluetooth.write` that never settled therefore
+ * latched it for the lifetime of the process: the `finally` never ran, and
+ * every later segmented write was refused. "Later segmented write" means
+ * EVERY later message: at `MAX_PROXY_PDU_LENGTH` = 20 the largest message
+ * that fits one Proxy PDU is 19 octets, and the smallest Network PDU this
+ * app builds is 20 (Table 3.10's 9 octets of header + a 7-octet
+ * TransportPDU + a 4-octet NetMIC, for a Get). Nothing cleared it either —
+ * not `stop()`, not a disconnect, not a reconnect.
+ *
+ * The fix has two halves and each is pinned separately below, because
+ * either one alone leaves a real failure standing: the TIMEOUT bounds a
+ * write that hangs while the link stays up, and the TEARDOWN RESET covers
+ * a write still pending when the link goes away (which no timeout can
+ * hurry, since the fixture — like a real stack that loses a peripheral
+ * mid-write — never settles it at all).
+ */
+describe('a GATT write that never settles (final re-review, finding 1)', () => {
+  /** A port that hangs every `write` while `hang.value` is true and
+   *  records every buffer it was handed. Hand-written rather than
+   *  `FakeBluetoothPort` on purpose: the fake models a real node's Proxy
+   *  PDU SERVER too, so after an abandoned first segment it correctly
+   *  refuses the next message's first segment (Section 6.3.2.2) — true to
+   *  hardware, and it would make this test prove the fixture's behaviour
+   *  rather than the manager's. What is under test here is only whether
+   *  the MANAGER is still willing to write. */
+  function hangingWritePort(
+    netKey: Buffer,
+    hang: { value: boolean },
+    written: Buffer[],
+  ): BluetoothPort {
+    const serviceData = Buffer.concat([Buffer.from([0x00]), k3(netKey)]);
+    return {
+      scan: async (): Promise<ScanResult[]> => [
+        { peripheralId: 'A', rssi: -50, serviceData: [{ serviceUuid: MESH_PROXY_SERVICE_UUID, data: serviceData }] },
+      ],
+      connect: async (): Promise<unknown> => ({}),
+      discover: async (): Promise<DiscoveredCharacteristic[]> => [
+        { serviceUuid: MESH_PROXY_SERVICE_UUID, characteristicUuid: MESH_PROXY_DATA_IN_UUID, handle: {} },
+        { serviceUuid: MESH_PROXY_SERVICE_UUID, characteristicUuid: MESH_PROXY_DATA_OUT_UUID, handle: {} },
+      ],
+      read: async (): Promise<Buffer> => Buffer.alloc(0),
+      write: async (_characteristic, data): Promise<void> => {
+        written.push(Buffer.from(data));
+        if (hang.value) await new Promise<void>(() => {}); // never settles
+      },
+      subscribe: async (): Promise<Subscription> => ({ unsubscribe: (): void => {} }),
+      disconnect: async (): Promise<void> => {},
+    };
+  }
+
+  /** One full macrotask turn, which Node only reaches once every microtask
+   *  queued behind it has drained — the same technique fakeClock's own
+   *  `advance` uses internally, needed here when a test must observe a
+   *  multi-`await` chain reaching a particular point BEFORE virtual time
+   *  moves. */
+  function flushMicrotasks(): Promise<void> {
+    return new Promise((resolve) => setImmediate(resolve));
+  }
+
+  test('is bounded rather than latched: the hung write rejects, and the NEXT message still goes out', async () => {
+    const netKey = randomBytes(16);
+    const hang = { value: true };
+    const written: Buffer[] = [];
+    const clock = createFakeClock();
+    const manager = new ProxyConnectionManager(hangingWritePort(netKey, hang, written), clock, netKey);
+    manager.start();
+    await clock.advance(0);
+
+    // 20 octets: one octet past what a single Proxy PDU can carry at the
+    // default maxProxyPduLength, so this takes the segmented path — as
+    // every real message does.
+    const first = manager.write(Buffer.alloc(20, 0x11));
+    const firstRejection = expect(first).rejects.toThrow(/timed out after/); // settled at the end of this test
+    await Promise.resolve();
+    expect(written).toHaveLength(1); // the first segment went out, and never came back
+
+    await clock.advance(PROXY_WRITE_TIMEOUT_MS);
+    await firstRejection;
+
+    hang.value = false;
+    await expect(manager.write(Buffer.alloc(20, 0x22))).resolves.toBeUndefined();
+    // the abandoned segment, then BOTH segments of the second message
+    expect(written).toHaveLength(3);
+    expect(written[1]?.[0]).toBe(0x40); // 0b01_000000: first segment of the new message
+    expect(written[2]?.[0]).toBe(0xc0); // 0b11_000000: its last segment
+  });
+
+  test('an unexpected disconnect clears the flag, so the reconnected link starts clean', async () => {
+    const netKey = randomBytes(16);
+    const { bluetooth, clock, manager } = setUp(netKey);
+    bluetooth.addNode({ id: 'A', rssi: -50, networkKey: netKey });
+    manager.start();
+    await clock.advance(0);
+    bluetooth.setWriteBehavior('A', 'hold');
+
+    const held = manager.write(Buffer.alloc(20, 0x11));
+    held.catch(() => {}); // the fixture never settles a held write (its own documented gap)
+    await Promise.resolve();
+
+    bluetooth.simulateDisconnect('A');
+    await clock.advance(0); // the ordinary rescan reconnects
+    expect(manager.getState()).toEqual({ status: 'connected', peripheralId: 'A' });
+
+    // NO virtual time has passed, so the write timeout cannot be what
+    // rescues this: only the teardown reset can.
+    bluetooth.setWriteBehavior('A', 'succeed');
+    await expect(manager.write(Buffer.alloc(20, 0x22))).resolves.toBeUndefined();
+  });
+
+  test('stop() clears the flag, so a restarted manager starts clean', async () => {
+    const netKey = randomBytes(16);
+    const { bluetooth, clock, manager } = setUp(netKey);
+    bluetooth.addNode({ id: 'A', rssi: -50, networkKey: netKey });
+    manager.start();
+    await clock.advance(0);
+    bluetooth.setWriteBehavior('A', 'hold');
+
+    const held = manager.write(Buffer.alloc(20, 0x11));
+    held.catch(() => {});
+    await Promise.resolve();
+
+    manager.stop();
+    manager.start();
+    await clock.advance(0);
+    expect(manager.getState()).toEqual({ status: 'connected', peripheralId: 'A' });
+
+    bluetooth.setWriteBehavior('A', 'succeed');
+    await expect(manager.write(Buffer.alloc(20, 0x22))).resolves.toBeUndefined();
+  });
+
+  test('the specification-mandated disconnect clears the flag too', async () => {
+    const netKey = randomBytes(16);
+    const { bluetooth, clock, manager } = setUp(netKey);
+    bluetooth.addNode({ id: 'A', rssi: -50, networkKey: netKey });
+    manager.start();
+    await clock.advance(0);
+    bluetooth.setWriteBehavior('A', 'hold');
+
+    const held = manager.write(Buffer.alloc(20, 0x11));
+    held.catch(() => {});
+    await Promise.resolve();
+
+    // 0b10_000000: a continuation segment with nothing being reassembled —
+    // Section 6.3.2.2, "the Proxy PDU Client shall disconnect".
+    bluetooth.simulateRawNotification('A', Buffer.from([0x80, 0x01]));
+    expect(manager.getState().status).toBe('unavailable');
+    await clock.advance(1000); // this path's own backoff, well short of the write timeout
+    expect(manager.getState()).toEqual({ status: 'connected', peripheralId: 'A' });
+
+    bluetooth.setWriteBehavior('A', 'succeed');
+    await expect(manager.write(Buffer.alloc(20, 0x22))).resolves.toBeUndefined();
+  });
+
+  test('the bound names which Proxy PDU stalled, and is the injected one, not merely the default', async () => {
+    const netKey = randomBytes(16);
+    const hang = { value: true };
+    const written: Buffer[] = [];
+    const clock = createFakeClock();
+    const manager = new ProxyConnectionManager(hangingWritePort(netKey, hang, written), clock, netKey, {
+      proxyWriteTimeoutMs: 75,
+    });
+    manager.start();
+    await clock.advance(0);
+
+    const first = manager.write(Buffer.alloc(20, 0x11));
+    const rejection = expect(first).rejects.toThrow(
+      'ProxyConnectionManager.write: Proxy PDU 1 of 2 to the Mesh Proxy Data In characteristic: timed out after 75ms',
+    );
+    await Promise.resolve();
+
+    await clock.advance(74);
+    expect(written).toHaveLength(1); // still waiting, correctly
+    await clock.advance(1);
+    await rejection;
+  });
+
+  test('a SECOND segment that stalls names itself, not the first', async () => {
+    const netKey = randomBytes(16);
+    const written: Buffer[] = [];
+    const hangAfterFirst = { value: false };
+    const clock = createFakeClock();
+    const port = hangingWritePort(netKey, hangAfterFirst, written);
+    const manager = new ProxyConnectionManager(
+      {
+        ...port,
+        write: async (characteristic, data): Promise<void> => {
+          hangAfterFirst.value = written.length === 1; // hang on the second segment only
+          await port.write(characteristic, data);
+        },
+      },
+      clock,
+      netKey,
+      { proxyWriteTimeoutMs: 75 },
+    );
+    manager.start();
+    await clock.advance(0);
+
+    const first = manager.write(Buffer.alloc(20, 0x11));
+    const rejection = expect(first).rejects.toThrow('Proxy PDU 2 of 2 to the Mesh Proxy Data In characteristic');
+    // Both segments have to have actually reached the port before virtual
+    // time moves, or the FIRST segment's own (about to be cancelled) timer
+    // would still be pending when `advance` scans — a race in the test, not
+    // in the module.
+    await flushMicrotasks();
+    expect(written).toHaveLength(2); // only the second never came back
+
+    await clock.advance(75);
+    await rejection;
+  });
+
+  test('rejects a proxyWriteTimeoutMs that is not a positive whole number of milliseconds, naming it', () => {
+    const bluetooth = new FakeBluetoothPort();
+    const clock = createFakeClock();
+    expect(() => new ProxyConnectionManager(bluetooth, clock, randomBytes(16), { proxyWriteTimeoutMs: 0 })).toThrow(
+      'ProxyConnectionManager: proxyWriteTimeoutMs must be an integer >= 1, got 0',
+    );
+  });
+
+  /**
+   * The relationship PROXY_WRITE_TIMEOUT_MS's own comment argues for, pinned
+   * rather than left to two separately-chosen constants staying in
+   * agreement. Every message is exactly two Proxy PDUs (see `write`'s own
+   * comment), so one traffic-queue attempt can spend at most twice this
+   * bound inside `write()`; if that ever reached the queue's own per-attempt
+   * deadline, the retry would arrive while the previous attempt still held
+   * the segmented-write flag and be refused — the exact failure the bound
+   * exists to remove, reintroduced by arithmetic.
+   */
+  test('a whole two-segment message times out well inside one traffic-queue attempt', () => {
+    expect(PROXY_WRITE_TIMEOUT_MS).toBe(2000);
+    expect(PROXY_WRITE_TIMEOUT_MS * 2).toBeLessThan(DEFAULT_TIMEOUT_MS);
   });
 });
 

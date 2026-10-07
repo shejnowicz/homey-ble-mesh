@@ -392,7 +392,13 @@ describe('a command whose status arrives', () => {
 
     const status = Buffer.from([0x77]);
     const promise = queue.send({ build: () => Buffer.from([0x01]), description: 'test command', isStatus: (n) => n.equals(status) });
-    expect(clock.pendingCount()).toBe(pendingBeforeSend + 1); // this attempt's own timer is now pending
+    // TWO timers, not one: this attempt's own timeout, and the bound
+    // `ProxyConnectionManager.write` now puts on the single GATT write it
+    // issued synchronously from inside `send()` (PROXY_WRITE_TIMEOUT_MS,
+    // added for the final re-review's finding 1). The second disappears the
+    // moment that write settles, which is why the post-success assertion
+    // below is back at `pendingBeforeSend` exactly.
+    expect(clock.pendingCount()).toBe(pendingBeforeSend + 2);
 
     bluetooth.simulateNotification('A', status); // resolves well before timeoutMs elapses
     await expect(promise).resolves.toEqual(status);
