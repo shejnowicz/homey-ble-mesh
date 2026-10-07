@@ -13,12 +13,27 @@
  * two Mesh Proxy characteristics (simulating a node that advertises the
  * service but does not actually implement it fully); drop a write
  * silently (modelling Write Without Response's total lack of
- * acknowledgement, Table 7.15 — see connection.ts's module header); and
+ * acknowledgement, Table 7.15 — see connection.ts's module header); hold a
+ * write open until a test chooses to settle it (modelling a congested
+ * transmit queue — see `setWriteBehavior`/`releaseWrite` below, added for
+ * Task 5's traffic queue after an earlier, task-local stub for the same
+ * need was judged better placed here, for Task 6 to reuse too); and
  * simulate both an inbound Data Out notification and an unexpected
  * disconnect. "Never answers at all" is simply a peripheral that is
  * registered but never advertising (or no peripheral registered at all) —
  * `scan()` returning an empty array is an entirely ordinary result, not a
  * special case this fixture has to fake up.
+ *
+ * SCAN TIMING. By default (no `clock` passed to the constructor) `scan()`
+ * resolves immediately regardless of the `durationMs` it was asked for —
+ * the behaviour every connection.test.ts test already relies on. Passing a
+ * `ClockPort` (added for Task 5, after a review found a defect that had
+ * been hidden by exactly this instant-scan shortcut) makes `scan()`
+ * genuinely consume `durationMs` of virtual time, via that same clock,
+ * before resolving — for a test that needs a reconnect to cost real time
+ * rather than none, which is the only way to tell "retries paced correctly
+ * against a slow reconnect" apart from "retries that happened to work
+ * because nothing ever took any time at all".
  */
 
 import { k3 } from '../../mesh/crypto/derive';
@@ -28,6 +43,7 @@ import {
   MESH_PROXY_SERVICE_UUID,
   type BluetoothPort,
   type CharacteristicHandle,
+  type ClockPort,
   type ConnectionHandle,
   type DiscoveredCharacteristic,
   type ScanResult,
@@ -35,6 +51,15 @@ import {
 } from '../connection';
 
 export type AttemptBehavior = 'succeed' | 'fail';
+
+/** `write()`'s own behaviour for a node: 'succeed' resolves normally
+ *  (recording the write, unless `dropWrites` also applies), 'fail' rejects
+ *  immediately (naming the peripheral), and 'hold' neither — it returns a
+ *  promise that stays pending until a test explicitly settles it with
+ *  `releaseWrite`, modelling a congested transmit queue (the GATT layer
+ *  genuinely accepting a write but not yet having gotten it onto the air)
+ *  rather than an instant accept-or-reject. */
+export type WriteBehavior = AttemptBehavior | 'hold';
 
 export interface FakeNodeConfig {
   readonly id: string;
@@ -56,6 +81,7 @@ export interface FakeNodeConfig {
   readonly discoverBehavior?: AttemptBehavior; // default 'succeed'
   readonly subscribeBehavior?: AttemptBehavior; // default 'succeed'
   readonly dropWrites?: boolean; // default false
+  readonly writeBehavior?: WriteBehavior; // default 'succeed'; see setWriteBehavior
   /** Omit one Mesh Proxy characteristic from `discover()`'s result,
    *  modelling a node that advertises the service but does not fully
    *  implement it. `null` (default): expose both. */
@@ -71,7 +97,13 @@ interface FakeNode {
   discoverBehavior: AttemptBehavior;
   subscribeBehavior: AttemptBehavior;
   dropWrites: boolean;
+  writeBehavior: WriteBehavior;
   missingCharacteristic: 'dataIn' | 'dataOut' | null;
+}
+
+interface HeldWrite {
+  readonly resolve: () => void;
+  readonly reject: (err: Error) => void;
 }
 
 interface OpenConnection {
@@ -103,6 +135,13 @@ export class FakeBluetoothPort implements BluetoothPort {
   private readonly openConnections = new Map<string, OpenConnection>();
   private readonly notifyCallbacks = new Map<string, (data: Buffer) => void>();
   private readonly readValues = new Map<string, Buffer>();
+  private readonly heldWrites = new Map<string, HeldWrite[]>();
+
+  /** `clock`, if given, is what `scan()` actually waits on for its
+   *  `durationMs` — see the module header's "SCAN TIMING" note. Omit it
+   *  (the default) to keep every existing test's instant-scan assumption
+   *  unchanged. */
+  constructor(private readonly clock?: ClockPort) {}
 
   /** Every peripheralId passed to `connect()`, in call order, including
    *  attempts that went on to fail — so a test can assert not just WHICH
@@ -150,6 +189,7 @@ export class FakeBluetoothPort implements BluetoothPort {
       discoverBehavior: config.discoverBehavior ?? 'succeed',
       subscribeBehavior: config.subscribeBehavior ?? 'succeed',
       dropWrites: config.dropWrites ?? false,
+      writeBehavior: config.writeBehavior ?? 'succeed',
       missingCharacteristic: config.missingCharacteristic ?? null,
     });
   }
@@ -188,6 +228,29 @@ export class FakeBluetoothPort implements BluetoothPort {
 
   setDropWrites(id: string, drop: boolean): void {
     this.node(id).dropWrites = drop;
+  }
+
+  setWriteBehavior(id: string, behavior: WriteBehavior): void {
+    this.node(id).writeBehavior = behavior;
+  }
+
+  /** Settles the `index`-th currently-held write for `id` (in the order
+   *  `write()` was called, 0-based) with `outcome` — `{ ok: true }`
+   *  resolves it, `{ ok: false, err }` rejects it with `err`. Throws if
+   *  there is no such held write — a misconfigured test, not a thing to
+   *  paper over (same stance `simulateDisconnect`/`simulateNotification`
+   *  already take for their own "nothing to act on" cases). */
+  releaseWrite(id: string, index: number, outcome: { ok: true } | { ok: false; err: Error }): void {
+    const held = this.heldWrites.get(id);
+    const entry = held?.[index];
+    if (!entry) {
+      throw new Error(`FakeBluetoothPort.releaseWrite: no held write #${index} for "${id}"`);
+    }
+    if (outcome.ok) {
+      entry.resolve();
+    } else {
+      entry.reject(outcome.err);
+    }
   }
 
   setReadValue(id: string, characteristicUuid: number, value: Buffer): void {
@@ -247,6 +310,14 @@ export class FakeBluetoothPort implements BluetoothPort {
   async scan(durationMs: number): Promise<ScanResult[]> {
     this.scanCalls += 1;
     this.scanDurationsRequested.push(durationMs);
+    if (this.clock !== undefined && durationMs > 0) {
+      // See the module header's "SCAN TIMING" note: genuinely consumes
+      // `durationMs` of virtual time via the SAME clock the caller drives,
+      // rather than resolving instantly.
+      await new Promise<void>((resolve) => {
+        this.clock!.setTimeout(resolve, durationMs);
+      });
+    }
     const results: ScanResult[] = [];
     for (const node of this.nodes.values()) {
       if (!node.advertising) continue;
@@ -321,6 +392,16 @@ export class FakeBluetoothPort implements BluetoothPort {
       characteristicUuid: handle.characteristicUuid,
       data: Buffer.from(data),
     });
+    if (node.writeBehavior === 'fail') {
+      throw new Error(`FakeBluetoothPort.write: configured to fail for "${handle.peripheralId}"`);
+    }
+    if (node.writeBehavior === 'hold') {
+      return new Promise<void>((resolve, reject) => {
+        const held = this.heldWrites.get(handle.peripheralId) ?? [];
+        held.push({ resolve, reject });
+        this.heldWrites.set(handle.peripheralId, held);
+      });
+    }
   }
 
   async subscribe(characteristic: CharacteristicHandle, onNotify: (data: Buffer) => void): Promise<Subscription> {

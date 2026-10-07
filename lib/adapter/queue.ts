@@ -1,4 +1,4 @@
-import type { ClockPort, TimerHandle } from './connection';
+import { SCAN_DURATION_MS, type ClockPort, type TimerHandle } from './connection';
 
 /**
  * The traffic queue (docs/superpowers/specs/2026-10-06-ble-mesh-provisioner-
@@ -95,32 +95,59 @@ import type { ClockPort, TimerHandle } from './connection';
  * this module does not grow a second copy of it or a hand-rolled
  * replacement for `ProxyConnectionManager`.
  *
- * WHY DISCONNECTION NEEDS NO DEDICATED CODE PATH. `ProxyConnectionManager`
+ * WHY DISCONNECTION NEEDS NO DEDICATED CODE PATH -- AND THE BUG A REVIEW
+ * FOUND IN THE FIRST ATTEMPT AT THIS REASONING. `ProxyConnectionManager`
  * publishes no "you were disconnected" event this module could subscribe
  * to (only `getState()`, which nothing here polls) -- and it turns out not
- * to need one. A command's single per-attempt timeout already covers BOTH
- * "the node never answered" and "the link dropped while we were waiting
- * for an answer": either way, no matching notification arrives within
- * `timeoutMs`, and the SAME retry path fires. By the time that retry's
- * `write()` call actually happens, `ProxyConnectionManager`'s own
- * reconnect-with-backoff (connection.ts, "on disconnect it rescans") has
- * ordinarily already restored the connection (its backoff resets to an
- * immediate rescan after a connection that had been successful -- which
- * this one was, until it dropped), so the retried write simply succeeds.
- * "One reconnect, one retry" therefore falls out of the ordinary bounded-
- * retry mechanism applied to this one scenario, not a special case bolted
- * onto it -- see queue.test.ts's disconnection test, which drives this
- * through a REAL `ProxyConnectionManager`/`FakeBluetoothPort` pair rather
- * than asserting anything about a made-up "disconnect" hook.
+ * to need one, PROVIDED a write failing outright is treated as a reason to
+ * WAIT, not as a reason to try again instantly. A command's single
+ * per-attempt timeout is meant to cover BOTH "the node never answered" and
+ * "the link dropped while we were waiting for an answer" identically: no
+ * matching notification arrives within `timeoutMs`, and the SAME retry
+ * path fires. The first version of this module got this half right and
+ * half wrong: `write()` rejecting (which is exactly what happens when a
+ * retry is attempted while `ProxyConnectionManager` is mid-reconnect) was
+ * wired to call `retryOrFail` DIRECTLY from the rejection handler, with no
+ * delay. Since a rejection settles in a microtask, not a clock tick, this
+ * meant that once the link was down, the ENTIRE remaining attempt budget
+ * was spent inside a single microtask chain, against a radio that
+ * provably was not there yet -- a review measured zero virtual
+ * milliseconds between the first timeout and the final failure, i.e. "one
+ * reconnect and ZERO retransmissions" against the design's own "one
+ * reconnect and one retry". Worse, the ORIGINAL default `timeoutMs` (4000,
+ * chosen to merely "mirror" `SCAN_DURATION_MS`) was exactly equal to one
+ * scan window -- even had retries been paced correctly, a reconnect costs
+ * at least one full scan PLUS connect/discover/subscribe, so the retry's
+ * write would still have fired at the one moment the reconnect could not
+ * yet have finished. Both defects compounded: an unpaced retry racing a
+ * deadline it could not win.
  *
- * A write that fails outright (e.g. `ProxyConnectionManager.write` rejects
- * immediately because nothing is connected right now -- see its own doc
- * comment) is treated exactly like a timeout for retry-accounting purposes:
- * it consumes one of the bounded attempts and, if any remain, the next
- * attempt is tried; the underlying rejection's message rides along in the
- * final failure if every attempt is exhausted (see `describeFailure`
- * below), since "the hub's own message" is more honest than reinventing
- * one.
+ * THE FIX, twofold: (1) `attempt`'s `write().catch()` handler no longer
+ * calls `retryOrFail` -- it only records the rejection's message (`entry.
+ * lastError`, surfaced in the eventual failure if every attempt is
+ * exhausted) and otherwise does nothing, leaving the per-attempt timer
+ * (armed BEFORE `write()` was even called -- see `attempt`'s own doc
+ * comment) to run to completion exactly as it would for "no status ever
+ * arrived". A write failing outright therefore no longer shortens the wait
+ * at all; it simply means this particular attempt's wait ends in a retry
+ * (or the final failure) for a known reason instead of an unknown one. (2)
+ * `DEFAULT_TIMEOUT_MS` is now derived FROM `SCAN_DURATION_MS` (double it,
+ * not match it) rather than coincidentally repeating the same number, so
+ * the relationship that has to hold -- "comfortably longer than a scan
+ * plus connect/discover/subscribe" -- is visible in the source rather than
+ * two separately-chosen constants that happened to agree.
+ *
+ * With both fixes, "one reconnect, one retry" falls out of the ordinary
+ * bounded-retry mechanism the way it was always meant to: the retry's
+ * `write()` call happens only once a FULL `timeoutMs` has elapsed, by
+ * which point `ProxyConnectionManager`'s own reconnect-with-backoff (which
+ * resets to an immediate rescan after what had been a successful
+ * connection) has had comfortably more time than it needs to finish. See
+ * queue.test.ts's disconnection tests -- including one built against a
+ * `FakeBluetoothPort` configured to let `scan()` actually consume its full
+ * documented `durationMs` of virtual time, rather than resolving
+ * instantly, which is what let the original defect hide behind a green
+ * suite in the first place.
  *
  * NULLISH CONVENTION: `null` throughout (no pending command is
  * `active === null`; no stale predicate to guard against is
@@ -168,13 +195,20 @@ export interface TrafficQueueOptions {
 }
 
 // Engineering choices, not specification values -- see TrafficQueueOptions
-// above. 4 seconds mirrors connection.ts's own SCAN_DURATION_MS as "long
-// enough for a real round trip, short enough not to make a stuck command
-// feel broken"; 3 total attempts (one send, two retries) is a small,
-// genuinely bounded number rather than either "never retry" or "retry
-// until the heat death of the universe".
-const DEFAULT_TIMEOUT_MS = 4000;
-const DEFAULT_MAX_ATTEMPTS = 3;
+// above, and the module header's account of why the FIRST choice of
+// DEFAULT_TIMEOUT_MS (a bare 4000, merely equal to SCAN_DURATION_MS) was
+// wrong: a reconnect costs at least one full scan window PLUS connect,
+// discover and subscribe, so a per-attempt timeout equal to the scan alone
+// is a race the retry cannot win. Doubling SCAN_DURATION_MS -- rather than
+// picking some other number that happens to be bigger -- keeps the
+// relationship that actually matters ("comfortably longer than one scan")
+// visible at the definition site instead of hoping two separately-chosen
+// constants stay in agreement. 3 total attempts (one send, two retries) is
+// a small, genuinely bounded number rather than either "never retry" or
+// "retry until the heat death of the universe". Both exported so a test
+// can pin the actual defaults rather than silently assuming them.
+export const DEFAULT_TIMEOUT_MS = SCAN_DURATION_MS * 2;
+export const DEFAULT_MAX_ATTEMPTS = 3;
 
 interface QueueEntry {
   readonly command: QueuedCommand;
@@ -193,20 +227,34 @@ interface ActiveEntry extends QueueEntry {
    *  timer fire that belongs to an attempt this entry has already moved
    *  past (a retry started before the earlier attempt's own promise
    *  settled). Mirrors connection.ts's `epoch` guard, scoped to one
-   *  command instead of the whole manager. The `write()`-rejection half of
-   *  this is independently mutation-tested (queue.test.ts's
-   *  "a write() that settles late" describe block, against a hand-rolled
-   *  `TrafficPort` whose write a test can keep open past its own timeout --
-   *  the real FakeBluetoothPort always settles write() within a couple of
-   *  microtasks, too fast to reach this race). The TIMER-fire half, in
-   *  `onAttemptTimedOut`, is NOT independently exercised: FakeClock's
-   *  timers are one-shot and this module always cancels the previous one
-   *  before arming a new one, so a stale timer fire for an entry's own
-   *  earlier attempt cannot occur through any fake this project has --
-   *  kept as the same defensive, not-exercised-by-name guard connection.ts
-   *  itself documents for its own epoch check. */
+   *  command instead of the whole manager.
+   *
+   *  What the `write()`-rejection half actually guards CHANGED with the
+   *  mechanism fix below: since that handler no longer calls `retryOrFail`
+   *  (a stale rejection can no longer trigger an extra retry -- there is
+   *  nothing left for it to trigger), the token check's remaining job is
+   *  narrower but real: a stale rejection must not overwrite `lastError`
+   *  with the WRONG attempt's reason, corrupting the final failure
+   *  message's "last attempt: ..." detail. Independently mutation-tested
+   *  (queue.test.ts's "a write() that settles late" describe block, second
+   *  test, against `FakeBluetoothPort`'s own held-write support).
+   *
+   *  The TIMER-fire half, in `onAttemptTimedOut`, is NOT independently
+   *  exercised: FakeClock's timers are one-shot and this module always
+   *  cancels the previous one before arming a new one, so a stale timer
+   *  fire for an entry's own earlier attempt cannot occur through any fake
+   *  this project has -- kept as the same defensive, not-exercised-by-name
+   *  guard connection.ts itself documents for its own epoch check. */
   attemptsMade: number;
   timer: TimerHandle | null;
+  /** The most recent `write()` rejection for the CURRENT attempt, if any --
+   *  reset at the start of every `attempt()` call, surfaced in the eventual
+   *  failure message if every attempt is exhausted. A write failing
+   *  outright no longer retries from inside the rejection handler (see the
+   *  module header's account of the defect this replaced) -- it only
+   *  changes what the eventual failure says caused it; the timer armed at
+   *  the start of this same attempt is what actually paces the retry. */
+  lastError: Error | null;
 }
 
 /** What a stale, already-abandoned command's predicate is kept as, for
@@ -288,29 +336,40 @@ export class TrafficQueue {
     if (this.active !== null) return;
     const next = this.backlog.shift();
     if (next === undefined) return;
-    this.active = { ...next, attemptsMade: 0, timer: null };
+    this.active = { ...next, attemptsMade: 0, timer: null, lastError: null };
     this.attempt(this.active);
   }
 
   /**
    * Makes one attempt at `entry`: writes its bytes (unchanged from the
    * first attempt -- see `QueueEntry.data`'s own doc comment, and the
-   * module header's TID note) and starts this attempt's timeout. The
+   * module header's TID note), copied again here so the transport can
+   * never mutate this entry's own stored snapshot (the global "never
+   * retain a view into a buffer you do not own" constraint applies to what
+   * this module HANDS OUT, not only to what it receives -- a port that
+   * wrote into the buffer it was given would otherwise corrupt every later
+   * retry of the same command), and starts this attempt's timeout. The
    * timeout is armed BEFORE `write()` settles, not after, so a slow or
    * failing write cannot itself consume time outside what `timeoutMs`
    * already bounds.
    */
   private attempt(entry: ActiveEntry): void {
     entry.attemptsMade += 1;
+    entry.lastError = null;
     const token = entry.attemptsMade;
     entry.timer = this.clock.setTimeout(() => this.onAttemptTimedOut(entry, token), this.timeoutMs);
-    this.transport.write(entry.data).catch((err: unknown) => {
+    this.transport.write(Buffer.from(entry.data)).catch((err: unknown) => {
       // A later attempt may already have started (the timeout for THIS
       // attempt fired before this rejection arrived) -- `token` no longer
       // matching means this rejection is stale and must change nothing.
       if (this.active !== entry || entry.attemptsMade !== token) return;
-      this.clearTimer(entry);
-      this.retryOrFail(entry, err instanceof Error ? err : new Error(String(err)));
+      // THE FIX (see the module header): a write failing outright is a
+      // reason to WAIT, not a reason to retry instantly from inside this
+      // handler. Only the cause is recorded, for the eventual failure
+      // message if every attempt is exhausted -- the timer armed above,
+      // already ticking since before this write was even attempted, is
+      // what decides when the retry actually happens.
+      entry.lastError = err instanceof Error ? err : new Error(String(err));
     });
   }
 
@@ -327,13 +386,16 @@ export class TrafficQueue {
     }
   }
 
-  private retryOrFail(entry: ActiveEntry, cause?: Error): void {
+  private retryOrFail(entry: ActiveEntry): void {
     if (entry.attemptsMade < this.maxAttempts) {
       this.attempt(entry);
       return;
     }
-    const detail = cause === undefined ? '' : ` (last attempt: ${cause.message})`;
-    this.fail(entry, new Error(`${entry.command.description}: no status received after ${entry.attemptsMade} attempts${detail}`));
+    const cause = entry.lastError;
+    const detail = cause === null ? '' : ` (last attempt: ${cause.message})`;
+    const attempts = entry.attemptsMade;
+    const noun = attempts === 1 ? 'attempt' : 'attempts';
+    this.fail(entry, new Error(`${entry.command.description}: no status received after ${attempts} ${noun}${detail}`));
   }
 
   private fail(entry: ActiveEntry, err: Error): void {
@@ -347,15 +409,19 @@ export class TrafficQueue {
   }
 
   private succeed(entry: ActiveEntry, data: Buffer): void {
-    // `clearTimer` here is tidiness (releasing the clock's reference to a
-    // timer nobody will act on), not itself load-bearing: `this.active =
-    // null` below is what actually protects against a stray later fire,
-    // since `onAttemptTimedOut`/the write() `.catch()` handler both check
-    // `this.active === entry` first. Mutation-tested separately (see
-    // queue.test.ts's comment on "a settled command leaves nothing behind"):
-    // dropping `this.active = null` breaks the "serialisation" tests (the
-    // next backlog entry can never start); dropping `clearTimer` alone
-    // breaks nothing this suite can observe.
+    // `clearTimer` here is NOT mere tidiness, despite `onAttemptTimedOut`'s
+    // own `this.active !== entry` guard making a stray fire logically
+    // harmless once `active` has moved on (review correction: an earlier
+    // version of this comment claimed the opposite, and was wrong -- see
+    // queue.test.ts's own corrected comment on "a settled command actually
+    // cancels its own timer"). With REAL timers, an uncancelled one keeps
+    // the event loop alive and keeps this `entry` (and everything it
+    // closes over) reachable from the timer queue until it finally fires,
+    // `timeoutMs` later, for nothing -- a genuine per-command resource
+    // leak, not merely a logically-inert one. `this.active = null` below
+    // is what protects the STATE MACHINE (the next backlog entry can start,
+    // a stray fire is a no-op); `clearTimer` is what protects the CLOCK
+    // (nothing is left pending once a command has actually settled).
     this.clearTimer(entry);
     this.active = null;
     entry.resolve(data);
@@ -366,16 +432,41 @@ export class TrafficQueue {
     if (this.lastAbandoned !== null) {
       const stale = this.lastAbandoned;
       this.lastAbandoned = null; // one-shot: protects at most this one notification
-      if (stale.isStatus(data)) {
+      if (this.safeIsStatus(stale.isStatus, data)) {
         return; // the late answer to a question nobody is asking anymore -- ignored
       }
     }
-    if (this.active !== null && this.active.command.isStatus(data)) {
+    if (this.active !== null && this.safeIsStatus(this.active.command.isStatus, data)) {
       this.succeed(this.active, data);
       return;
     }
     for (const listener of this.unsolicitedListeners) {
-      listener(Buffer.from(data));
+      try {
+        listener(Buffer.from(data));
+      } catch {
+        // One listener's own failure must not stop delivery to the rest,
+        // and must not escape into ProxyConnectionManager's own
+        // notification dispatch loop (which has no per-listener isolation
+        // of its own -- inherited from that layer, not introduced here).
+        // There is no error-reporting channel reachable from inside a
+        // notification callback, so there is nothing productive to do
+        // with the error beyond not letting it propagate.
+      }
+    }
+  }
+
+  /** Calls a caller-supplied `isStatus` predicate defensively: a predicate
+   *  that throws is treated as "does not match" rather than being allowed
+   *  to escape into `ProxyConnectionManager`'s own notification dispatch
+   *  loop. The layer below has the same gap for its own listeners
+   *  (inherited, not introduced here) -- but THIS module's predicate is
+   *  caller-supplied business logic, and therefore the one most likely to
+   *  actually throw. */
+  private safeIsStatus(isStatus: (notification: Buffer) => boolean, data: Buffer): boolean {
+    try {
+      return isStatus(data);
+    } catch {
+      return false;
     }
   }
 }
