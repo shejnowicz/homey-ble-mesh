@@ -20,7 +20,8 @@ import { encodeAccessMessage, type AccessMessage } from '../../../lib/mesh/packe
 import { decodeNetworkPdu } from '../../../lib/mesh/packet/network';
 import { k4 } from '../../../lib/mesh/crypto/derive';
 import type { CompositionData } from '../../../lib/mesh/config/composition';
-import type { HomeyCapability } from '../../../lib/models/capabilities';
+import type { HomeyCapability, NodeProbeResult, TemperatureRange } from '../../../lib/models/capabilities';
+import { DEFAULT_TEMPERATURE_RANGE } from '../temperatureRange';
 
 /** Waits a full macrotask turn — same technique, and same reason, as
  *  `fakeClock.ts`'s own private `flushMicrotasks` (queue.test.ts's own
@@ -93,6 +94,8 @@ const OP_LIGHTNESS_STATUS = 0x824e;
 const OP_CTL_GET = 0x825d;
 const OP_CTL_SET = 0x825e;
 const OP_CTL_STATUS = 0x8260;
+const OP_CTL_TEMPERATURE_SET = 0x8264;
+const OP_CTL_TEMPERATURE_STATUS = 0x8266;
 const OP_HSL_GET = 0x826d;
 const OP_HSL_SET = 0x8276;
 const OP_HSL_STATUS = 0x8278;
@@ -146,12 +149,25 @@ interface FakeNodeState {
   onOff: number;
   lightness: number;
   temperature: number;
+  deltaUv: number;
   hue: number;
   saturation: number;
 }
 
+/**
+ * A node MEASURED to run the composite Light CTL Server and NOT the Light
+ * CTL Temperature Server — the one probe result that makes
+ * `setLightTemperature` send a `Light CTL Set` (which, unlike the
+ * Temperature Set, carries a mandatory Lightness field). Used by the tests
+ * that are about that Lightness field rather than about the model choice.
+ */
+const COMPOSITE_CTL_PROBE: NodeProbeResult = {
+  models: { lightCtlTemperature: 'unsupported', lightCtl: 'supported' },
+  temperatureRange: null,
+};
+
 function defaultNodeState(): FakeNodeState {
-  return { onOff: 0, lightness: 0, temperature: __testing.MIN_PRACTICAL_KELVIN, hue: 0, saturation: 0 };
+  return { onOff: 0, lightness: 0, temperature: DEFAULT_TEMPERATURE_RANGE.minKelvin, deltaUv: 0, hue: 0, saturation: 0 };
 }
 
 /** For Lightness/CTL/HSL Status, whose fields (Table 6.53/6.71/6.87) are all
@@ -291,6 +307,17 @@ function installLightingResponder(bluetooth: FakeBluetoothPort, peripheralId: st
           opts.state.temperature = parameters.readUInt16LE(2);
           return sendAsNode(statusPayload(OP_CTL_STATUS, [opts.state.lightness, opts.state.temperature]), opts.appKey, 'application');
         }
+        case OP_CTL_TEMPERATURE_SET: {
+          // Table 6.73: Temperature || Delta UV || TID — NO lightness, which
+          // is exactly why this fake leaves `lightness` alone here.
+          opts.state.temperature = parameters.readUInt16LE(0);
+          opts.state.deltaUv = parameters.readUInt16LE(2);
+          return sendAsNode(
+            statusPayload(OP_CTL_TEMPERATURE_STATUS, [opts.state.temperature, opts.state.deltaUv]),
+            opts.appKey,
+            'application',
+          );
+        }
         case OP_HSL_GET:
           return sendAsNode(
             statusPayload(OP_HSL_STATUS, [opts.state.lightness, opts.state.hue, opts.state.saturation]),
@@ -392,6 +419,13 @@ function setUp(
     capabilities?: ReadonlySet<HomeyCapability>;
     queueOptions?: { timeoutMs?: number; maxAttempts?: number };
     nodeState?: Partial<FakeNodeState>;
+    /** What this node was measured to do at pairing time, as the store would
+     *  hold it. Omitted = a node paired before the probe existed. */
+    probe?: NodeProbeResult;
+    /** This device's own resolved colour-temperature range — omitted means
+     *  the documented fallback, exactly as a device with no setting and no
+     *  reported range gets. */
+    temperatureRange?: TemperatureRange;
     responderOptions?: Partial<Omit<LightingResponderOptions, 'ourAddress' | 'nodeAddress' | 'netKey' | 'appKey' | 'deviceKey' | 'state'>>;
   } = {},
 ): Harness {
@@ -426,7 +460,7 @@ function setUp(
     ivIndex: 0,
     ourUnicastAddress: OUR_ADDRESS,
     nextUnicastAddress: NODE_ADDRESS + 1,
-    nodes: [{ address: NODE_ADDRESS, deviceKey, composition }],
+    nodes: [{ address: NODE_ADDRESS, deviceKey, composition, ...(options.probe === undefined ? {} : { probe: options.probe }) }],
   });
 
   const device = new FakeDevicePort(options.capabilities ?? ALL_CAPABILITIES);
@@ -440,7 +474,14 @@ function setUp(
     },
     onUnsolicited: (listener: (data: Buffer) => void): (() => void) => queue.onUnsolicited(listener),
   };
-  const controller = new MeshLightController({ queue: countingQueue, store, clock, device, address: NODE_ADDRESS });
+  const controller = new MeshLightController({
+    queue: countingQueue,
+    store,
+    clock,
+    device,
+    address: NODE_ADDRESS,
+    temperatureRange: options.temperatureRange,
+  });
 
   const nodeState: FakeNodeState = { ...defaultNodeState(), ...options.nodeState };
   installLightingResponder(bluetooth, NODE_PERIPHERAL_ID, {
@@ -493,19 +534,35 @@ describe('unit conversions', () => {
     expect(__testing.fractionToWire(Number.NaN)).toBe(0x0000);
   });
 
-  test('homeyToKelvin: 0 is cold (the practical maximum), 1 is warm (the practical minimum)', () => {
-    expect(__testing.homeyToKelvin(0)).toBe(__testing.MAX_PRACTICAL_KELVIN);
-    expect(__testing.homeyToKelvin(1)).toBe(__testing.MIN_PRACTICAL_KELVIN);
+  test('homeyToKelvin: 0 is cold (the range maximum), 1 is warm (the range minimum)', () => {
+    expect(__testing.homeyToKelvin(0, DEFAULT_TEMPERATURE_RANGE)).toBe(DEFAULT_TEMPERATURE_RANGE.maxKelvin);
+    expect(__testing.homeyToKelvin(1, DEFAULT_TEMPERATURE_RANGE)).toBe(DEFAULT_TEMPERATURE_RANGE.minKelvin);
   });
 
-  test('kelvinToHomey inverts homeyToKelvin at the practical range edges', () => {
-    expect(__testing.kelvinToHomey(__testing.MAX_PRACTICAL_KELVIN)).toBe(0);
-    expect(__testing.kelvinToHomey(__testing.MIN_PRACTICAL_KELVIN)).toBe(1);
+  test('kelvinToHomey inverts homeyToKelvin at the range edges', () => {
+    expect(__testing.kelvinToHomey(DEFAULT_TEMPERATURE_RANGE.maxKelvin, DEFAULT_TEMPERATURE_RANGE)).toBe(0);
+    expect(__testing.kelvinToHomey(DEFAULT_TEMPERATURE_RANGE.minKelvin, DEFAULT_TEMPERATURE_RANGE)).toBe(1);
   });
 
-  test('kelvinToHomey clamps a value outside the practical (but spec-legal) range instead of leaving the 0..1 domain', () => {
-    expect(__testing.kelvinToHomey(800)).toBe(1); // below practical min (but >= Table 6.6's 800 K floor) -> fully warm
-    expect(__testing.kelvinToHomey(20000)).toBe(0); // above practical max (but <= Table 6.6's 20000 K ceiling) -> fully cold
+  test('kelvinToHomey clamps a value outside this bulb\'s range (but spec-legal) instead of leaving the 0..1 domain', () => {
+    expect(__testing.kelvinToHomey(800, DEFAULT_TEMPERATURE_RANGE)).toBe(1); // below the range min (but >= Table 6.6's 800 K floor) -> fully warm
+    expect(__testing.kelvinToHomey(20000, DEFAULT_TEMPERATURE_RANGE)).toBe(0); // above the range max (but <= Table 6.6's 20000 K ceiling) -> fully cold
+  });
+
+  test('THE RANGE IS THE ARGUMENT, not a constant: the same Homey value maps to a different kelvin on a different bulb', () => {
+    // The discriminating case for the whole per-device-range change: a
+    // module that still carried its own constants would produce the same
+    // number for both of these.
+    const narrow: TemperatureRange = { minKelvin: 2700, maxKelvin: 3000 };
+    const wide: TemperatureRange = { minKelvin: 2000, maxKelvin: 10000 };
+    expect(__testing.homeyToKelvin(0.5, narrow)).toBe(2850);
+    expect(__testing.homeyToKelvin(0.5, wide)).toBe(6000);
+    // ...and each one's own inverse round-trips within its own range.
+    expect(__testing.kelvinToHomey(2850, narrow)).toBeCloseTo(0.5, 6);
+    expect(__testing.kelvinToHomey(6000, wide)).toBeCloseTo(0.5, 6);
+    // A value fully inside the WIDE range but outside the NARROW one
+    // clamps on the narrow bulb — it genuinely cannot produce it.
+    expect(__testing.kelvinToHomey(6000, narrow)).toBe(0);
   });
 });
 
@@ -702,7 +759,7 @@ describe('unsolicited status', () => {
 
     const pdu = buildNodeNotification(h.netKey, h.appKey, statusPayload(OP_CTL_STATUS, [32768, 4000]));
     h.bluetooth.simulateNotification(NODE_PERIPHERAL_ID, pdu);
-    await flushMicrotasks();expect(h.device.getCapabilityValue('light_temperature')).toBeCloseTo(__testing.kelvinToHomey(4000), 6);
+    await flushMicrotasks();expect(h.device.getCapabilityValue('light_temperature')).toBeCloseTo(__testing.kelvinToHomey(4000, DEFAULT_TEMPERATURE_RANGE), 6);
     expect(h.device.getCapabilityValue('dim')).toBeCloseTo(__testing.wireToFraction(32768), 6);
     expect(h.bluetooth.writesReceived).toHaveLength(0);
   });
@@ -832,28 +889,120 @@ describe('setDim', () => {
 });
 
 describe('setLightTemperature', () => {
-  test('preserves the CURRENT dim value in the CTL Set rather than defaulting it', async () => {
+  test('sends a Light CTL TEMPERATURE Set (0x8264) by default — the message the owner\'s own bulb answers', async () => {
     const h = setUp();
     await connectManager(h.manager, h.clock);
-    h.device.capabilityValues.set('dim', 0.25); // as if a previous read/command already established this
+    h.device.capabilityValues.set('dim', 0.25);
+
+    await h.controller.setLightTemperature(0.5);
+
+    const sent = decodeOurCommand(h.bluetooth.writesReceived[0]!.data, h.netKey, h.appKey);
+    expect(sent?.opcode).toBe(OP_CTL_TEMPERATURE_SET);
+    // Table 6.73: Temperature || Delta UV || TID — temperature FIRST, and
+    // no Lightness field anywhere, which is the point.
+    expect(sent?.parameters.readUInt16LE(0)).toBe(__testing.homeyToKelvin(0.5, DEFAULT_TEMPERATURE_RANGE));
+    expect(sent?.parameters).toHaveLength(5);
+    expect(h.device.getCapabilityValue('light_temperature')).toBeCloseTo(0.5, 3);
+  });
+
+  test('CANNOT disturb brightness: the node\'s own lightness is untouched by a temperature change, and `dim` is left alone', async () => {
+    // The practical reason the Temperature model is preferred. A composite
+    // Light CTL Set would have had to state SOME brightness.
+    const h = setUp({ nodeState: { lightness: 40000 } });
+    await connectManager(h.manager, h.clock);
+    h.device.capabilityValues.set('dim', 0.25);
+
+    await h.controller.setLightTemperature(0.5);
+
+    expect(h.nodeState.lightness).toBe(40000);
+    expect(h.device.getCapabilityValue('dim')).toBeCloseTo(0.25, 6);
+  });
+
+  test('settles on the node\'s own Light CTL Temperature Status (0x8266), not on what was commanded', async () => {
+    const h = setUp();
+    await connectManager(h.manager, h.clock);
+
+    await h.controller.setLightTemperature(1); // the range minimum
+
+    const reported = h.nodeState.temperature;
+    expect(reported).toBe(DEFAULT_TEMPERATURE_RANGE.minKelvin);
+    expect(h.device.getCapabilityValue('light_temperature')).toBeCloseTo(
+      __testing.kelvinToHomey(reported, DEFAULT_TEMPERATURE_RANGE),
+      6,
+    );
+    // The status also tells Homey which picker is driving the lamp.
+    expect(h.device.getCapabilityValue('light_mode')).toBe('temperature');
+  });
+
+  test('falls back to the composite Light CTL Set for a node MEASURED to run that one and not the Temperature model', async () => {
+    // THE DISCRIMINATING CASE for `chooseTemperatureWriteModel`: the only
+    // measurement that moves off the default is a positive 'unsupported'
+    // for the Temperature model AND a positive 'supported' for the
+    // composite one.
+    const h = setUp({
+      probe: { models: { lightCtlTemperature: 'unsupported', lightCtl: 'supported' }, temperatureRange: null },
+    });
+    await connectManager(h.manager, h.clock);
+    h.device.capabilityValues.set('dim', 0.25);
 
     await h.controller.setLightTemperature(0.5);
 
     const sent = decodeOurCommand(h.bluetooth.writesReceived[0]!.data, h.netKey, h.appKey);
     expect(sent?.opcode).toBe(OP_CTL_SET);
     expect(sent?.parameters.readUInt16LE(0)).toBe(__testing.fractionToWire(0.25)); // lightness preserved
-    expect(sent?.parameters.readUInt16LE(2)).toBe(__testing.homeyToKelvin(0.5)); // temperature requested
-    expect(h.device.getCapabilityValue('light_temperature')).toBeCloseTo(0.5, 3);
+    expect(sent?.parameters.readUInt16LE(2)).toBe(__testing.homeyToKelvin(0.5, DEFAULT_TEMPERATURE_RANGE));
   });
 
-  test('with no prior dim value, defaults to full brightness rather than an arbitrary one', async () => {
-    const h = setUp();
+  test('on the composite fallback with no prior dim value, defaults to full brightness rather than an arbitrary one', async () => {
+    const h = setUp({
+      probe: { models: { lightCtlTemperature: 'unsupported', lightCtl: 'supported' }, temperatureRange: null },
+    });
     await connectManager(h.manager, h.clock);
 
     await h.controller.setLightTemperature(0.2);
 
     const sent = decodeOurCommand(h.bluetooth.writesReceived[0]!.data, h.netKey, h.appKey);
     expect(sent?.parameters.readUInt16LE(0)).toBe(0xffff);
+  });
+
+  test.each([
+    ['nothing measured at all (a node paired before the probe existed)', undefined],
+    ['both models measured unknown', { models: {}, temperatureRange: null }],
+    ['the Temperature model measured unsupported but the composite one NOT measured supported', { models: { lightCtlTemperature: 'unsupported' as const }, temperatureRange: null }],
+    ['both measured supported', { models: { lightCtlTemperature: 'supported' as const, lightCtl: 'supported' as const }, temperatureRange: null }],
+  ])('keeps the 0x8264 default when the measurement does not positively contradict it: %s', async (_label, probe) => {
+    const h = setUp({ probe });
+    await connectManager(h.manager, h.clock);
+
+    await h.controller.setLightTemperature(0.5);
+
+    expect(decodeOurCommand(h.bluetooth.writesReceived[0]!.data, h.netKey, h.appKey)?.opcode).toBe(OP_CTL_TEMPERATURE_SET);
+  });
+
+  test('uses THIS device\'s own range, not a module constant — the kelvin on the wire follows the range it was given', async () => {
+    const narrow: TemperatureRange = { minKelvin: 2700, maxKelvin: 3000 };
+    const h = setUp({ temperatureRange: narrow });
+    await connectManager(h.manager, h.clock);
+
+    await h.controller.setLightTemperature(0);
+
+    expect(decodeOurCommand(h.bluetooth.writesReceived[0]!.data, h.netKey, h.appKey)?.parameters.readUInt16LE(0)).toBe(3000);
+  });
+
+  test('setTemperatureRange accepts a usable range and takes effect on the NEXT command; an unusable one is refused and changes nothing', async () => {
+    const h = setUp({ temperatureRange: { minKelvin: 2700, maxKelvin: 3000 } });
+    await connectManager(h.manager, h.clock);
+
+    expect(h.controller.setTemperatureRange({ minKelvin: 2000, maxKelvin: 6500 })).toBe(true);
+    await h.controller.setLightTemperature(0);
+    expect(decodeOurCommand(h.bluetooth.writesReceived[0]!.data, h.netKey, h.appKey)?.parameters.readUInt16LE(0)).toBe(6500);
+
+    // Inverted, and outside Table 6.6 — both refused, and the accepted
+    // range above is still the one in force.
+    expect(h.controller.setTemperatureRange({ minKelvin: 6000, maxKelvin: 3000 })).toBe(false);
+    expect(h.controller.setTemperatureRange({ minKelvin: 100, maxKelvin: 30000 })).toBe(false);
+    await h.controller.setLightTemperature(0);
+    expect(decodeOurCommand(h.bluetooth.writesReceived[1]!.data, h.netKey, h.appKey)?.parameters.readUInt16LE(0)).toBe(6500);
   });
 });
 
@@ -900,7 +1049,7 @@ describe('availability', () => {
 
     expect(h.device.getCapabilityValue('onoff')).toBe(true);
     expect(h.device.getCapabilityValue('dim')).toBeCloseTo(__testing.wireToFraction(40000), 6);
-    expect(h.device.getCapabilityValue('light_temperature')).toBeCloseTo(__testing.kelvinToHomey(4000), 6);
+    expect(h.device.getCapabilityValue('light_temperature')).toBeCloseTo(__testing.kelvinToHomey(4000, DEFAULT_TEMPERATURE_RANGE), 6);
     expect(h.device.getCapabilityValue('light_hue')).toBeCloseTo(__testing.wireToFraction(11000), 6);
     expect(h.device.getCapabilityValue('light_saturation')).toBeCloseTo(__testing.wireToFraction(22000), 6);
     expect(h.device.availabilityCalls.at(-1)).toEqual({ available: true });
@@ -1167,7 +1316,11 @@ describe('the dim fraction a Light CTL / Light HSL Set carries', () => {
   });
 
   test('a device whose dim is already known carries THAT brightness, not the fallback', async () => {
-    const h = setUp();
+    // Driven through the COMPOSITE Light CTL Set, because that is the
+    // message with a Lightness field at all — the default Light CTL
+    // Temperature Set has none, which is exactly why it cannot get this
+    // wrong (see `setLightTemperature`'s own tests above).
+    const h = setUp({ probe: COMPOSITE_CTL_PROBE });
     await connectManager(h.manager, h.clock);
     await h.device.setCapabilityValue('dim', 0.25);
 
@@ -1180,7 +1333,7 @@ describe('the dim fraction a Light CTL / Light HSL Set carries', () => {
   });
 
   test('a device whose dim has no value yet carries full brightness — the decision, pinned', async () => {
-    const h = setUp();
+    const h = setUp({ probe: COMPOSITE_CTL_PROBE });
     await connectManager(h.manager, h.clock);
     expect(h.device.getCapabilityValue('dim')).toBeNull(); // nothing has populated it
 

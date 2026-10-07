@@ -1,4 +1,4 @@
-import { CompositionData } from '../mesh/config/composition';
+import { CompositionData, ElementDescription } from '../mesh/config/composition';
 
 /**
  * Decides which Homey capabilities a bulb gets, purely from what the node
@@ -14,12 +14,17 @@ import { CompositionData } from '../mesh/config/composition';
  *
  * THE TABLE (design-fixed):
  *
- *   model reported by the node   | Homey capability
- *   ------------------------------|--------------------------------
- *   Generic OnOff Server          | `onoff`
- *   Light Lightness Server        | `dim`
- *   Light CTL Server              | `light_temperature`
- *   Light HSL Server              | `light_hue`, `light_saturation`
+ *   model reported by the node       | Homey capability
+ *   ----------------------------------|--------------------------------
+ *   Generic OnOff Server              | `onoff`
+ *   Light Lightness Server            | `dim`
+ *   Light CTL Server                  | `light_temperature`
+ *   Light CTL Temperature Server      | `light_temperature`
+ *   Light HSL Server                  | `light_hue`, `light_saturation`
+ *
+ * The fifth row is the hardware round's addition - see
+ * `MODEL_ID_LIGHT_CTL_TEMPERATURE_SERVER` below for why the two
+ * colour-temperature models earn the same capability rather than two.
  *
  * PLUS: an element reporting BOTH Light CTL Server and Light HSL Server
  * also gets `light_mode` (the capability a bulb uses to say which of the
@@ -27,6 +32,33 @@ import { CompositionData } from '../mesh/config/composition';
  * grants only that row's own capabilities, never `light_mode` on its own.
  * A node reporting only some of the four rows gets only the matching
  * capabilities; one absent from `sigModels` contributes nothing.
+ *
+ * DECLARATION IS NO LONGER THE LAST WORD (hardware round). The sentence
+ * above - "never from a hardcoded per-product list" - still stands and is
+ * still the point; what changed is that a node's own declaration turned out
+ * not to be reliable either. The owner's bulb declares a Light CTL Server
+ * and never answers a single `Light CTL Set` at any value, and declares
+ * Light HSL servers while having no colour emitters at all. So
+ * `mapCompositionToCapabilities` now takes an OPTIONAL `probe` argument:
+ * what the node was measured to actually do at pairing time
+ * (`drivers/light/modelProbe.ts`). It can only ever subtract from the
+ * declaration, never add to it, and only on a positive `'unsupported'`
+ * measurement - which keeps "we never hardcode a product" true while no
+ * longer requiring a node's word to be taken for everything.
+ *
+ * WHAT THE PROBE CANNOT SETTLE, and therefore what this module still takes
+ * on trust:
+ *   1. WHETHER A LAMP HAS COLOUR LEDS. The owner's bulb acknowledges
+ *      `Light HSL Set` with a correct echo and emits only white; the
+ *      manufacturer's own app confirms it is warm-to-cold white only. No
+ *      wire probe can see that, so the HSL row stays declaration-driven
+ *      until the owner's planned per-device monocolor/multicolor/warm
+ *      setting exists to say so directly. Do not try to infer it here.
+ *   2. THE COLOUR-TEMPERATURE RANGE. `Light CTL Temperature Range Get` is
+ *      the SIG's own answer and some nodes simply never reply to it (the
+ *      owner's does not), which is why `NodeProbeResult.temperatureRange`
+ *      is nullable and why `drivers/light/meshLight.ts` resolves the range
+ *      from the node, then a per-device setting, then a documented default.
  *
  * VENDOR MODELS (`element.vendorModels`, Table 3.64's 32-bit
  * Company-Identifier + Vendor-Model-Identifier space) are a disjoint
@@ -119,6 +151,20 @@ import { CompositionData } from '../mesh/config/composition';
 const MODEL_ID_GENERIC_ONOFF_SERVER = 0x1000;
 const MODEL_ID_LIGHT_LIGHTNESS_SERVER = 0x1300;
 const MODEL_ID_LIGHT_CTL_SERVER = 0x1303;
+/**
+ * Light CTL Temperature Server - Assigned Numbers, by-value table Page 141
+ * of 446, by-name table Page 142, read the same way as the four above.
+ * A FIFTH ROW OF THE DESIGN TABLE, added in the hardware round: Mesh Model
+ * Section 6.4.4 defines this as its own model (it is the one that answers
+ * `Light CTL Temperature Set`, the message the owner's bulb actually obeys),
+ * separate from the Light CTL Server next to it, and a node may implement
+ * either. It earns the SAME capability as Light CTL Server does,
+ * `light_temperature`, because from Homey's side both are simply "this lamp
+ * can be told a colour temperature"; which of the two messages is used to
+ * tell it is `drivers/light/meshLight.ts`'s decision, informed by the
+ * pairing-time probe, not a second capability.
+ */
+const MODEL_ID_LIGHT_CTL_TEMPERATURE_SERVER = 0x1306;
 const MODEL_ID_LIGHT_HSL_SERVER = 0x1307;
 
 /**
@@ -138,8 +184,89 @@ export const LIGHTING_SERVER_MODEL_IDS: ReadonlyArray<number> = [
   MODEL_ID_GENERIC_ONOFF_SERVER,
   MODEL_ID_LIGHT_LIGHTNESS_SERVER,
   MODEL_ID_LIGHT_CTL_SERVER,
+  // Bound TOO, and this is load-bearing rather than tidy: an application
+  // key is bound per MODEL, so without this entry a node's Light CTL
+  // Temperature Server would never accept an application-key-secured
+  // `Light CTL Temperature Set` at all - the exact message the owner's bulb
+  // is the only one it obeys. A node that does not declare this model
+  // simply has nothing to bind here (the caller skips any model the element
+  // does not list), so adding it costs a node that lacks it nothing.
+  MODEL_ID_LIGHT_CTL_TEMPERATURE_SERVER,
   MODEL_ID_LIGHT_HSL_SERVER,
 ];
+
+// ===========================================================================
+// What a node was MEASURED to do, as opposed to what it declared - see
+// `drivers/light/modelProbe.ts` for how this is obtained and
+// `mapCompositionToCapabilities` below for how it overrides the declaration.
+// ===========================================================================
+
+/**
+ * The lighting models this project can probe, named rather than numbered so
+ * a stored probe result stays readable (and diff-able) in Homey's settings.
+ * `lightCtl` and `lightCtlTemperature` are listed SEPARATELY on purpose:
+ * they are different models with different opcodes, and the owner's own
+ * bulb answers one and not the other while declaring both.
+ */
+export type ProbedModel = 'genericOnOff' | 'lightLightness' | 'lightCtl' | 'lightCtlTemperature' | 'lightHsl';
+
+/**
+ * What the probe concluded about one model.
+ *   - `'supported'`: its acknowledged Set was answered with its own Status.
+ *   - `'unsupported'`: its acknowledged Set was sent and nothing came back.
+ *   - `'unknown'`: it was never probed, or could not be (no way to read the
+ *     current value first, so no no-op write to send), or the probe ran out
+ *     of its budget before reaching it. An `'unknown'` never overrides the
+ *     declaration; only `'unsupported'` does.
+ */
+export type ModelProbeVerdict = 'supported' | 'unsupported' | 'unknown';
+
+/** A kelvin range a node reported for itself (Mesh Model Table 6.8). */
+export interface TemperatureRange {
+  readonly minKelvin: number;
+  readonly maxKelvin: number;
+}
+
+/**
+ * One node's measured behaviour, stored alongside its composition (see
+ * `lib/adapter/store.ts#NodeEntry`).
+ *
+ * `temperatureRange` is `null` whenever the node did not answer
+ * `Light CTL Temperature Range Get`, or answered it with Table 6.8's own
+ * 0xFFFF "unknown" row - both of which leave this app with no measured
+ * range, which is a different thing from a range of zero width.
+ */
+export interface NodeProbeResult {
+  readonly models: Readonly<Partial<Record<ProbedModel, ModelProbeVerdict>>>;
+  readonly temperatureRange: TemperatureRange | null;
+}
+
+/** Reads one model's verdict, treating an absent entry as `'unknown'` - the conservative direction, since only `'unsupported'` ever removes a capability. */
+export function probeVerdict(probe: NodeProbeResult | null | undefined, model: ProbedModel): ModelProbeVerdict {
+  return probe?.models[model] ?? 'unknown';
+}
+
+/**
+ * Which of the two colour-temperature models a controller should SEND to
+ * this node.
+ *
+ * The default is `'lightCtlTemperature'` (`Light CTL Temperature Set`,
+ * `0x8264`) and that is deliberately the FALLBACK rather than a rule: it is
+ * what the owner's own bulb obeys, measured, and it is also the better
+ * message on its own merits (it carries no Lightness field, so a
+ * temperature change cannot disturb brightness - see `lighting.ts`'s own
+ * note on Table 6.73 vs Table 6.69). The ONLY thing that moves this off the
+ * default is a measurement that positively contradicts it: the Temperature
+ * model probed `'unsupported'` AND the composite model probed
+ * `'supported'`. Two `'unknown'`s, or a node that was never probed at all,
+ * keep the default - silence from a probe is not evidence against it.
+ */
+export function chooseTemperatureWriteModel(probe: NodeProbeResult | null | undefined): 'lightCtl' | 'lightCtlTemperature' {
+  const temperature = probeVerdict(probe, 'lightCtlTemperature');
+  const composite = probeVerdict(probe, 'lightCtl');
+  if (temperature === 'unsupported' && composite === 'supported') return 'lightCtl';
+  return 'lightCtlTemperature';
+}
 
 /** The Homey capability identifiers this mapping ever produces: the design's fixed table, plus `light_mode`. */
 export type HomeyCapability =
@@ -169,16 +296,51 @@ export interface CapabilityAssignment {
  * appended last when both colour models are present; elements are visited
  * in `composition.elements` order. Never throws and never returns `null` -
  * see the module header's NULLISH CONVENTION note.
+ *
+ * `probe`, when supplied, is what the node was MEASURED to do at pairing
+ * time (`drivers/light/modelProbe.ts`). It can only ever REMOVE a
+ * capability the declaration would have granted, never add one: a model the
+ * node never declared is never probed in the first place, and a probe
+ * verdict of `'unknown'` leaves the declaration untouched. Omitting it
+ * entirely reproduces this function's pre-probe behaviour exactly, which is
+ * what every already-paired node (whose store entry has no probe result)
+ * relies on.
  */
 export function mapCompositionToCapabilities(
   composition: CompositionData,
+  probe?: NodeProbeResult | null,
 ): ReadonlyArray<CapabilityAssignment> {
   const assignments: CapabilityAssignment[] = [];
 
+  /** A model the element DECLARED and the probe did not positively rule
+   *  out. Only `'unsupported'` - an acknowledged Set that was sent and
+   *  never answered - removes anything; `'unknown'` leaves the declaration
+   *  standing, which is what makes a node this app never probed behave
+   *  exactly as it did before the probe existed. */
+  const measuredAsPresent = (element: ElementDescription, modelId: number, model: ProbedModel): boolean =>
+    element.sigModels.includes(modelId) && probeVerdict(probe, model) !== 'unsupported';
+
   composition.elements.forEach((element, elementIndex) => {
-    const hasOnOff = element.sigModels.includes(MODEL_ID_GENERIC_ONOFF_SERVER);
-    const hasLightness = element.sigModels.includes(MODEL_ID_LIGHT_LIGHTNESS_SERVER);
-    const hasCtl = element.sigModels.includes(MODEL_ID_LIGHT_CTL_SERVER);
+    const hasOnOff = measuredAsPresent(element, MODEL_ID_GENERIC_ONOFF_SERVER, 'genericOnOff');
+    const hasLightness = measuredAsPresent(element, MODEL_ID_LIGHT_LIGHTNESS_SERVER, 'lightLightness');
+    // EITHER colour-temperature model earns `light_temperature`, and the
+    // capability survives as long as at least one of the two the element
+    // actually declared was not ruled out. The owner's own bulb is exactly
+    // this case: it declares both, the composite one is measured
+    // `'unsupported'`, the Temperature one `'supported'` - and the lamp can
+    // plainly change colour temperature, so dropping the capability because
+    // one of the two models is a lie would be the wrong answer.
+    const hasCtl =
+      measuredAsPresent(element, MODEL_ID_LIGHT_CTL_SERVER, 'lightCtl') ||
+      measuredAsPresent(element, MODEL_ID_LIGHT_CTL_TEMPERATURE_SERVER, 'lightCtlTemperature');
+    // HSL IS DELIBERATELY NOT PROBE-GATED - see the module header's own
+    // "WHAT THE PROBE CANNOT SETTLE" note. A bulb with no colour emitters
+    // at all still acknowledges Light HSL Set with a correct echo, so the
+    // probe's `'supported'` here means only "the model answers", never "the
+    // lamp has colour LEDs", and its `'unsupported'` would be the only
+    // useful half - too little to justify treating this row differently
+    // from the declaration until the owner's planned per-device
+    // monocolor/multicolor/warm setting exists to resolve it properly.
     const hasHsl = element.sigModels.includes(MODEL_ID_LIGHT_HSL_SERVER);
 
     if (hasOnOff) {

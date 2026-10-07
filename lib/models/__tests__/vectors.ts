@@ -231,6 +231,155 @@ export const LIGHT_CTL_STATUS_WITH_TARGET = {
 };
 
 // ===========================================================================
+// Light CTL Temperature (Table 6.73/6.75) and Light CTL Temperature Range
+// (Table 6.76/6.79). Table 6.6: CTL Temperature ONLY 0x0320-0x4E20
+// (800-20000 K) legal; Table 6.9: CTL Delta UV signed 16-bit, full domain;
+// Table 6.8: Range Min/Max are kelvin in that same span, OR 0xFFFF meaning
+// "the color temperature of white light is unknown"; Table 7.1: Status Code
+// 0x00 Success, 0x01 Cannot Set Range Min, 0x02 Cannot Set Range Max,
+// 0x03-0xFF RFU. Opcodes `82 64`/`82 66`/`82 62`/`82 63` (see
+// `lighting.ts`'s own transcription of the whole Light CTL opcode block).
+//
+// THE TWO STATUS FIXTURES BELOW ARE THE ONLY MEASURED ONES IN THIS FILE,
+// and the only non-CONSTRUCTED fixtures in it besides
+// `SECTION_1_5_WORKED_EXAMPLE`. They are not published samples either -
+// this document still publishes none - but they are not hand-built from the
+// field table: they are the Status parameters a real Tuya-made CCT bulb
+// (cid=2000 (0x07D0), pid=768, one element) actually put on the wire in
+// answer to a Light CTL Temperature Set, recorded verbatim by the owner,
+// with the lamp visibly going warm and back as it did so. They are
+// therefore the single strongest check in this file: a layout mistake in
+// `decodeLightCtlTemperatureStatus` that a hand-built fixture would simply
+// share (both having come from the same reading of the same table) cannot
+// survive these, because nothing about them came from this project's own
+// reading of anything.
+// ===========================================================================
+
+/**
+ * Table 6.73 "Light CTL Temperature Set message structure", full form
+ * (Transition Time/Delay present). CONSTRUCTED. temperature=0x1770
+ * (6000 K - the value the owner's bulb was actually driven to; LE `70 17`),
+ * deltaUv=-2 (0xFFFE two's complement, LE `FE FF` - negative AND
+ * byte-asymmetric, so both signedness and endianness are detectable),
+ * tid=0x3C, transition={stepResolution:2 (10 s), numberOfSteps:0x09},
+ * delay=0x1E. Transition octet = 0x09 | (2<<6) = 0x09 | 0x80 = 0x89.
+ * Parameters = Temperature(7017) || DeltaUV(FEFF) || TID(3C) ||
+ * TransitionTime(89) || Delay(1E).
+ */
+export const LIGHT_CTL_TEMPERATURE_SET_FULL = {
+  temperature: 0x1770,
+  deltaUv: -2,
+  tid: 0x3c,
+  stepResolution: 2,
+  numberOfSteps: 0x09,
+  delay: 0x1e,
+  message: '82647017feff3c891e',
+};
+
+/** Table 6.73, minimal form (no Transition Time/Delay). CONSTRUCTED. temperature=0x0BB8 (3000 K - the other value the owner's bulb was driven to; LE `B8 0B`), deltaUv=0 ("Delta UV equal to 0", Table 6.9), tid=0x00. */
+export const LIGHT_CTL_TEMPERATURE_SET_MINIMAL = {
+  temperature: 0x0bb8,
+  deltaUv: 0,
+  tid: 0x00,
+  message: '8264b80b000000',
+};
+
+/** Table 6.73, Delta UV at the signed 16-bit domain's own minimum, -32768 (wire 0x8000, LE `00 80`), Temperature at Table 6.6's own floor 0x0320 (800 K). CONSTRUCTED. */
+export const LIGHT_CTL_TEMPERATURE_SET_DELTA_UV_MIN = {
+  temperature: 0x0320,
+  deltaUv: -32768,
+  tid: 0x11,
+  message: '82642003008011',
+};
+
+/** Table 6.73, Delta UV at the signed 16-bit domain's own maximum, 32767 (wire 0x7FFF, LE `FF 7F`), Temperature at Table 6.6's own ceiling 0x4E20 (20000 K). CONSTRUCTED. */
+export const LIGHT_CTL_TEMPERATURE_SET_DELTA_UV_MAX = {
+  temperature: 0x4e20,
+  deltaUv: 32767,
+  tid: 0x22,
+  message: '8264204eff7f22',
+};
+
+/** Table 6.75 "Light CTL Temperature Status message structure", Present-only (4 Parameters octets). CONSTRUCTED. presentTemperature=0x0320 (800 K, Table 6.6's floor; LE `20 03`), presentDeltaUv=-32768 (LE `00 80`) - the one fixture here that pins Present CTL Delta UV as SIGNED: read unsigned it would come back 32768, not -32768. */
+export const LIGHT_CTL_TEMPERATURE_STATUS_MINIMAL = {
+  presentTemperature: 0x0320,
+  presentDeltaUv: -32768,
+  message: '826620030080',
+};
+
+/**
+ * Table 6.75, full form (Target group present). MEASURED ON HARDWARE, not
+ * constructed - see this section's own header note. The owner wrote a
+ * 6000 K temperature to the bulb and recorded the Status parameters that
+ * came back, verbatim: `7017 0200 7017 0000 47`.
+ *
+ * Read against Table 6.75: Present CTL Temperature = 0x1770 = 6000 K
+ * (exactly what was written, LE `70 17`), Present CTL Delta UV = 0x0002,
+ * Target CTL Temperature = 0x1770, Target CTL Delta UV = 0x0000, Remaining
+ * Time = 0x47. Remaining Time octet 0x47 decomposes (Table 3.33, Figure
+ * 3.4) as numberOfSteps = 0x47 & 0x3F = 0x07 and stepResolution =
+ * (0x47 >> 6) & 0x3 = 0b01, i.e. 7 steps of 1 second (Table 3.34's own row
+ * for 0b01).
+ *
+ * WHAT THIS FIXTURE INDEPENDENTLY CONFIRMS, beyond the decoder agreeing
+ * with itself: that the Status really is 9 Parameters octets in its full
+ * form, that Temperature really is the FIRST field (6000 lands where the
+ * table says it should, and 0x1770 read big-endian would be 0x7017 =
+ * 28695, outside Table 6.6's legal range entirely), and that Present and
+ * Target are genuinely separate fields carrying the same value here rather
+ * than one field this project split in two.
+ */
+export const LIGHT_CTL_TEMPERATURE_STATUS_6000K_MEASURED = {
+  presentTemperature: 0x1770,
+  presentDeltaUv: 0x0002,
+  targetTemperature: 0x1770,
+  targetDeltaUv: 0x0000,
+  stepResolution: 1,
+  numberOfSteps: 0x07,
+  message: '8266701702007017000047',
+};
+
+/** Table 6.75, full form. MEASURED ON HARDWARE, the same session's 3000 K write: `b80b 0200 b80b 0000 47`. 0x0BB8 = 3000 K. Kept alongside the 6000 K one because two measured points, an octave apart, is what makes the field position an observation rather than a coincidence. */
+export const LIGHT_CTL_TEMPERATURE_STATUS_3000K_MEASURED = {
+  presentTemperature: 0x0bb8,
+  presentDeltaUv: 0x0002,
+  targetTemperature: 0x0bb8,
+  targetDeltaUv: 0x0000,
+  stepResolution: 1,
+  numberOfSteps: 0x07,
+  message: '8266b80b0200b80b000047',
+};
+
+/** Table 6.76 "Light CTL Temperature Range Get message structure": Opcode only. CONSTRUCTED. */
+export const LIGHT_CTL_TEMPERATURE_RANGE_GET = {
+  message: '8262',
+};
+
+/** Table 6.79 "Light CTL Temperature Range Status message structure". CONSTRUCTED. statusCode=0x00 (Table 7.1 "Success"), rangeMin=0x0BB8 (3000 K, LE `B8 0B`), rangeMax=0x1770 (6000 K, LE `70 17`) - the owner's own bulb's printed range, used here as a plausible answer from a bulb that DOES implement this message. Parameters = StatusCode(00) || RangeMin(B80B) || RangeMax(7017). */
+export const LIGHT_CTL_TEMPERATURE_RANGE_STATUS_OK = {
+  statusCode: 0x00,
+  rangeMin: 0x0bb8,
+  rangeMax: 0x1770,
+  message: '826300b80b7017',
+};
+
+/** Table 6.79 with Table 6.8's own 0xFFFF row ("The color temperature of white light is unknown") in BOTH range fields - a node that answered and still said nothing. CONSTRUCTED. */
+export const LIGHT_CTL_TEMPERATURE_RANGE_STATUS_UNKNOWN = {
+  statusCode: 0x00,
+  rangeMin: 0xffff,
+  rangeMax: 0xffff,
+  message: '826300ffffffff',
+};
+
+/** Table 6.79 with a NON-success Status Code (Table 7.1's 0x01 "Cannot Set Range Min"), carrying Table 6.6's own two boundary values so the range fields are still distinct and endianness-detectable. CONSTRUCTED. */
+export const LIGHT_CTL_TEMPERATURE_RANGE_STATUS_REFUSED = {
+  statusCode: 0x01,
+  rangeMin: 0x0320,
+  rangeMax: 0x4e20,
+  message: '8263012003204e',
+};
+
+// ===========================================================================
 // Light HSL (Table 6.84/6.85/6.87). Table 6.18/6.12/6.15: Lightness/Hue/
 // Saturation all full 16-bit domain, no Prohibited values. Table 6.87 has
 // NO Target fields at all (see `lighting.ts`'s own note on this structural

@@ -50,6 +50,8 @@ import {
 import { PROVISIONING_SAMPLE } from '../../../lib/mesh/crypto/__tests__/vectors';
 import { PROXY_SAR_TIMEOUT_MS } from '../../../lib/mesh/packet/proxyPdu';
 import { COMPOSITION_DATA_PAGE0_SAMPLE } from '../../../lib/mesh/config/__tests__/vectors';
+import { k4 } from '../../../lib/mesh/crypto/derive';
+import type { ProbedModel } from '../../../lib/models/capabilities';
 
 /**
  * Drives the WHOLE pairing sequence — provisioning (the real
@@ -280,7 +282,29 @@ interface ConfigResponderOptions {
    *  silence alone cannot reach (that path throws/times out before ever
    *  decoding a reply to check its type). */
   readonly nodeResetWrongReply?: boolean;
+  /**
+   * WHICH LIGHTING MODELS THIS FAKE NODE ACTUALLY RUNS, as opposed to which
+   * ones its composition declares - the whole point of the capability probe
+   * (`drivers/light/modelProbe.ts`). A model listed here as `'silent'`
+   * receives the probe's messages and answers nothing, exactly like the
+   * owner's own bulb does for `Light CTL Set`; a model not listed answers
+   * normally. Default: every model answers, which is what the pre-probe
+   * tests in this file implicitly assume about a well-behaved node.
+   */
+  readonly silentModels?: ReadonlyArray<ProbedModel>;
+  /**
+   * What this node answers a `Light CTL Temperature Range Get` with.
+   *   - a `{min, max}` pair: a node that reports its range (Table 6.79);
+   *   - `'unknown'`: a node that answers with Table 6.8's own 0xFFFF row;
+   *   - `'silent'` (the default): a node that never answers it at all -
+   *     the owner's own bulb's measured behaviour.
+   */
+  readonly temperatureRangeReply?: { readonly min: number; readonly max: number } | 'unknown' | 'silent';
 }
+
+/** Every fake lamp's own live state, by peripheral id — so a test can
+ *  assert the probe's no-op writes left the lamp exactly as it found it. */
+const lampStateByPeripheral = new Map<string, { onOff: number; lightness: number; temperature: number; deltaUv: number; hue: number; saturation: number }>();
 
 function installConfigResponder(
   bluetooth: FakeBluetoothPort,
@@ -328,13 +352,127 @@ function installConfigResponder(
     expectedSrc: ourAddress,
   };
 
+  // ---------------------------------------------------------------------
+  // THE LIGHTING HALF OF THIS FAKE NODE (capability probe round). Every
+  // message above is DEVICE-key-secured, because they are Config messages;
+  // the probe's are APPLICATION-key-secured, because the lighting models
+  // answer on the key that was just bound to them. So this responder now
+  // tries two contexts, in that order, with separate reassembly state for
+  // each — a PDU that does not authenticate under one is `'ignored'` and
+  // leaves that context's state untouched (`acceptIncomingPdu`'s own
+  // contract), so trying both costs nothing and confuses nothing.
+  //
+  // WHAT IT MODELS: a well-behaved node answers every acknowledged Set with
+  // its own Status, which is exactly what the probe measures. `silentModels`
+  // makes one model answer nothing instead — the owner's own bulb's
+  // measured behaviour for `Light CTL Set` — so a test can assert the probe
+  // tells the two apart.
+  const appKeyRequestContext: MeshReceiveContext = {
+    key: TEST_APP_KEY,
+    keyKind: 'application',
+    netKey: TEST_NET_KEY,
+    ivIndex: 0,
+    expectedSrc: ourAddress,
+  };
+  let appKeyRequestState: MeshReceiveState | undefined;
+  const sendAsNodeAppKey = (accessPayload: Buffer): Buffer[] =>
+    encodeMeshMessage({
+      accessPayload,
+      key: TEST_APP_KEY,
+      keyKind: 'application',
+      aid: k4(TEST_APP_KEY),
+      src: nodeAddress,
+      dst: ourAddress,
+      netKey: TEST_NET_KEY,
+      ivIndex: 0,
+      ttl: POINT_TO_POINT_TTL,
+      allocateSeq: allocateNodeSeq,
+    });
+  const silent = (model: ProbedModel): boolean => (options.silentModels ?? []).includes(model);
+  const u16le = (value: number): Buffer => {
+    const b = Buffer.alloc(2);
+    b.writeUInt16LE(value, 0);
+    return b;
+  };
+  /** This fake lamp's own current state — read back by the probe's Gets and
+   *  echoed by its Sets, so a probe that is NOT a no-op write would be
+   *  visible here as a changed value. */
+  const lamp = { onOff: 0x01, lightness: 0x8000, temperature: 0x1194, deltaUv: 0x0000, hue: 0x4000, saturation: 0x2000 };
+  const lightingReply = (opcode: number, parameters: Buffer): Buffer[] | undefined => {
+    switch (opcode) {
+      case 0x8201: // Generic OnOff Get
+        return sendAsNodeAppKey(Buffer.from([0x82, 0x04, lamp.onOff]));
+      case 0x8202: // Generic OnOff Set
+        if (silent('genericOnOff')) return undefined;
+        lamp.onOff = parameters[0] as number;
+        return sendAsNodeAppKey(Buffer.from([0x82, 0x04, lamp.onOff]));
+      case 0x824b: // Light Lightness Get
+        return sendAsNodeAppKey(Buffer.concat([Buffer.from([0x82, 0x4e]), u16le(lamp.lightness)]));
+      case 0x824c: // Light Lightness Set
+        if (silent('lightLightness')) return undefined;
+        lamp.lightness = parameters.readUInt16LE(0);
+        return sendAsNodeAppKey(Buffer.concat([Buffer.from([0x82, 0x4e]), u16le(lamp.lightness)]));
+      case 0x825d: // Light CTL Get
+        return sendAsNodeAppKey(Buffer.concat([Buffer.from([0x82, 0x60]), u16le(lamp.lightness), u16le(lamp.temperature)]));
+      case 0x825e: // Light CTL Set
+        if (silent('lightCtl')) return undefined;
+        lamp.lightness = parameters.readUInt16LE(0);
+        lamp.temperature = parameters.readUInt16LE(2);
+        lamp.deltaUv = parameters.readUInt16LE(4);
+        return sendAsNodeAppKey(Buffer.concat([Buffer.from([0x82, 0x60]), u16le(lamp.lightness), u16le(lamp.temperature)]));
+      case 0x8264: // Light CTL Temperature Set
+        if (silent('lightCtlTemperature')) return undefined;
+        lamp.temperature = parameters.readUInt16LE(0);
+        lamp.deltaUv = parameters.readUInt16LE(2);
+        return sendAsNodeAppKey(Buffer.concat([Buffer.from([0x82, 0x66]), u16le(lamp.temperature), u16le(lamp.deltaUv)]));
+      case 0x826d: // Light HSL Get
+        return sendAsNodeAppKey(
+          Buffer.concat([Buffer.from([0x82, 0x78]), u16le(lamp.lightness), u16le(lamp.hue), u16le(lamp.saturation)]),
+        );
+      case 0x8276: // Light HSL Set
+        if (silent('lightHsl')) return undefined;
+        lamp.lightness = parameters.readUInt16LE(0);
+        lamp.hue = parameters.readUInt16LE(2);
+        lamp.saturation = parameters.readUInt16LE(4);
+        return sendAsNodeAppKey(
+          Buffer.concat([Buffer.from([0x82, 0x78]), u16le(lamp.lightness), u16le(lamp.hue), u16le(lamp.saturation)]),
+        );
+      case 0x8262: {
+        // Light CTL Temperature Range Get -> Range Status (Table 6.79).
+        const reply = options.temperatureRangeReply ?? 'silent';
+        if (reply === 'silent') return undefined;
+        const [min, max] = reply === 'unknown' ? [0xffff, 0xffff] : [reply.min, reply.max];
+        return sendAsNodeAppKey(Buffer.concat([Buffer.from([0x82, 0x63, 0x00]), u16le(min as number), u16le(max as number)]));
+      }
+      default:
+        return undefined;
+    }
+  };
+  /** The fake lamp's own state, for a test that wants to prove the probe left it alone. */
+  lampStateByPeripheral.set(peripheralId, lamp);
+
   const responder: AutoResponder = (data) => {
+    // EVERY PDU GOES THROUGH BOTH CONTEXTS, with neither short-circuiting
+    // the other — subtle and load-bearing. Reassembly (`acceptSegment`) is
+    // key-INDEPENDENT: a segmented Config AppKey Add's first segment reads
+    // as `'incomplete'` under the application-key context too, so an
+    // earlier version of this responder that returned as soon as the
+    // app-key context said `'incomplete'` never showed that segment to the
+    // device-key context at all, and the real request could never
+    // reassemble. Feeding both, always, and dispatching on whichever
+    // actually AUTHENTICATED is the only arrangement that is correct for
+    // both message families at once.
+    const appKeyResult = acceptIncomingPdu(appKeyRequestState, appKeyRequestContext, data);
+    appKeyRequestState = appKeyResult.kind === 'complete' ? undefined : appKeyResult.state;
     const result = acceptIncomingPdu(driverRequestState, driverRequestContext, data);
+    driverRequestState = result.kind === 'complete' ? undefined : result.state;
+
+    if (appKeyResult.kind === 'complete') {
+      return lightingReply(appKeyResult.message.opcode, appKeyResult.message.parameters);
+    }
     if (result.kind !== 'complete') {
-      driverRequestState = result.state;
       return undefined; // mid-segmented-request (AppKey Add's first segment) — no reply yet
     }
-    driverRequestState = undefined;
 
     if (result.message.opcode === 0x8008) {
       // Config Composition Data Get -> Config Composition Data Status.
@@ -532,10 +670,43 @@ describe('a successful pairing', () => {
     await pairNode(deps, 'bulb-1');
 
     // 6 provisioning writes, then 1 (Composition Get) + 2 (AppKey Add,
-    // segmented) + 1 (Model App Bind) = 4 config writes = 10 total.
-    expect(bluetooth.writesReceived).toHaveLength(10);
-    const configWrites = bluetooth.writesReceived.slice(6);
-    expect(configWrites.every((w) => w.peripheralId === 'bulb-1')).toBe(true);
+    // segmented) + 1 (Model App Bind) = 4 config writes, then the
+    // capability probe's own 2 (Generic OnOff Get, then the no-op Generic
+    // OnOff Set it builds from the answer — the published composition
+    // sample declares Generic OnOff Server and none of the other four
+    // lighting models, so that is the whole probe for this node) = 12
+    // total.
+    expect(bluetooth.writesReceived).toHaveLength(12);
+    const configWrites = bluetooth.writesReceived.slice(6, 10);
+    const probeWrites = bluetooth.writesReceived.slice(10);
+    expect(bluetooth.writesReceived.every((w) => w.peripheralId === 'bulb-1')).toBe(true);
+    // THE PROBE COMES LAST, AND THAT IS LOAD-BEARING: it is
+    // application-key-secured, and the application key is only bound to the
+    // node's models by the Model App Bind two writes earlier. A probe that
+    // ran before the bind would be answered by nothing and would conclude
+    // the node implements no models at all.
+    expect(probeWrites.map((w) => w.messageType)).toEqual([0x00, 0x00]);
+    const probeOpcodes = probeWrites.map((w) => {
+      const pdu = decodeNetworkPdu({ networkKey: TEST_NET_KEY, ivIndex: 0, pdu: w.data });
+      if (pdu === null) throw new Error('test fixture error: a probe write did not decode as a Network PDU');
+      const unsegmented = decodeUnsegmentedAccess(pdu.transportPdu);
+      if (unsegmented === null) throw new Error('test fixture error: a probe write was not unsegmented');
+      const payload = decryptUpperTransport({
+        key: TEST_APP_KEY,
+        keyKind: 'application',
+        seq: pdu.seq,
+        src: pdu.src,
+        dst: pdu.dst,
+        ivIndex: 0,
+        szmic: false,
+        upperTransportPdu: unsegmented.upperTransportPdu,
+      });
+      if (payload === null) throw new Error('test fixture error: a probe write did not authenticate under TEST_APP_KEY');
+      return decodeAccessMessage(payload)?.opcode;
+    });
+    // Generic OnOff Get (0x8201) then Generic OnOff Set (0x8202) — read
+    // first, write back, exactly as `modelProbe.ts` promises.
+    expect(probeOpcodes).toEqual([0x8201, 0x8202]);
 
     // THE PROXY PDU ENVELOPE, on both sessions and with the RIGHT message
     // type on each (review finding, final wave — before this round both
@@ -1008,7 +1179,15 @@ describe('element attribution', () => {
       },
     });
 
-    const outcome = await pairNode(deps, 'two-lighting-elements');
+    // PROBE BUDGET ZERO: this test's fake node answers by counting writes,
+    // so it cannot answer the capability probe's application-key traffic —
+    // and it does not need to, because what it pins is the BIND addressing,
+    // not the probe. A zero budget means `probeModels` has no time to send
+    // anything and records every declared model `'unknown'` without a
+    // single write (pinned directly in `modelProbe.test.ts`), which leaves
+    // the write sequence this responder counts exactly as it was before the
+    // probe existed.
+    const outcome = await pairNode({ ...deps, probeBudgetMs: 0 }, 'two-lighting-elements');
 
     expect(outcome.kind).toBe('paired');
     // THE DISCRIMINATING ASSERTION: element 0 bound at address 2 (nodeAddress+0),

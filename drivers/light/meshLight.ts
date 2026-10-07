@@ -11,6 +11,9 @@ import {
   encodeLightCtlGet,
   decodeLightCtlStatus,
   type LightCtlStatus,
+  encodeLightCtlTemperatureSet,
+  decodeLightCtlTemperatureStatus,
+  type LightCtlTemperatureStatus,
   encodeLightHslSet,
   encodeLightHslGet,
   decodeLightHslStatus,
@@ -27,7 +30,13 @@ import { encodeConfigNodeReset, decodeConfigStatus } from '../../lib/mesh/config
 import { k4 } from '../../lib/mesh/crypto/derive';
 import { NetworkStore } from '../../lib/adapter/store';
 import type { QueuedCommand } from '../../lib/adapter/queue';
-import type { HomeyCapability } from '../../lib/models/capabilities';
+import {
+  chooseTemperatureWriteModel,
+  type HomeyCapability,
+  type NodeProbeResult,
+  type TemperatureRange,
+} from '../../lib/models/capabilities';
+import { DEFAULT_TEMPERATURE_RANGE, isUsableRange } from './temperatureRange';
 
 /**
  * The device layer (docs/superpowers/specs/2026-10-06-ble-mesh-provisioner-
@@ -249,6 +258,16 @@ export interface MeshLightControllerDeps {
    *  (see `pairing.ts#PairedDeviceDescriptor`'s own doc comment: "task 7's
    *  device.ts looks nodes up by it"). */
   readonly address: number;
+  /**
+   * This device's own colour-temperature range, already resolved by
+   * `device.ts` from the three sources `./temperatureRange.ts` describes
+   * (the per-device setting, the node's own reported range, the documented
+   * fallback). Passed IN rather than resolved here, so the conversion stays
+   * pure and this module never reads a Homey setting; omit it and the
+   * documented fallback is used. `setTemperatureRange` below updates it
+   * when the user edits the setting.
+   */
+  readonly temperatureRange?: TemperatureRange;
 }
 
 // ===========================================================================
@@ -289,29 +308,32 @@ function wireToFraction(value: number): number {
  * FULL specification range, legitimately reachable by any compliant node.
  * Mapping that whole span onto Homey's 0..1 slider would make the
  * practically useful middle of it (ordinary tunable-white bulbs) a tiny
- * sliver of the control. 2700-6500 K is the common consumer tunable-white
- * range (warm white to cool daylight) — an engineering choice, not a
- * specification value, to verify against the owner's own three bulbs once
- * hardware is available (this project has not yet read their actual
- * supported range — Light CTL Temperature Range Get is out of this design's
- * scope) and adjust if they report something different.
+ * sliver of the control, so the slider is mapped onto THIS BULB's own
+ * range instead.
+ *
+ * THE RANGE IS NO LONGER A CONSTANT, and these two functions no longer own
+ * it. It is resolved per device — from the node's own
+ * `Light CTL Temperature Range Status` if it reports one, else from a
+ * per-device setting the user can correct, else from a documented
+ * fallback — in `./temperatureRange.ts`, which carries the full precedence
+ * order and the consequence of getting it wrong. The maths stays PURE and
+ * takes the range as an argument rather than reaching for device state, so
+ * every combination is directly testable.
+ *
+ * Homey's own `light_temperature` convention: 0 = cold, 1 = warm.
  */
-const MIN_PRACTICAL_KELVIN = 2700;
-const MAX_PRACTICAL_KELVIN = 6500;
-
-/** Homey's own `light_temperature` convention: 0 = cold, 1 = warm. */
-function homeyToKelvin(value: number): number {
+function homeyToKelvin(value: number, range: TemperatureRange): number {
   const fraction = clamp01(value);
-  return Math.round(MAX_PRACTICAL_KELVIN - fraction * (MAX_PRACTICAL_KELVIN - MIN_PRACTICAL_KELVIN));
+  return Math.round(range.maxKelvin - fraction * (range.maxKelvin - range.minKelvin));
 }
 
-/** Inverse of `homeyToKelvin` — a status reporting a value outside the
- *  practical range (legal per Table 6.6, e.g. a node controlled by some
+/** Inverse of `homeyToKelvin` — a status reporting a value outside this
+ *  bulb's range (legal per Table 6.6, e.g. a node controlled by some
  *  other means at 900 K) is clamped into it rather than producing a value
  *  outside Homey's own 0..1 domain. */
-function kelvinToHomey(kelvin: number): number {
-  const bounded = clamp(kelvin, MIN_PRACTICAL_KELVIN, MAX_PRACTICAL_KELVIN);
-  return clamp01((MAX_PRACTICAL_KELVIN - bounded) / (MAX_PRACTICAL_KELVIN - MIN_PRACTICAL_KELVIN));
+function kelvinToHomey(kelvin: number, range: TemperatureRange): number {
+  const bounded = clamp(kelvin, range.minKelvin, range.maxKelvin);
+  return clamp01((range.maxKelvin - bounded) / (range.maxKelvin - range.minKelvin));
 }
 
 function errorMessage(err: unknown): string {
@@ -372,7 +394,10 @@ export function currentDimFractionFallback(reason: 'no-capability' | 'no-value')
 interface LightingModel<S> {
   readonly name: string;
   decodeStatus(pdu: Buffer): S | null;
-  applyStatus(device: DeviceCapabilityPort, status: S): Promise<void>;
+  /** `range` is this device's own resolved colour-temperature range — only
+   *  the two CTL models use it, but it is passed to all of them rather than
+   *  giving one model a different signature from its siblings. */
+  applyStatus(device: DeviceCapabilityPort, status: S, range: TemperatureRange): Promise<void>;
 }
 
 const ONOFF_MODEL: LightingModel<GenericOnOffStatus> = {
@@ -399,9 +424,9 @@ const LIGHTNESS_MODEL: LightingModel<LightLightnessStatus> = {
 const CTL_MODEL: LightingModel<LightCtlStatus> = {
   name: 'Light CTL',
   decodeStatus: decodeLightCtlStatus,
-  async applyStatus(device, status) {
+  async applyStatus(device, status, range) {
     if (device.hasCapability('light_temperature')) {
-      await device.setCapabilityValue('light_temperature', kelvinToHomey(status.presentTemperature));
+      await device.setCapabilityValue('light_temperature', kelvinToHomey(status.presentTemperature, range));
     }
     // Light CTL Lightness is bound to the same underlying Lightness state
     // Light Lightness Server reports (Mesh Model specification) — kept in
@@ -445,7 +470,46 @@ const HSL_MODEL: LightingModel<LightHslStatus> = {
   },
 };
 
-const ALL_MODELS: ReadonlyArray<LightingModel<unknown>> = [ONOFF_MODEL, LIGHTNESS_MODEL, CTL_MODEL, HSL_MODEL];
+/**
+ * The SECOND colour-temperature model — a different model with different
+ * opcodes, not a variant of the one above (see `lighting.ts`'s own section
+ * header). This is the one the owner's bulb actually obeys.
+ *
+ * CARRIES NO LIGHTNESS, so unlike `CTL_MODEL` this one deliberately leaves
+ * `dim` alone: Table 6.75 reports Temperature and Delta UV only, and
+ * writing a brightness this status never mentioned would be inventing one.
+ * That is also the whole reason this model is preferred for WRITING — a
+ * temperature change through it cannot disturb the lamp's brightness.
+ */
+const CTL_TEMPERATURE_MODEL: LightingModel<LightCtlTemperatureStatus> = {
+  name: 'Light CTL Temperature',
+  decodeStatus: decodeLightCtlTemperatureStatus,
+  async applyStatus(device, status, range) {
+    if (device.hasCapability('light_temperature')) {
+      await device.setCapabilityValue('light_temperature', kelvinToHomey(status.presentTemperature, range));
+    }
+    // Same reasoning as CTL_MODEL's own `light_mode` note: whichever
+    // colour model a node reports is the one currently driving the lamp.
+    if (device.hasCapability('light_mode')) {
+      await device.setCapabilityValue('light_mode', 'temperature');
+    }
+  },
+};
+
+// The unsolicited dispatcher tries every one of these in turn — safe
+// because all five opcodes are disjoint (Assigned Numbers), so at most one
+// ever matches. `CTL_TEMPERATURE_MODEL` has to be here, not only on the
+// command path: the owner's bulb answers a temperature change with an
+// `0x8266`, and a change made by some OTHER means arrives the same way, so
+// without it Homey would miss exactly the status this round added support
+// for.
+const ALL_MODELS: ReadonlyArray<LightingModel<unknown>> = [
+  ONOFF_MODEL,
+  LIGHTNESS_MODEL,
+  CTL_MODEL,
+  CTL_TEMPERATURE_MODEL,
+  HSL_MODEL,
+];
 
 /** The message Homey shows while no node has answered yet — set at
  *  construction (`start()`) and whenever the shared connection drops. */
@@ -492,6 +556,9 @@ export class MeshLightController {
   private readonly device: DeviceCapabilityPort;
   private readonly clock: MeshClockPort;
   private readonly address: number;
+  /** See `MeshLightControllerDeps.temperatureRange`. Mutable, because the
+   *  user can change the per-device setting while the device is running. */
+  private temperatureRange: TemperatureRange;
 
   private nextTid = 0;
   private connected = false;
@@ -514,6 +581,21 @@ export class MeshLightController {
     this.device = deps.device;
     this.clock = deps.clock;
     this.address = deps.address;
+    this.temperatureRange = isUsableRange(deps.temperatureRange) ? deps.temperatureRange : DEFAULT_TEMPERATURE_RANGE;
+  }
+
+  /**
+   * Replaces this device's colour-temperature range — `device.ts` calls it
+   * from Homey's own `onSettings` when the user corrects the range by hand.
+   * An unusable range (inverted, or outside Table 6.6's legal span) is
+   * REFUSED rather than clamped into shape: the previous range stays, and
+   * the caller is told, so a typo cannot silently leave the slider mapped
+   * onto nonsense. Returns whether it was accepted.
+   */
+  setTemperatureRange(range: TemperatureRange): boolean {
+    if (!isUsableRange(range)) return false;
+    this.temperatureRange = range;
+    return true;
   }
 
   start(): void {
@@ -616,22 +698,72 @@ export class MeshLightController {
     if (status !== null) await this.applyDecodedStatus(LIGHTNESS_MODEL, status);
   }
 
+  /**
+   * WHICH OF THE TWO COLOUR-TEMPERATURE MESSAGES THIS SENDS is decided per
+   * node, from what the node was MEASURED to answer at pairing time
+   * (`modelProbe.ts`), not from what it declared and not from a constant.
+   * `chooseTemperatureWriteModel` carries the rule; the short version is
+   * that `Light CTL Temperature Set` (`0x8264`) is the default and only a
+   * positive measurement to the contrary moves off it.
+   *
+   * WHY THAT DEFAULT: on the owner's bulb, `Light CTL Set` (`0x825E`) is
+   * declared and dead — three attempts at each of several values, no answer
+   * ever — while `0x8264` is answered correctly and visibly changes the
+   * lamp. It is also the better message independently of that bulb, because
+   * it carries no Lightness field (Table 6.73 vs Table 6.69), so a
+   * temperature change through it cannot disturb brightness. The composite
+   * encoder stays in the codebase and stays used: this method still falls
+   * back to it for a node measured to run that one and not this one, and
+   * READING stays on `Light CTL Get` -> `Light CTL Status` throughout
+   * (`reReadState` below), which is measured to work on the same bulb.
+   */
   async setLightTemperature(value: number): Promise<void> {
     const tid = this.allocateTid();
-    const accessPayload = encodeLightCtlSet({
-      lightness: fractionToWire(this.currentDimFraction()),
-      temperature: homeyToKelvin(value),
-      deltaUv: 0, // not exposed to Homey — see lighting.ts's own field doc comment.
-      tid,
-    });
+    const temperature = homeyToKelvin(value, this.temperatureRange);
     await this.setOptimistic('light_temperature', clamp01(value));
+    // The STATUS awaited is always the one belonging to the message
+    // actually sent — a Light CTL Temperature Set is answered by `0x8266`,
+    // never by the `0x8260` the composite Set would get — which is why each
+    // branch names its own model rather than sharing one predicate.
+    if (chooseTemperatureWriteModel(this.nodeProbe()) === 'lightCtl') {
+      await this.sendModelCommand(
+        CTL_MODEL,
+        encodeLightCtlSet({
+          lightness: fractionToWire(this.currentDimFraction()),
+          temperature,
+          deltaUv: 0, // not exposed to Homey — see lighting.ts's own field doc comment.
+          tid,
+        }),
+      );
+      return;
+    }
+    await this.sendModelCommand(CTL_TEMPERATURE_MODEL, encodeLightCtlTemperatureSet({ temperature, deltaUv: 0, tid }));
+  }
+
+  /** Sends one already-encoded command and applies whatever Status comes
+   *  back for that same model — the shape every `set*` method above spells
+   *  out inline, factored out here for `setLightTemperature`, whose model is
+   *  chosen at runtime and so cannot be a single concrete type at the call
+   *  site. */
+  private async sendModelCommand<S>(model: LightingModel<S>, accessPayload: Buffer): Promise<void> {
     const reply = await this.queue.send({
       build: () => this.buildApplicationPdu(accessPayload),
-      isStatus: (pdu) => this.tryDecodeModel(CTL_MODEL, pdu) !== null,
-      description: `Light CTL Set (node ${this.address})`,
+      isStatus: (pdu) => this.tryDecodeModel(model, pdu) !== null,
+      description: `${model.name} Set (node ${this.address})`,
     });
-    const status = this.tryDecodeModel(CTL_MODEL, reply);
-    if (status !== null) await this.applyDecodedStatus(CTL_MODEL, status);
+    const status = this.tryDecodeModel(model, reply);
+    if (status !== null) await this.applyDecodedStatus(model, status);
+  }
+
+  /** What this node was measured to do at pairing time, read fresh from the
+   *  shared store every time rather than cached at construction — the same
+   *  "re-read, never a stale snapshot" discipline `currentNetworkContext`
+   *  already follows, and it means a re-pair that measures differently takes
+   *  effect without reloading the device. `null` for a node paired before the
+   *  probe existed, which `chooseTemperatureWriteModel` reads as "no
+   *  measurement, keep the default". */
+  private nodeProbe(): NodeProbeResult | null {
+    return this.store.getState().nodes.find((n) => n.address === this.address)?.probe ?? null;
   }
 
   /** Hue and saturation travel together (Light HSL Set's own single
@@ -788,7 +920,7 @@ export class MeshLightController {
    *  note for why every successful decode does the latter, not only a
    *  reconnection re-read. */
   private async applyDecodedStatus<S>(model: LightingModel<S>, status: S): Promise<void> {
-    await model.applyStatus(this.device, status);
+    await model.applyStatus(this.device, status, this.temperatureRange);
     this.connected = true;
     // Hearing from the node is evidence it is reachable, so the re-read
     // backoff that was throttling attempts against its silence no longer
@@ -930,8 +1062,6 @@ export const __testing = {
   homeyToKelvin,
   kelvinToHomey,
   currentDimFractionFallback,
-  MIN_PRACTICAL_KELVIN,
-  MAX_PRACTICAL_KELVIN,
   RE_READ_BACKOFF_BASE_MS,
   RE_READ_BACKOFF_MAX_MS,
   MAX_RE_READ_FAILURE_STREAK,

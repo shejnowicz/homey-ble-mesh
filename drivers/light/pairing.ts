@@ -49,8 +49,16 @@ import {
   decodeConfigStatus,
 } from '../../lib/mesh/config/client';
 import { encodeAccessMessage, type AccessMessage } from '../../lib/mesh/packet/access';
+import { k4 } from '../../lib/mesh/crypto/derive';
 import type { CompositionData } from '../../lib/mesh/config/composition';
-import { mapCompositionToCapabilities, LIGHTING_SERVER_MODEL_IDS, type HomeyCapability } from '../../lib/models/capabilities';
+import {
+  mapCompositionToCapabilities,
+  LIGHTING_SERVER_MODEL_IDS,
+  type HomeyCapability,
+  type NodeProbeResult,
+} from '../../lib/models/capabilities';
+import { probeModels, type ProbeTransport } from './modelProbe';
+import { DEFAULT_TEMPERATURE_RANGE } from './temperatureRange';
 
 /**
  * Pairing (docs/superpowers/specs/2026-10-06-ble-mesh-provisioner-design.md,
@@ -481,6 +489,54 @@ class NotificationChannel {
     if (waiting !== null) waiting.reject(err);
   }
 
+  /**
+   * A wait that may END WITHOUT A REPLY, resolving `null`, and that leaves
+   * this channel clean when it does.
+   *
+   * The ordinary `next()` below is bounded from OUTSIDE, by `openSession`'s
+   * `withTimeout` - which rejects the caller while leaving `this.waiting`
+   * set, so the very next `next()` throws "called again while a previous
+   * call is still pending". That is harmless for every existing caller,
+   * because a stage timeout ends the whole pairing attempt anyway. The
+   * capability probe (`modelProbe.ts`) is the first caller for which a
+   * timeout is an EXPECTED, recoverable outcome - it is the probe's
+   * negative result - and which must keep using the session afterward. So
+   * this method owns both the waiter and the timer, and clears both on
+   * either path, rather than being bounded from outside.
+   */
+  nextWithin(clock: ClockPort, timeoutMs: number): Promise<Buffer | null> {
+    if (this.failure !== null) return Promise.reject(this.failure);
+    const queued = this.queue.shift();
+    if (queued !== undefined) return Promise.resolve(queued);
+    if (this.waiting !== null) {
+      throw new Error('NotificationChannel.nextWithin: called again while a previous call is still pending');
+    }
+    return new Promise<Buffer | null>((resolve, reject) => {
+      const settle = (): void => {
+        clock.clearTimeout(timer);
+        // Only clear the slot if it is still OURS: `fail()` may already
+        // have taken it, and stealing a later caller's slot would lose
+        // that caller's wait forever.
+        if (this.waiting === waiter) this.waiting = null;
+      };
+      const waiter = {
+        resolve: (data: Buffer): void => {
+          settle();
+          resolve(data);
+        },
+        reject: (err: Error): void => {
+          settle();
+          reject(err);
+        },
+      };
+      const timer = clock.setTimeout(() => {
+        settle();
+        resolve(null);
+      }, timeoutMs);
+      this.waiting = waiter;
+    });
+  }
+
   next(): Promise<Buffer> {
     if (this.failure !== null) return Promise.reject(this.failure);
     const queued = this.queue.shift();
@@ -504,6 +560,10 @@ class NotificationChannel {
 interface GattSession {
   write(data: Buffer): Promise<void>;
   next(): Promise<Buffer>;
+  /** Waits at most `timeoutMs` for the next notification, resolving `null`
+   *  if none arrives - see `NotificationChannel#nextWithin` for why this is
+   *  not just `next()` with a shorter bound. */
+  nextWithin(timeoutMs: number): Promise<Buffer | null>;
   disconnect(): Promise<void>;
 }
 
@@ -668,6 +728,7 @@ async function openSession(
       }
     },
     next: (): Promise<Buffer> => bounded(channel.next(), `${stage} stalled`),
+    nextWithin: (timeoutMs: number): Promise<Buffer | null> => channel.nextWithin(clock, timeoutMs),
     disconnect: (): Promise<void> => {
       // Nothing of this session's own may outlive it: an un-cleared SAR
       // timer would keep a real event loop alive, and would fire against a
@@ -762,6 +823,14 @@ export async function runProvisioningExchange(session: GattSession, input: Begin
 
 interface ConfigExchangeInput {
   readonly session: GattSession;
+  /** Only `now()`/`setTimeout`/`clearTimeout` are used, and only by the
+   *  capability probe at the end of the exchange — see `runConfigExchange`'s
+   *  own THE PROBE note. */
+  readonly clock: ClockPort;
+  /** Overrides `modelProbe.ts`'s own per-probe timeout, for tests. */
+  readonly probeTimeoutMs?: number;
+  /** Overrides `modelProbe.ts`'s own total probe budget, for tests. */
+  readonly probeBudgetMs?: number;
   readonly netKey: Buffer;
   readonly netKeyIndex: number;
   readonly appKey: Buffer;
@@ -784,7 +853,7 @@ interface ConfigExchangeInput {
  * App Bind) was refused or stalled.
  */
 export type ConfigExchangeResult =
-  | { readonly kind: 'ok'; readonly composition: CompositionData }
+  | { readonly kind: 'ok'; readonly composition: CompositionData; readonly probe: NodeProbeResult }
   | { readonly kind: 'failed'; readonly message: string; readonly composition: CompositionData | null };
 
 /** Sends one device-key-secured Config message and waits for the (possibly
@@ -876,6 +945,105 @@ async function failWithReset(input: ConfigExchangeInput, composition: Compositio
 }
 
 /**
+ * The capability probe's own transport (`modelProbe.ts#ProbeTransport`) over
+ * this still-open configuration session.
+ *
+ * APPLICATION KEY, NOT THE DEVICE KEY every other message in this exchange
+ * uses: Config messages are device-key-secured (Section 4.3.1), but the
+ * LIGHTING models answer on the application key - the very key the Model
+ * App Binds immediately above have just bound to them. Probing with the
+ * device key would get silence from every model and the probe would
+ * conclude, wrongly and confidently, that the node implements none of them.
+ *
+ * `accept` is handed the re-encoded ACCESS message (Opcode || Parameters),
+ * which is the shape every `lib/models/lighting.ts` decoder takes - the
+ * same reshape `meshLight.ts#tryDecodeModel` performs for the same reason.
+ *
+ * KEEPS WAITING WITHIN ITS OWN WINDOW for something `accept` likes, rather
+ * than resolving on the first PDU to arrive. A previous probe's LATE answer
+ * is the case that matters: resolving on it would turn one model's silence
+ * into the next model's false `'supported'`, which is precisely the
+ * conclusion this whole mechanism exists to get right.
+ */
+function createProbeTransport(input: ConfigExchangeInput): ProbeTransport {
+  const receiveContext: MeshReceiveContext = {
+    key: input.appKey,
+    keyKind: 'application',
+    netKey: input.netKey,
+    ivIndex: input.ivIndex,
+    expectedSrc: input.nodeAddress,
+  };
+  return {
+    async request(accessPayload: Buffer, accept: (pdu: Buffer) => boolean, timeoutMs: number): Promise<Buffer | null> {
+      const pdus = encodeMeshMessage({
+        accessPayload,
+        key: input.appKey,
+        keyKind: 'application',
+        aid: k4(input.appKey),
+        src: input.ourAddress,
+        dst: input.nodeAddress,
+        netKey: input.netKey,
+        ivIndex: input.ivIndex,
+        // Point-to-point for the same reason `sendConfigRequest` is: this
+        // session holds its own GATT connection to the very node being
+        // probed, so there is nothing for a relay to do.
+        ttl: POINT_TO_POINT_TTL,
+        allocateSeq: input.allocateSeq,
+      });
+      for (const pdu of pdus) await input.session.write(pdu);
+
+      const deadline = input.clock.now() + timeoutMs;
+      let state: MeshReceiveState | undefined;
+      for (;;) {
+        const remaining = deadline - input.clock.now();
+        if (remaining <= 0) return null;
+        const incoming = await input.session.nextWithin(remaining);
+        if (incoming === null) return null;
+        const result = acceptIncomingPdu(state, receiveContext, incoming);
+        if (result.kind !== 'complete') {
+          state = result.state;
+          continue;
+        }
+        state = undefined;
+        const reencoded = encodeAccessMessage(result.message);
+        if (accept(reencoded)) return reencoded;
+        // Decoded cleanly, but it is not what this request asked for (a
+        // stale answer, or an unsolicited report) - keep waiting inside the
+        // same window rather than reporting it as this request's reply.
+      }
+    },
+  };
+}
+
+/** Nothing measured - what a node gets when the probe could not run at all. */
+const EMPTY_PROBE_RESULT: NodeProbeResult = { models: {}, temperatureRange: null };
+
+/**
+ * Runs the capability probe, and CANNOT FAIL PAIRING. The probe is an
+ * optimisation of a pairing that has already succeeded - composition read,
+ * application key added, every model bound - so an exception from it (an
+ * encoder refusing a Prohibited value a node reported for itself, say) must
+ * cost the user their measurement, never their bulb. `probeModels` already
+ * turns a lost link and an unanswered message into ordinary verdicts; this
+ * wrapper is for everything else.
+ */
+async function runProbe(input: ConfigExchangeInput, composition: CompositionData): Promise<NodeProbeResult> {
+  try {
+    return await probeModels(
+      {
+        transport: createProbeTransport(input),
+        clock: input.clock,
+        probeTimeoutMs: input.probeTimeoutMs,
+        probeBudgetMs: input.probeBudgetMs,
+      },
+      composition,
+    );
+  } catch {
+    return EMPTY_PROBE_RESULT;
+  }
+}
+
+/**
  * Reads composition data, adds the application key, and binds it to every
  * one of the node's SIG models this design maps to a Homey capability
  * (`LIGHTING_SERVER_MODEL_IDS`) — the design's "adds the application key,
@@ -948,7 +1116,13 @@ export async function runConfigExchange(input: ConfigExchangeInput): Promise<Con
       }
     }
 
-    return { kind: 'ok', composition };
+    // THE PROBE, last and deliberately so: it needs the application key
+    // bound to the node's models (every Model App Bind above) before any
+    // lighting model will answer it at all. See `modelProbe.ts`'s own
+    // module header for what it measures and why silence counts as a
+    // negative in this one place.
+    const probe = await runProbe(input, composition);
+    return { kind: 'ok', composition, probe };
   } catch (err) {
     return failWithReset(input, knownComposition, `configuration exchange failed unexpectedly: ${errorMessage(err)}`);
   }
@@ -1002,6 +1176,10 @@ export interface PairingDeps {
   readonly clock: ClockPort;
   /** Overrides `DEFAULT_PAIRING_STEP_TIMEOUT_MS` for this attempt. */
   readonly stepTimeoutMs?: number;
+  /** Overrides `modelProbe.ts#DEFAULT_PROBE_TIMEOUT_MS` for this attempt - injected so tests drive the probe's own timing without waiting on it. */
+  readonly probeTimeoutMs?: number;
+  /** Overrides `modelProbe.ts#DEFAULT_PROBE_BUDGET_MS` for this attempt. */
+  readonly probeBudgetMs?: number;
 }
 
 export interface PairedDeviceDescriptor {
@@ -1014,6 +1192,12 @@ export interface PairedDeviceDescriptor {
   /** Opaque to Homey; carries the peripheral id this node was last seen
    *  advertising under, for task 7's connection use. */
   readonly store: { readonly peripheralId: string };
+  /** Initial per-device settings (`driver.compose.json`'s own `settings`
+   *  block) - the colour-temperature range, seeded from what the node
+   *  reported about itself at pairing time, or from the documented
+   *  fallback when it reported nothing. The user can correct it afterward;
+   *  see `temperatureRange.ts`. */
+  readonly settings: { readonly temperature_min_kelvin: number; readonly temperature_max_kelvin: number };
 }
 
 export type PairingOutcome =
@@ -1114,6 +1298,9 @@ export async function pairNode(deps: PairingDeps, peripheralId: string): Promise
     try {
       const exchangeResult = await runConfigExchange({
         session: configSession,
+        clock: deps.clock,
+        probeTimeoutMs: deps.probeTimeoutMs,
+        probeBudgetMs: deps.probeBudgetMs,
         netKey,
         netKeyIndex,
         appKey,
@@ -1141,7 +1328,7 @@ export async function pairNode(deps: PairingDeps, peripheralId: string): Promise
       if (exchangeResult.kind === 'failed') {
         return { kind: 'failed', message: exchangeResult.message };
       }
-      return finishPairing(deps.store, peripheralId, nodeAddress, deviceKey, exchangeResult.composition);
+      return finishPairing(deps.store, peripheralId, nodeAddress, deviceKey, exchangeResult.composition, exchangeResult.probe);
     } catch (err) {
       // Defensive only: runConfigExchange catches its own exceptions
       // internally now (attempting a reset first — see failWithReset) and
@@ -1182,18 +1369,32 @@ function finishPairing(
   nodeAddress: number,
   deviceKey: Buffer,
   composition: CompositionData,
+  probe: NodeProbeResult,
 ): PairingOutcome {
   const fresh = store.getState();
+  // The probe is stored ALONGSIDE the composition, not instead of it: the
+  // declaration is still what says which models exist to probe at all, and
+  // a later version of this app may measure differently. Both are kept.
   store.setState({
     ...fresh,
-    nodes: [...fresh.nodes, { address: nodeAddress, deviceKey, composition }],
+    nodes: [...fresh.nodes, { address: nodeAddress, deviceKey, composition, probe }],
   });
 
-  const assignments = mapCompositionToCapabilities(composition);
+  // MEASUREMENT FIRST, DECLARATION WHERE THERE IS NONE - see
+  // `capabilities.ts#mapCompositionToCapabilities`. This is the one line
+  // that makes the probe matter: a node that declares a model and was
+  // measured not to run it does not get that model's capability.
+  const assignments = mapCompositionToCapabilities(composition, probe);
   const capabilities: HomeyCapability[] = [];
   for (const assignment of assignments) {
     if (!capabilities.includes(assignment.capability)) capabilities.push(assignment.capability);
   }
+
+  // The per-device range settings start from what the node reported, and
+  // from the documented fallback when it reported nothing - see
+  // `temperatureRange.ts`'s own module header for the full precedence
+  // order and for what goes wrong on a silent bulb with a different range.
+  const range = probe.temperatureRange ?? DEFAULT_TEMPERATURE_RANGE;
 
   return {
     kind: 'paired',
@@ -1202,6 +1403,7 @@ function finishPairing(
       data: { id: String(nodeAddress) },
       capabilities,
       store: { peripheralId },
+      settings: { temperature_min_kelvin: range.minKelvin, temperature_max_kelvin: range.maxKelvin },
     },
   };
 }

@@ -52,7 +52,7 @@ import { encodeAccessMessage, decodeAccessMessage } from '../mesh/packet/access'
  * such throughout that file, per the brief's own instruction for exactly
  * this situation.
  *
- * OPCODE PROVENANCE: every one of these twelve messages' field tables in
+ * OPCODE PROVENANCE: every one of these sixteen messages' field tables in
  * the Mesh Model document says only that the Opcode field "shall contain
  * the opcode value for the <Message> message defined in the Assigned
  * Numbers document [10]" (verbatim, repeated per message) - so, exactly as
@@ -68,10 +68,31 @@ import { encodeAccessMessage, decodeAccessMessage } from '../mesh/packet/access'
  * Opcodes by Name" - both tables agree, independently, for all twelve
  * values below (cross-checked by extracting both tables with `pdftotext
  * -layout` and grepping each for every opcode byte pair used here).
+ *
+ * LIGHT CTL TEMPERATURE, AND WHY IT IS HERE AT ALL (hardware round). The
+ * owner's bulb answers `Light CTL Temperature Set` (`0x82 0x64`) with a
+ * `Light CTL Temperature Status` (`0x82 0x66`) and never answers the
+ * composite `Light CTL Set` (`0x82 0x5E`) at any value, three attempts
+ * each - measured on the device, not inferred from its composition data,
+ * which declares both. Both messages stay in this module: the composite
+ * Set's own Status decoder is still how the app READS colour temperature
+ * (`Light CTL Get` -> `Light CTL Status` works on that same bulb), so
+ * neither half of the composite pair is dead code. See
+ * `drivers/light/meshLight.ts` for which of the two it SENDS, and
+ * `drivers/light/modelProbe.ts` for how that is now measured per node
+ * rather than hardcoded.
+ *
+ * THE OPCODE BLOCK WAS RE-READ ROW BY ROW, deliberately: the hand-written
+ * list this round started from had `0x82 0x63` labelled "Light CTL
+ * Temperature Get" and `0x82 0x5F` labelled "Light CTL Default Get", and
+ * both were wrong (they are Light CTL Temperature Range Status and Light
+ * CTL Set Unacknowledged). The full, verified block is transcribed beside
+ * the constants below so no future reader has to trust a remembered
+ * neighbour again.
  */
 
 // ===========================================================================
-// Opcodes (see the module header's OPCODE PROVENANCE note). All twelve are
+// Opcodes (see the module header's OPCODE PROVENANCE note). All sixteen are
 // 2-octet SIG opcodes (Assigned Numbers' own "0x82 0xNN" form, first octet
 // 0x82 = 0b10000010, matching Table 3.62's 2-octet marker "10xxxxxx") -
 // packed per `packet/access.ts`'s own in-memory convention,
@@ -90,6 +111,30 @@ const OPCODE_LIGHT_LIGHTNESS_STATUS = 0x824e; // "Light Lightness Status" = `0x8
 const OPCODE_LIGHT_CTL_GET = 0x825d; // "Light CTL Get" = `0x82 0x5D`.
 const OPCODE_LIGHT_CTL_SET = 0x825e; // "Light CTL Set" = `0x82 0x5E`.
 const OPCODE_LIGHT_CTL_STATUS = 0x8260; // "Light CTL Status" = `0x82 0x60`.
+
+// The Light CTL Temperature half of the same opcode block. Added for the
+// hardware round (see the module header's LIGHT CTL TEMPERATURE note): the
+// owner's bulb answers `0x82 0x64` but never `0x82 0x5E`, and the whole
+// block was re-read out of the Assigned Numbers document row by row because
+// an earlier hand-written list of it had THREE rows mislabelled. Both of
+// that document's own tables (Section 4.2.1 "by Value", Page 153 of 446;
+// Section 4.2.2 "by Name", Page 163) agree, independently, on all ten rows
+// of the block, transcribed here in full so the next reader never has to
+// guess which neighbour is which:
+//   0x82 0x5D Light CTL Get                              (above)
+//   0x82 0x5E Light CTL Set                              (above)
+//   0x82 0x5F Light CTL Set Unacknowledged               (not used here)
+//   0x82 0x60 Light CTL Status                           (above)
+//   0x82 0x61 Light CTL Temperature Get                  (not used here)
+//   0x82 0x62 Light CTL Temperature Range Get            (below)
+//   0x82 0x63 Light CTL Temperature Range Status         (below)
+//   0x82 0x64 Light CTL Temperature Set                  (below)
+//   0x82 0x65 Light CTL Temperature Set Unacknowledged   (not used here)
+//   0x82 0x66 Light CTL Temperature Status               (below)
+const OPCODE_LIGHT_CTL_TEMPERATURE_RANGE_GET = 0x8262; // "Light CTL Temperature Range Get" = `0x82 0x62`.
+const OPCODE_LIGHT_CTL_TEMPERATURE_RANGE_STATUS = 0x8263; // "Light CTL Temperature Range Status" = `0x82 0x63`.
+const OPCODE_LIGHT_CTL_TEMPERATURE_SET = 0x8264; // "Light CTL Temperature Set" = `0x82 0x64`.
+const OPCODE_LIGHT_CTL_TEMPERATURE_STATUS = 0x8266; // "Light CTL Temperature Status" = `0x82 0x66`.
 
 const OPCODE_LIGHT_HSL_GET = 0x826d; // "Light HSL Get" = `0x82 0x6D`.
 const OPCODE_LIGHT_HSL_SET = 0x8276; // "Light HSL Set" = `0x82 0x76`.
@@ -573,6 +618,195 @@ export function decodeLightCtlStatus(pdu: Buffer): LightCtlStatus | null {
     };
   }
   return null;
+}
+
+
+// ===========================================================================
+// Light CTL Temperature (Section 6.3.2.6 "Light CTL Temperature Set",
+// Section 6.3.2.8 "Light CTL Temperature Status", Section 6.3.2.9 "Light
+// CTL Temperature Range Get", Section 6.3.2.12 "Light CTL Temperature Range
+// Status" / Section 6.1.3.1 "Light CTL Temperature" and Section 6.1.3.3
+// "Light CTL Temperature Range" for the states' own value tables).
+//
+// A SEPARATE MODEL, NOT A VARIANT OF LIGHT CTL. Section 6.4.4 names "Light
+// CTL Temperature Server" as its own model (SIG Model ID 0x1306 - see
+// `models/capabilities.ts`'s own identifier provenance note), distinct from
+// the Light CTL Server (0x1303) that answers the composite messages above.
+// A node can implement either, both or - as the owner's bulb demonstrates
+// by answering `0x8264` and never `0x825E` - declare both and only really
+// run one. The Range messages are the exception: Section 6.4.3.3.1 puts
+// those on the LIGHT CTL Server ("When a Light CTL Server receives a Light
+// CTL Temperature Range Get message, it shall respond with a Light CTL
+// Temperature Range Status message"), not on the Temperature Server, which
+// is why the range query below is addressed with the rest of the composite
+// model's traffic rather than alongside the Temperature Set.
+// ===========================================================================
+
+export interface LightCtlTemperatureSetParams {
+  /** Table 6.6 "Light CTL Temperature states": ONLY 0x0320-0x4E20 (800-20000 K) is legal - its own other row, "All other values", is "Prohibited" - enforced here on encode, exactly as `encodeLightCtlSet` enforces it for the same state. */
+  temperature: number;
+  /** Table 6.9 "Light CTL Delta UV states": signed 16-bit, full domain, 0x0000 = Delta UV of 0 - the same raw wire integer `LightCtlSetParams.deltaUv` carries, with the same "not the Represented Delta UV display ratio" caveat. */
+  deltaUv: number;
+  /**
+   * Transaction Identifier - the same rule as `GenericOnOffSetParams.tid`,
+   * with this message's own two sections read directly rather than assumed
+   * symmetric. SENDER, Section 6.6.2.4.2 "Sending Light CTL Temperature Set
+   * / Light CTL Temperature Set Unacknowledged messages", quoted: "a Light
+   * CTL Client shall send a Light CTL Temperature Set message, setting the
+   * CTL Temperature and CTL Delta UV fields to the required values and the
+   * TID field to the least recently used value." and "To retransmit the
+   * message, a Light CTL Client shall use the same value for the TID field
+   * as in the previously sent message, within 6 seconds from sending that
+   * message." RECEIVER, Section 6.4.4.2.2 "Receiving Light CTL Temperature
+   * Set / Light CTL Temperature Set Unacknowledged messages", quoted: "it
+   * shall set the Light CTL Temperature state to the CTL Temperature field
+   * of the message and the Light CTL Delta UV state to the CTL Delta UV
+   * field of the message, unless the message has the same values for the
+   * SRC, DST, and TID fields as the previous message received within the
+   * last 6 seconds." - the same (SRC, DST, TID)/6-second uniqueness key as
+   * every other Set in this module.
+   */
+  tid: number;
+  /** Table 6.73's own C.1 footnote, quoted in full: "If the Transition Time field is present, the Delay field shall also be present; otherwise these fields shall not be present." - word for word identical to Table 3.37's. */
+  transition?: SetTransition;
+}
+
+/**
+ * Table 6.73 "Light CTL Temperature Set message structure": Opcode (2) ||
+ * CTL Temperature (2, M) || CTL Delta UV (2, M) || TID (1, M) ||
+ * [Transition Time (1, O) || Delay (1, C.1)].
+ *
+ * NOTE THE MISSING FIELD, because it is the whole practical difference from
+ * `encodeLightCtlSet`: there is NO Lightness field here. The composite
+ * Light CTL Set (Table 6.69) forces a caller changing colour temperature to
+ * state a brightness at the same time; this message does not, so a
+ * temperature change through it cannot disturb the lamp's brightness even
+ * in principle.
+ */
+export function encodeLightCtlTemperatureSet(params: LightCtlTemperatureSetParams): Buffer {
+  assertIntInRange('temperature', params.temperature, MIN_CTL_TEMPERATURE, MAX_CTL_TEMPERATURE);
+  // Named before `i16le`'s own generic internal guard runs, same reason as
+  // `encodeLightCtlSet`'s own `deltaUv` check.
+  assertIntInRange('deltaUv', params.deltaUv, MIN_INT16, MAX_INT16);
+  assertLightingField('tid', params.tid, MAX_OCTET);
+  const parameters = Buffer.concat([
+    u16le(params.temperature),
+    i16le(params.deltaUv),
+    Buffer.from([params.tid]),
+    encodeSetTransition(params.transition),
+  ]);
+  return encodeAccessMessage({ opcode: OPCODE_LIGHT_CTL_TEMPERATURE_SET, parameters });
+}
+
+/**
+ * Table 6.75 "Light CTL Temperature Status message structure": Present CTL
+ * Temperature (2, M) || Present CTL Delta UV (2, M) || [Target CTL
+ * Temperature (2, O) || Target CTL Delta UV (2, C.1) || Remaining Time (1,
+ * C.1)]. Table 6.75's own C.1 footnote, quoted in full: "If the Target CTL
+ * Temperature field is present, the Target CTL Delta UV field and the
+ * Remaining Time field shall also be present; otherwise these fields shall
+ * not be present." - three fields in one conditional group, the same SHAPE
+ * as Table 6.71's but keyed on a different first field.
+ *
+ * CARRIES DELTA UV, WHICH `LightCtlStatus` DOES NOT. Table 6.71 reports
+ * Lightness and Temperature and no Delta UV at all; this one reports
+ * Temperature and Delta UV and no Lightness. Neither is a superset of the
+ * other, which is why both decoders exist.
+ */
+export interface LightCtlTemperatureStatus {
+  presentTemperature: number;
+  presentDeltaUv: number;
+  target?: {
+    temperature: number;
+    deltaUv: number;
+    remainingTime: GenericTransitionTime;
+  };
+}
+
+/** Same decode stance as every other Status decoder here: `null` for a non-matching opcode or a Parameters length other than 4 (Present-only) or 9 (with the full Target group). */
+export function decodeLightCtlTemperatureStatus(pdu: Buffer): LightCtlTemperatureStatus | null {
+  const message = decodeAccessMessage(pdu);
+  if (message === null || message.opcode !== OPCODE_LIGHT_CTL_TEMPERATURE_STATUS) {
+    return null;
+  }
+  const { parameters } = message;
+  if (parameters.length === 4) {
+    return {
+      presentTemperature: parameters.readUInt16LE(0),
+      // Signed: Table 6.9's domain is signed 16-bit, so a node reporting a
+      // negative Delta UV must read back negative, not as 0x8000-and-up.
+      presentDeltaUv: parameters.readInt16LE(2),
+    };
+  }
+  if (parameters.length === 9) {
+    return {
+      presentTemperature: parameters.readUInt16LE(0),
+      presentDeltaUv: parameters.readInt16LE(2),
+      target: {
+        temperature: parameters.readUInt16LE(4),
+        deltaUv: parameters.readInt16LE(6),
+        remainingTime: decodeTransitionTimeOctet(parameters[8] as number),
+      },
+    };
+  }
+  return null;
+}
+
+/** Table 6.76 "Light CTL Temperature Range Get message structure": Opcode (2) only - no parameters. */
+export function encodeLightCtlTemperatureRangeGet(): Buffer {
+  return encodeAccessMessage({ opcode: OPCODE_LIGHT_CTL_TEMPERATURE_RANGE_GET, parameters: Buffer.alloc(0) });
+}
+
+/**
+ * Table 6.8 "Light CTL Temperature Range Min and Light CTL Temperature
+ * Range Max states" has THREE rows, not two: the range 0x0320-0x4E20 is
+ * "The color temperature of white light in kelvin (that is, 0x0320 is 800 K
+ * and 0x4E20 is 20000 K)", the single value 0xFFFF is "The color
+ * temperature of white light is unknown", and "All other values" is
+ * "Prohibited". The 0xFFFF row is the one that matters to a caller: a node
+ * answering the Range Get with 0xFFFF has ANSWERED and still told you
+ * nothing, which is a different outcome from silence and must not be
+ * mistaken for a 65535 K bulb.
+ */
+export const CTL_TEMPERATURE_RANGE_UNKNOWN = 0xffff;
+
+/**
+ * Table 7.1 "Summary of status codes" (Section 7.2 "Status codes"), all
+ * four rows: 0x00 "Success" ("Command successfully processed"), 0x01
+ * "Cannot Set Range Min" ("The provided value for Range Min cannot be
+ * set"), 0x02 "Cannot Set Range Max" ("The provided value for Range Max
+ * cannot be set"), 0x03-0xFF "RFU" ("Reserved for Future Use"). Only
+ * Success is named here because only Success is actionable for this module's
+ * one Range caller; the raw code is carried through regardless, same way
+ * `config/client.ts` carries a Config status code it has no name for.
+ */
+export const CTL_TEMPERATURE_RANGE_STATUS_SUCCESS = 0x00;
+
+/** Table 6.79 "Light CTL Temperature Range Status message structure": Status Code (1, M) || Range Min (2, M) || Range Max (2, M). No optional group at all, unlike every other Status in this module. */
+export interface LightCtlTemperatureRangeStatus {
+  /** Table 7.1 - see `CTL_TEMPERATURE_RANGE_STATUS_SUCCESS`. Carried raw, never rejected on decode. */
+  statusCode: number;
+  /** Table 6.8 - kelvin, or `CTL_TEMPERATURE_RANGE_UNKNOWN` (0xFFFF). */
+  rangeMin: number;
+  /** Table 6.8 - kelvin, or `CTL_TEMPERATURE_RANGE_UNKNOWN` (0xFFFF). */
+  rangeMax: number;
+}
+
+/** Same decode stance as the others: `null` for a non-matching opcode or any Parameters length other than the one Table 6.79 defines (5 octets). */
+export function decodeLightCtlTemperatureRangeStatus(pdu: Buffer): LightCtlTemperatureRangeStatus | null {
+  const message = decodeAccessMessage(pdu);
+  if (message === null || message.opcode !== OPCODE_LIGHT_CTL_TEMPERATURE_RANGE_STATUS) {
+    return null;
+  }
+  const { parameters } = message;
+  if (parameters.length !== 5) {
+    return null;
+  }
+  return {
+    statusCode: parameters[0] as number,
+    rangeMin: parameters.readUInt16LE(1),
+    rangeMax: parameters.readUInt16LE(3),
+  };
 }
 
 // ===========================================================================

@@ -46,6 +46,7 @@
  */
 
 import type { CompositionData } from '../mesh/config/composition';
+import type { ModelProbeVerdict, NodeProbeResult, ProbedModel, TemperatureRange } from '../models/capabilities';
 import { MAX_SEQ } from '../mesh/packet/ranges';
 
 /**
@@ -71,6 +72,23 @@ export interface NodeEntry {
   readonly address: number;
   readonly deviceKey: Buffer;
   readonly composition: CompositionData;
+  /**
+   * What the node was MEASURED to do at pairing time
+   * (`drivers/light/modelProbe.ts`), stored ALONGSIDE the composition
+   * rather than instead of it - the declaration still says which models
+   * exist to probe, and keeping both means a later version of this app can
+   * re-derive capabilities differently without re-pairing anything.
+   *
+   * OPTIONAL, AND THAT IS THE MIGRATION. Every node paired before the probe
+   * existed has no entry here, and must keep working exactly as it did:
+   * `undefined` means "never measured", which
+   * `capabilities.ts#mapCompositionToCapabilities` treats as "believe the
+   * declaration" - the pre-probe behaviour, byte for byte. There is no
+   * version bump and no rewrite pass for the same reason: an absent field
+   * that already means the right thing is a migration that cannot fail
+   * halfway.
+   */
+  readonly probe?: NodeProbeResult;
 }
 
 /** Everything the design's "Persistence, sequence numbers and removal"
@@ -193,6 +211,14 @@ interface PersistedNode {
   address: number;
   deviceKey: string;
   composition: CompositionData;
+  /** Absent for a node paired before the probe existed - see `NodeEntry.probe`. */
+  probe?: PersistedProbe;
+}
+
+/** `NodeProbeResult`'s own JSON shape. Plain data already (no Buffers), so this is a structural copy rather than a conversion - but it is still re-validated on the way back in, like every other field here, because a hand-edited settings value never went through `encodeNetworkState`. */
+interface PersistedProbe {
+  models: Partial<Record<ProbedModel, ModelProbeVerdict>>;
+  temperatureRange: TemperatureRange | null;
 }
 
 interface PersistedNetworkState {
@@ -211,6 +237,78 @@ interface PersistedSequenceState {
    *  already been issued (by this run or an earlier one), so a reload must
    *  never hand out anything less than this value. */
   reservedUpTo: number;
+}
+
+/** Every verdict `ModelProbeVerdict` allows, as a runtime set - a stored
+ *  value that is a string but not one of these is corrupt, and must fail
+ *  the same way a wrong JS type does (the type system has nothing to say
+ *  about a value that came out of Homey's settings). */
+const PROBE_VERDICTS: ReadonlySet<string> = new Set(['supported', 'unsupported', 'unknown']);
+
+/** Every `ProbedModel` key, likewise. An UNRECOGNISED key is dropped rather
+ *  than rejected on the way IN (a settings value written by a newer version
+ *  of this app, read back by an older one, must not brick the store) but a
+ *  recognised key with a nonsense verdict IS rejected, because that is
+ *  corruption rather than a version difference. */
+const PROBED_MODELS: ReadonlyArray<ProbedModel> = [
+  'genericOnOff',
+  'lightLightness',
+  'lightCtl',
+  'lightCtlTemperature',
+  'lightHsl',
+];
+
+function encodeProbe(field: string, probe: NodeProbeResult): PersistedProbe {
+  const models: Partial<Record<ProbedModel, ModelProbeVerdict>> = {};
+  for (const model of PROBED_MODELS) {
+    const verdict = probe.models[model];
+    if (verdict === undefined) continue;
+    if (!PROBE_VERDICTS.has(verdict)) {
+      throw new Error(`network state field "${field}.models.${model}" is not a valid probe verdict, got ${String(verdict)}`);
+    }
+    models[model] = verdict;
+  }
+  const range = probe.temperatureRange;
+  if (range !== null) {
+    assertRange(`${field}.temperatureRange.minKelvin`, range.minKelvin, 0, 0xffff);
+    assertRange(`${field}.temperatureRange.maxKelvin`, range.maxKelvin, 0, 0xffff);
+  }
+  return { models, temperatureRange: range === null ? null : { minKelvin: range.minKelvin, maxKelvin: range.maxKelvin } };
+}
+
+/** The inverse. Throws on anything that is not our own shape, like every
+ *  other decoder here - `readStateForWrite`'s caller turns that into "the
+ *  empty state" or "refuse to write", never a crash. */
+function decodeProbe(field: string, value: unknown): NodeProbeResult {
+  if (typeof value !== 'object' || value === null) {
+    throw new Error(`stored network state field "${field}" is not an object`);
+  }
+  const raw = value as Record<string, unknown>;
+  if (typeof raw.models !== 'object' || raw.models === null) {
+    throw new Error(`stored network state field "${field}.models" is not an object`);
+  }
+  const rawModels = raw.models as Record<string, unknown>;
+  const models: Partial<Record<ProbedModel, ModelProbeVerdict>> = {};
+  for (const model of PROBED_MODELS) {
+    const verdict = rawModels[model];
+    if (verdict === undefined || verdict === null) continue;
+    if (typeof verdict !== 'string' || !PROBE_VERDICTS.has(verdict)) {
+      throw new Error(`stored network state field "${field}.models.${model}" is not a valid probe verdict`);
+    }
+    models[model] = verdict as ModelProbeVerdict;
+  }
+
+  let temperatureRange: TemperatureRange | null = null;
+  if (raw.temperatureRange !== null && raw.temperatureRange !== undefined) {
+    const rawRange = raw.temperatureRange as Record<string, unknown>;
+    if (typeof rawRange.minKelvin !== 'number' || typeof rawRange.maxKelvin !== 'number') {
+      throw new Error(`stored network state field "${field}.temperatureRange" is not a {minKelvin, maxKelvin} pair`);
+    }
+    assertRange(`${field}.temperatureRange.minKelvin`, rawRange.minKelvin, 0, 0xffff);
+    assertRange(`${field}.temperatureRange.maxKelvin`, rawRange.maxKelvin, 0, 0xffff);
+    temperatureRange = { minKelvin: rawRange.minKelvin, maxKelvin: rawRange.maxKelvin };
+  }
+  return { models, temperatureRange };
 }
 
 /**
@@ -233,11 +331,18 @@ function encodeNetworkState(state: NetworkState): PersistedNetworkState {
   const nodes: PersistedNode[] = state.nodes.map((node, i) => {
     assertRange(`nodes[${i}].address`, node.address, MIN_UNICAST_ADDRESS, MAX_UNICAST_ADDRESS);
     assertKeyLength(`nodes[${i}].deviceKey`, node.deviceKey);
-    return {
+    const encoded: PersistedNode = {
       address: node.address,
       deviceKey: Buffer.from(node.deviceKey).toString('hex'),
       composition: JSON.parse(JSON.stringify(node.composition)) as CompositionData,
     };
+    // Written only when there IS one: a node never probed stays absent
+    // rather than acquiring an empty object, so "never measured" and
+    // "measured nothing" stay distinguishable in the stored value.
+    if (node.probe !== undefined) {
+      encoded.probe = encodeProbe(`nodes[${i}].probe`, node.probe);
+    }
+    return encoded;
   });
 
   return {
@@ -293,11 +398,15 @@ function decodeNetworkState(value: unknown): NetworkState {
     if (typeof node.deviceKey !== 'string') {
       throw new Error(`stored network state field "nodes[${i}].deviceKey" is not a string`);
     }
-    return {
+    const entry: NodeEntry = {
       address: node.address,
       deviceKey: hexToKeyBuffer(node.deviceKey, `nodes[${i}].deviceKey`),
       composition: JSON.parse(JSON.stringify(node.composition)) as CompositionData,
     };
+    // Absent (a node paired before the probe existed) stays absent - see
+    // `NodeEntry.probe`'s own note on why that IS the migration.
+    if (node.probe === undefined || node.probe === null) return entry;
+    return { ...entry, probe: decodeProbe(`nodes[${i}].probe`, node.probe) };
   });
 
   const netKey = v.netKey === null || v.netKey === undefined ? null : hexToKeyBuffer(v.netKey as string, 'netKey');

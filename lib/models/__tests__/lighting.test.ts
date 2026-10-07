@@ -9,6 +9,12 @@ import {
   encodeLightCtlGet,
   encodeLightCtlSet,
   decodeLightCtlStatus,
+  encodeLightCtlTemperatureSet,
+  decodeLightCtlTemperatureStatus,
+  encodeLightCtlTemperatureRangeGet,
+  decodeLightCtlTemperatureRangeStatus,
+  CTL_TEMPERATURE_RANGE_UNKNOWN,
+  CTL_TEMPERATURE_RANGE_STATUS_SUCCESS,
   encodeLightHslGet,
   encodeLightHslSet,
   decodeLightHslStatus,
@@ -32,6 +38,17 @@ import {
   LIGHT_CTL_SET_DELTA_UV_MAX,
   LIGHT_CTL_STATUS_MINIMAL,
   LIGHT_CTL_STATUS_WITH_TARGET,
+  LIGHT_CTL_TEMPERATURE_SET_FULL,
+  LIGHT_CTL_TEMPERATURE_SET_MINIMAL,
+  LIGHT_CTL_TEMPERATURE_SET_DELTA_UV_MIN,
+  LIGHT_CTL_TEMPERATURE_SET_DELTA_UV_MAX,
+  LIGHT_CTL_TEMPERATURE_STATUS_MINIMAL,
+  LIGHT_CTL_TEMPERATURE_STATUS_6000K_MEASURED,
+  LIGHT_CTL_TEMPERATURE_STATUS_3000K_MEASURED,
+  LIGHT_CTL_TEMPERATURE_RANGE_GET,
+  LIGHT_CTL_TEMPERATURE_RANGE_STATUS_OK,
+  LIGHT_CTL_TEMPERATURE_RANGE_STATUS_UNKNOWN,
+  LIGHT_CTL_TEMPERATURE_RANGE_STATUS_REFUSED,
   LIGHT_HSL_GET,
   LIGHT_HSL_SET_FULL,
   LIGHT_HSL_SET_MINIMAL,
@@ -381,6 +398,152 @@ describe('Light CTL', () => {
 
   test('Status: malformed Parameters length (5 octets - neither 4 nor 9) decodes to null', () => {
     expect(decodeLightCtlStatus(hex('82605555204e00'))).toBeNull();
+  });
+});
+
+// ===========================================================================
+// Light CTL Temperature (a SEPARATE model from Light CTL - see
+// `lighting.ts`'s own section header). The two measured-on-hardware Status
+// fixtures are the only checks in this file that did not come from this
+// project's own reading of the field table, so they are what catches a
+// layout mistake a hand-built fixture would simply share.
+// ===========================================================================
+
+describe('Light CTL Temperature', () => {
+  test('Set: Table 6.73, full form (CONSTRUCTED)', () => {
+    const encoded = encodeLightCtlTemperatureSet({
+      temperature: LIGHT_CTL_TEMPERATURE_SET_FULL.temperature,
+      deltaUv: LIGHT_CTL_TEMPERATURE_SET_FULL.deltaUv,
+      tid: LIGHT_CTL_TEMPERATURE_SET_FULL.tid,
+      transition: {
+        time: {
+          stepResolution: LIGHT_CTL_TEMPERATURE_SET_FULL.stepResolution,
+          numberOfSteps: LIGHT_CTL_TEMPERATURE_SET_FULL.numberOfSteps,
+        },
+        delay: LIGHT_CTL_TEMPERATURE_SET_FULL.delay,
+      },
+    });
+    expect(encoded).toEqual(hex(LIGHT_CTL_TEMPERATURE_SET_FULL.message));
+  });
+
+  test('Set: Table 6.73, minimal form (CONSTRUCTED)', () => {
+    expect(
+      encodeLightCtlTemperatureSet({
+        temperature: LIGHT_CTL_TEMPERATURE_SET_MINIMAL.temperature,
+        deltaUv: LIGHT_CTL_TEMPERATURE_SET_MINIMAL.deltaUv,
+        tid: LIGHT_CTL_TEMPERATURE_SET_MINIMAL.tid,
+      }),
+    ).toEqual(hex(LIGHT_CTL_TEMPERATURE_SET_MINIMAL.message));
+  });
+
+  test('Set: Delta UV at the signed 16-bit domain\'s own minimum and maximum (CONSTRUCTED)', () => {
+    for (const fixture of [LIGHT_CTL_TEMPERATURE_SET_DELTA_UV_MIN, LIGHT_CTL_TEMPERATURE_SET_DELTA_UV_MAX]) {
+      expect(
+        encodeLightCtlTemperatureSet({ temperature: fixture.temperature, deltaUv: fixture.deltaUv, tid: fixture.tid }),
+      ).toEqual(hex(fixture.message));
+    }
+  });
+
+  test('Set: carries NO Lightness field - the whole practical difference from Light CTL Set (Table 6.73 vs Table 6.69)', () => {
+    // Parameters are Temperature(2) || DeltaUV(2) || TID(1) = 5 octets, so
+    // the whole message is 2 + 5 = 7. Light CTL Set's own minimal form is
+    // two octets longer, carrying a Lightness this message has no field
+    // for. Pinned as a LENGTH, independently of the byte fixtures above,
+    // because "a temperature change cannot disturb brightness" is the
+    // reason this model is used at all.
+    const encoded = encodeLightCtlTemperatureSet({ temperature: 0x0bb8, deltaUv: 0, tid: 0 });
+    expect(encoded).toHaveLength(7);
+  });
+
+  test('Set: Table 6.6 - temperature outside [0x0320, 0x4E20] throws (Prohibited)', () => {
+    expect(() => encodeLightCtlTemperatureSet({ temperature: 0x031f, deltaUv: 0, tid: 0 })).toThrow(/temperature/);
+    expect(() => encodeLightCtlTemperatureSet({ temperature: 0x4e21, deltaUv: 0, tid: 0 })).toThrow(/temperature/);
+  });
+
+  test('Set: deltaUv outside the signed 16-bit domain throws, named by field', () => {
+    expect(() => encodeLightCtlTemperatureSet({ temperature: 0x0320, deltaUv: -32769, tid: 0 })).toThrow(/deltaUv/);
+    expect(() => encodeLightCtlTemperatureSet({ temperature: 0x0320, deltaUv: 32768, tid: 0 })).toThrow(/deltaUv/);
+  });
+
+  test('Set: tid outside the 1-octet domain throws, named by field', () => {
+    expect(() => encodeLightCtlTemperatureSet({ temperature: 0x0320, deltaUv: 0, tid: 0x100 })).toThrow(/tid/);
+  });
+
+  test('Status: Table 6.75, Present-only, Delta UV at the signed minimum (CONSTRUCTED)', () => {
+    expect(decodeLightCtlTemperatureStatus(hex(LIGHT_CTL_TEMPERATURE_STATUS_MINIMAL.message))).toEqual({
+      presentTemperature: LIGHT_CTL_TEMPERATURE_STATUS_MINIMAL.presentTemperature,
+      presentDeltaUv: LIGHT_CTL_TEMPERATURE_STATUS_MINIMAL.presentDeltaUv,
+    });
+  });
+
+  test.each([
+    ['6000 K', LIGHT_CTL_TEMPERATURE_STATUS_6000K_MEASURED],
+    ['3000 K', LIGHT_CTL_TEMPERATURE_STATUS_3000K_MEASURED],
+  ])('Status: Table 6.75, full form - %s, MEASURED ON THE OWNER\'S BULB', (_label, fixture) => {
+    expect(decodeLightCtlTemperatureStatus(hex(fixture.message))).toEqual({
+      presentTemperature: fixture.presentTemperature,
+      presentDeltaUv: fixture.presentDeltaUv,
+      target: {
+        temperature: fixture.targetTemperature,
+        deltaUv: fixture.targetDeltaUv,
+        remainingTime: { stepResolution: fixture.stepResolution, numberOfSteps: fixture.numberOfSteps },
+      },
+    });
+  });
+
+  test('Status: the two measured fixtures decode to the two kelvin values that were actually written (6000 and 3000)', () => {
+    // The point of this one is the NUMBER, not the structure: a big-endian
+    // read of either fixture produces 0x7017 (28695) / 0xB80B (47115),
+    // both outside Table 6.6's legal range entirely - so this is the
+    // check that would have caught the byte order even with no field-table
+    // reading at all.
+    expect(decodeLightCtlTemperatureStatus(hex(LIGHT_CTL_TEMPERATURE_STATUS_6000K_MEASURED.message))?.presentTemperature).toBe(6000);
+    expect(decodeLightCtlTemperatureStatus(hex(LIGHT_CTL_TEMPERATURE_STATUS_3000K_MEASURED.message))?.presentTemperature).toBe(3000);
+  });
+
+  test('Status: wrong opcode decodes to null - Light CTL Status (0x8260) is NOT a Light CTL Temperature Status (0x8266)', () => {
+    expect(decodeLightCtlTemperatureStatus(hex(LIGHT_CTL_STATUS_MINIMAL.message))).toBeNull();
+    // ...and the converse, since both decoders accept a 4-octet and a
+    // 9-octet Parameters field: the composite decoder must not accept the
+    // measured Temperature Status either.
+    expect(decodeLightCtlStatus(hex(LIGHT_CTL_TEMPERATURE_STATUS_6000K_MEASURED.message))).toBeNull();
+  });
+
+  test('Status: malformed Parameters length (6 octets - neither 4 nor 9) decodes to null', () => {
+    expect(decodeLightCtlTemperatureStatus(hex('826620030080ff'))).toBeNull();
+  });
+});
+
+describe('Light CTL Temperature Range', () => {
+  test('Get: Table 6.76 - Opcode only (CONSTRUCTED)', () => {
+    expect(encodeLightCtlTemperatureRangeGet()).toEqual(hex(LIGHT_CTL_TEMPERATURE_RANGE_GET.message));
+  });
+
+  test('Status: Table 6.79 - Status Code || Range Min || Range Max (CONSTRUCTED)', () => {
+    expect(decodeLightCtlTemperatureRangeStatus(hex(LIGHT_CTL_TEMPERATURE_RANGE_STATUS_OK.message))).toEqual({
+      statusCode: CTL_TEMPERATURE_RANGE_STATUS_SUCCESS,
+      rangeMin: LIGHT_CTL_TEMPERATURE_RANGE_STATUS_OK.rangeMin,
+      rangeMax: LIGHT_CTL_TEMPERATURE_RANGE_STATUS_OK.rangeMax,
+    });
+  });
+
+  test('Status: Table 6.8\'s own 0xFFFF row - a node that answered and still said nothing', () => {
+    const decoded = decodeLightCtlTemperatureRangeStatus(hex(LIGHT_CTL_TEMPERATURE_RANGE_STATUS_UNKNOWN.message));
+    expect(decoded).toEqual({ statusCode: 0x00, rangeMin: CTL_TEMPERATURE_RANGE_UNKNOWN, rangeMax: CTL_TEMPERATURE_RANGE_UNKNOWN });
+  });
+
+  test('Status: a non-success Status Code (Table 7.1) is carried through raw, never rejected on decode', () => {
+    expect(decodeLightCtlTemperatureRangeStatus(hex(LIGHT_CTL_TEMPERATURE_RANGE_STATUS_REFUSED.message))).toEqual({
+      statusCode: LIGHT_CTL_TEMPERATURE_RANGE_STATUS_REFUSED.statusCode,
+      rangeMin: LIGHT_CTL_TEMPERATURE_RANGE_STATUS_REFUSED.rangeMin,
+      rangeMax: LIGHT_CTL_TEMPERATURE_RANGE_STATUS_REFUSED.rangeMax,
+    });
+  });
+
+  test('Status: wrong opcode, and any Parameters length other than 5, decode to null', () => {
+    expect(decodeLightCtlTemperatureRangeStatus(hex(LIGHT_CTL_TEMPERATURE_STATUS_MINIMAL.message))).toBeNull();
+    expect(decodeLightCtlTemperatureRangeStatus(hex('826300b80b70'))).toBeNull();
+    expect(decodeLightCtlTemperatureRangeStatus(hex('826300b80b701700'))).toBeNull();
   });
 });
 
