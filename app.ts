@@ -58,7 +58,7 @@ import { ProxyConnectionManager, type ProxyConnectionState } from './lib/adapter
 import { TrafficQueue } from './lib/adapter/queue';
 import { type MeshLightController, type MeshClockPort, type MeshTrafficPort } from './drivers/light/meshLight';
 import { createRealClock } from './drivers/light/pairing';
-import { HomeyBluetoothPort } from './drivers/light/driver';
+import { HomeyBluetoothPort } from './drivers/light/homeyBluetooth';
 
 type AppHomey = InstanceType<typeof Homey.App>['homey'];
 
