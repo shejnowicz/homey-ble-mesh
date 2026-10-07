@@ -10,8 +10,14 @@ import { ProxyConnectionManager, SCAN_DURATION_MS } from '../../../lib/adapter/c
 import { TrafficQueue } from '../../../lib/adapter/queue';
 import { FakeBluetoothPort, type AutoResponder } from '../../../lib/adapter/__tests__/fakeBluetooth';
 import { createFakeClock, type FakeClock } from '../../../lib/adapter/__tests__/fakeClock';
-import { encodeMeshMessage, acceptIncomingPdu, type MeshReceiveContext } from '../../../lib/mesh/packet/message';
+import {
+  encodeMeshMessage,
+  acceptIncomingPdu,
+  RELAYED_TTL,
+  type MeshReceiveContext,
+} from '../../../lib/mesh/packet/message';
 import { encodeAccessMessage, type AccessMessage } from '../../../lib/mesh/packet/access';
+import { decodeNetworkPdu } from '../../../lib/mesh/packet/network';
 import { k4 } from '../../../lib/mesh/crypto/derive';
 import type { CompositionData } from '../../../lib/mesh/config/composition';
 import type { HomeyCapability } from '../../../lib/models/capabilities';
@@ -229,6 +235,9 @@ function installLightingResponder(bluetooth: FakeBluetoothPort, peripheralId: st
       dst: opts.ourAddress,
       netKey: opts.netKey,
       ivIndex: 0,
+      // The fake node replies with the same relayed TTL a real one would
+      // use for a status crossing the mesh back to us.
+      ttl: RELAYED_TTL,
       allocateSeq: allocateNodeSeq,
     });
 
@@ -343,6 +352,7 @@ function buildNodeNotification(netKey: Buffer, appKey: Buffer, accessPayload: Bu
     dst: OUR_ADDRESS,
     netKey,
     ivIndex: 0,
+    ttl: RELAYED_TTL,
     allocateSeq: () => 777,
   });
   return pdus[0] as Buffer;
@@ -365,6 +375,12 @@ interface Harness {
   store: NetworkStore;
   device: FakeDevicePort;
   controller: MeshLightController;
+  /** How many commands the CONTROLLER has handed to the shared queue — the
+   *  measure the C3 tests below need, and the one `writesReceived` cannot
+   *  give: the queue serialises, so a hundred commands enqueued against an
+   *  unreachable node still produce only ONE write until the first gives up.
+   *  Counting at `send()` is counting what actually piles up. */
+  queueSends: () => number;
   netKey: Buffer;
   appKey: Buffer;
   deviceKey: Buffer;
@@ -414,7 +430,17 @@ function setUp(
   });
 
   const device = new FakeDevicePort(options.capabilities ?? ALL_CAPABILITIES);
-  const controller = new MeshLightController({ queue, store, device, address: NODE_ADDRESS });
+  // The controller talks to the REAL queue through a counting pass-through —
+  // nothing is stubbed, only observed (see `Harness.queueSends`).
+  let sends = 0;
+  const countingQueue = {
+    send: (command: Parameters<TrafficQueue['send']>[0]): Promise<Buffer> => {
+      sends += 1;
+      return queue.send(command);
+    },
+    onUnsolicited: (listener: (data: Buffer) => void): (() => void) => queue.onUnsolicited(listener),
+  };
+  const controller = new MeshLightController({ queue: countingQueue, store, clock, device, address: NODE_ADDRESS });
 
   const nodeState: FakeNodeState = { ...defaultNodeState(), ...options.nodeState };
   installLightingResponder(bluetooth, NODE_PERIPHERAL_ID, {
@@ -427,7 +453,20 @@ function setUp(
     ...options.responderOptions,
   });
 
-  return { bluetooth, clock, manager, queue, store, device, controller, netKey, appKey, deviceKey, nodeState };
+  return {
+    bluetooth,
+    clock,
+    manager,
+    queue,
+    store,
+    device,
+    controller,
+    queueSends: () => sends,
+    netKey,
+    appKey,
+    deviceKey,
+    nodeState,
+  };
 }
 
 async function connectManager(manager: ProxyConnectionManager, clock: FakeClock): Promise<void> {
@@ -545,7 +584,7 @@ describe('transaction identifier', () => {
     expect(new Set(tids).size).toBe(3);
   });
 
-  test('a RETRY of the same command resends byte-identical bytes, TID included', async () => {
+  test('a RETRY carries the SAME transaction identifier (and still reaches the node)', async () => {
     const h = setUp({
       queueOptions: { timeoutMs: 50, maxAttempts: 2 },
       responderOptions: { silentOnFirstAttemptForOpcodes: new Set([OP_ONOFF_SET]) },
@@ -560,8 +599,81 @@ describe('transaction identifier', () => {
     await promise;
 
     expect(h.bluetooth.writesReceived).toHaveLength(2);
-    const [first, second] = h.bluetooth.writesReceived;
-    expect(first!.data.equals(second!.data)).toBe(true);
+    const tids = h.bluetooth.writesReceived.map((w) => decodeOurCommand(w.data, h.netKey, h.appKey)?.parameters[1]);
+    expect(tids[0]).toBe(tids[1]);
+    expect(tids[0]).not.toBeUndefined();
+  });
+
+  /**
+   * C4, THE DEFECT THIS TEST EXISTS FOR. Retries used to re-send the EXACT
+   * buffer the first attempt sent — a design note argued, correctly, that
+   * this made "the transaction identifier stays stable" free. It was silent
+   * about the SEQUENCE NUMBER living inside those same bytes. Section 3.9.8
+   * "Message replay protection": a message whose IVISeq is "lower than or
+   * equal to the last valid IVISeq value" from that element is discarded.
+   * So a byte-identical retry could only ever succeed in the one case where
+   * the original never reached the node's model at all; in the single most
+   * likely case for retrying — the command ARRIVED and the status was lost
+   * — every retry was dropped as a replay and the user was told the command
+   * failed on a lamp that had changed.
+   *
+   * Both halves are asserted on the SAME three attempts, because they are
+   * in tension: a fix that rebuilt everything would give three different
+   * TIDs (defeating the node's own deduplication in the other direction),
+   * and the old behaviour gave three identical sequence numbers.
+   */
+  test('three attempts carry THREE DIFFERENT sequence numbers and ONE transaction identifier', async () => {
+    const h = setUp({
+      queueOptions: { timeoutMs: 50, maxAttempts: 3 },
+      responderOptions: { silentOpcodes: new Set([OP_ONOFF_SET]) }, // never answered, so all three attempts fire
+    });
+    await connectManager(h.manager, h.clock);
+
+    const promise = h.controller.setOnOff(true);
+    const rejection = expect(promise).rejects.toThrow(/no status received after 3 attempts/);
+    await flushMicrotasks();
+    await h.clock.advance(50);
+    await h.clock.advance(50);
+    await h.clock.advance(50);
+    await rejection;
+
+    expect(h.bluetooth.writesReceived).toHaveLength(3);
+
+    const seqs = h.bluetooth.writesReceived.map(
+      (w) => decodeNetworkPdu({ networkKey: h.netKey, ivIndex: 0, pdu: w.data })?.seq,
+    );
+    expect(seqs.every((s) => typeof s === 'number')).toBe(true);
+    expect(new Set(seqs).size).toBe(3); // three DIFFERENT sequence numbers...
+    expect(seqs[1]).toBeGreaterThan(seqs[0] as number); // ...strictly increasing, which is what replay protection requires
+    expect(seqs[2]).toBeGreaterThan(seqs[1] as number);
+
+    // Table 3.37: Opcode(2) || OnOff(1) || TID(1).
+    const tids = h.bluetooth.writesReceived.map((w) => decodeOurCommand(w.data, h.netKey, h.appKey)?.parameters[1]);
+    expect(new Set(tids).size).toBe(1); // ...and ONE transaction identifier
+    expect(tids[0]).not.toBeUndefined();
+  });
+
+  /** The same two properties for the Config Node Reset path, which has no
+   *  transaction identifier of its own but is just as replay-protected —
+   *  and whose failure (a bulb left bound to a network nobody owns) is the
+   *  most expensive one in the app. */
+  test('a retried Config Node Reset carries a fresh sequence number each attempt', async () => {
+    const h = setUp({ queueOptions: { timeoutMs: 50, maxAttempts: 3 }, responderOptions: { failReset: true } });
+    await connectManager(h.manager, h.clock);
+
+    const promise = h.controller.remove();
+    const rejection = expect(promise).rejects.toThrow(/failed to reset node/);
+    await flushMicrotasks();
+    await h.clock.advance(50);
+    await h.clock.advance(50);
+    await h.clock.advance(50);
+    await rejection;
+
+    expect(h.bluetooth.writesReceived).toHaveLength(3);
+    const seqs = h.bluetooth.writesReceived.map(
+      (w) => decodeNetworkPdu({ networkKey: h.netKey, ivIndex: 0, pdu: w.data })?.seq,
+    );
+    expect(new Set(seqs).size).toBe(3);
   });
 });
 
@@ -605,6 +717,43 @@ describe('unsolicited status', () => {
     h.bluetooth.simulateNotification(NODE_PERIPHERAL_ID, pdu);
     await flushMicrotasks();expect(h.device.getCapabilityValue('onoff')).toBeNull();
     expect(h.device.availabilityCalls).toEqual([{ available: false, message: CONNECTION_UNAVAILABLE_MESSAGE }]);
+  });
+
+  /**
+   * REVIEW FINDING (final wave): the expected-source check was pinned for
+   * the UNSOLICITED path (the test above) and at the decoder (message.test.
+   * ts), but NOT on the path this module's own header calls out as the
+   * thing it exists for — "a command's own `isStatus` predicate is
+   * therefore the ONLY thing stopping one node's status from being mistaken
+   * for another's answer, which matters because every bulb uses the SAME
+   * application key". A status from bulb B, perfectly valid and perfectly
+   * decryptable with the shared application key, must not resolve bulb A's
+   * pending command: that is the whole of how three bulbs share one queue.
+   */
+  test('a status from a DIFFERENT node never resolves this node\'s pending command', async () => {
+    const h = setUp({
+      queueOptions: { timeoutMs: 50, maxAttempts: 1 },
+      responderOptions: { silentOpcodes: new Set([OP_ONOFF_SET]) }, // our own node says nothing
+    });
+    h.controller.start();
+    await connectManager(h.manager, h.clock);
+
+    const promise = h.controller.setOnOff(true);
+    const rejection = expect(promise).rejects.toThrow(/no status received after 1 attempt/);
+    await flushMicrotasks();
+
+    // Another bulb on the same mesh, same NetKey, same application key, a
+    // genuine Generic OnOff Status — everything matches except the source.
+    h.bluetooth.simulateNotification(
+      NODE_PERIPHERAL_ID,
+      buildNodeNotification(h.netKey, h.appKey, onOffStatusPayload(0), NODE_ADDRESS + 1),
+    );
+    await flushMicrotasks();
+
+    // Not resolved by it, and not applied to this device's capability either.
+    await h.clock.advance(50);
+    await rejection;
+    expect(h.device.setCalls.filter((c) => c.capability === 'onoff')).toEqual([{ capability: 'onoff', value: true }]);
   });
 
   test('hearing from the node marks it available again even without a reconnection event', async () => {
@@ -815,6 +964,15 @@ describe('availability', () => {
 
     // SAME status, called again — nothing told this controller the shared
     // connection ever went down and came back; it still must not assume.
+    // RATE LIMITED since the final fix wave (C3): the retry is real, but it
+    // waits out the backoff first. The tick that arrives before the backoff
+    // has elapsed does nothing at all — that is the whole point — so this
+    // test now proves BOTH halves at once: suppressed while throttled, and
+    // genuinely retried once the throttle is up.
+    await h.controller.onConnectionStateChange('connected');
+    expect(h.bluetooth.writesReceived).toHaveLength(1); // still throttled: no new Get
+
+    await h.clock.advance(__testing.RE_READ_BACKOFF_BASE_MS);
     await h.controller.onConnectionStateChange('connected');
 
     expect(h.bluetooth.writesReceived).toHaveLength(2); // the retry's own Get, not skipped
@@ -829,6 +987,219 @@ describe('availability', () => {
     await h.controller.onConnectionStateChange('connected');
 
     expect(h.bluetooth.writesReceived).toHaveLength(1);
+  });
+});
+
+// ===========================================================================
+// C3 — ONE UNREACHABLE BULB MUST NOT SATURATE THE SHARED QUEUE.
+//
+// The defect, as a reviewer measured it: app.ts fans
+// `onConnectionStateChange('connected')` out to every controller on every
+// poll tick (deliberately, to close an earlier finding), and a controller
+// whose node is silent never records that it is connected — so every tick
+// started another full state re-read, each enqueuing Gets that take the full
+// retry budget to fail, on the one queue every device shares. Two hundred
+// ticks produced two hundred re-reads started, sixteen settled, and a
+// backlog of one hundred and eighty-four growing linearly.
+//
+// These tests MEASURE, as the reviewer did, rather than assert that
+// something eventually happened: they drive a fixed number of ticks against
+// a silent node and count how many re-reads were actually STARTED.
+// ===========================================================================
+
+describe('a silent node is retried, but rate-limited', () => {
+  /** Drives `ticks` poll ticks exactly as app.ts does — one call per
+   *  controller per tick, never awaited by the caller — advancing virtual
+   *  time by `pollMs` between them. Returns how many Gets actually reached
+   *  the radio, which is the measure that matters: each one is a queue
+   *  entry competing with every other device's traffic. */
+  async function pollFor(
+    h: Harness,
+    ticks: number,
+    pollMs: number,
+  ): Promise<{ reReadsStarted: number; writes: number }> {
+    for (let i = 0; i < ticks; i += 1) {
+      void h.controller.onConnectionStateChange('connected').catch(() => undefined);
+      await flushMicrotasks();
+      await h.clock.advance(pollMs);
+    }
+    await flushMicrotasks();
+    // `queueSends` is the measure that matters, NOT `writesReceived`: the
+    // queue serialises, so a hundred Gets enqueued against a silent node
+    // still produce only one WRITE until the first gives up. What grew in
+    // the reviewer's measurement was the backlog, and the backlog is fed by
+    // `send()`.
+    return { reReadsStarted: h.queueSends(), writes: h.bluetooth.writesReceived.length };
+  }
+
+  test('two hundred poll ticks against a node that never answers start a BOUNDED number of re-reads, not two hundred', async () => {
+    const h = setUp({
+      capabilities: new Set(['onoff']), // one Get per re-read, so writes == re-reads started
+      queueOptions: { timeoutMs: 1000, maxAttempts: 1 },
+      responderOptions: { silentOpcodes: new Set([OP_ONOFF_GET]) }, // the node is simply gone
+    });
+    await connectManager(h.manager, h.clock);
+
+    // 200 ticks at the app's own poll interval (2 s) = 400 s of virtual
+    // time. Before this fix that produced ~200 re-reads started and a
+    // backlog that grew with every one of them.
+    const { reReadsStarted, writes } = await pollFor(h, 200, 2000);
+
+    // MEASURED: the in-flight flag alone caps this at one re-read per
+    // completed attempt; the backoff then spaces those out. Over 400 s,
+    // with a 30 s base doubling to a 300 s cap, that is a handful — the
+    // exact number is asserted so a weakened guard shows up as a number
+    // going UP rather than as a vague "not too many".
+    expect(reReadsStarted).toBe(4);
+    expect(writes).toBe(4); // one Get per re-read, none of them queued behind another
+    // Nothing accumulated: every re-read that started also finished before
+    // the next one began, so the shared queue is EMPTY and a user command on
+    // another bulb reaches the radio on the very next microtask rather than
+    // queuing behind a pile. Measured the same way — by counting writes.
+    const userCommand = h.queue.send({
+      build: () => Buffer.from([0x00]),
+      description: 'a user command',
+      isStatus: () => false,
+    });
+    const rejection = expect(userCommand).rejects.toThrow('a user command: no status received after 1 attempt');
+    await flushMicrotasks();
+    expect(h.bluetooth.writesReceived).toHaveLength(writes + 1); // went out at once, behind nothing
+    await h.clock.advance(1000);
+    await rejection;
+  });
+
+  test('a re-read still running swallows every tick that arrives while it runs (the in-flight flag alone)', async () => {
+    const h = setUp({
+      capabilities: new Set(['onoff']),
+      queueOptions: { timeoutMs: 10_000, maxAttempts: 1 }, // one slow attempt
+      responderOptions: { silentOpcodes: new Set([OP_ONOFF_GET]) },
+    });
+    await connectManager(h.manager, h.clock);
+
+    // Five ticks inside the first attempt's own 10 s window. Counted at
+    // `send()`, because the queue would have hidden four extra enqueued Gets
+    // behind the one in flight — which is exactly how this defect stayed
+    // invisible in the first place.
+    const { reReadsStarted, writes } = await pollFor(h, 5, 1000);
+    expect(reReadsStarted).toBe(1); // one re-read started, four ticks ignored
+    expect(writes).toBe(1);
+  });
+
+  test('the backoff grows and is capped, and is cleared by hearing from the node', async () => {
+    expect(__testing.reReadBackoffMs(0)).toBe(0);
+    expect(__testing.reReadBackoffMs(1)).toBe(__testing.RE_READ_BACKOFF_BASE_MS);
+    expect(__testing.reReadBackoffMs(2)).toBe(__testing.RE_READ_BACKOFF_BASE_MS * 2);
+    expect(__testing.reReadBackoffMs(3)).toBe(__testing.RE_READ_BACKOFF_BASE_MS * 4);
+    expect(__testing.reReadBackoffMs(__testing.MAX_RE_READ_FAILURE_STREAK)).toBe(__testing.RE_READ_BACKOFF_MAX_MS);
+    expect(__testing.RE_READ_BACKOFF_BASE_MS).toBe(30_000);
+    expect(__testing.RE_READ_BACKOFF_MAX_MS).toBe(300_000);
+  });
+
+  test('an unsolicited status clears the backoff, so a bulb that comes back is not throttled for minutes', async () => {
+    const h = setUp({
+      capabilities: new Set(['onoff']),
+      queueOptions: { timeoutMs: 50, maxAttempts: 1 },
+      responderOptions: { silentOnFirstAttemptForOpcodes: new Set([OP_ONOFF_GET]) },
+    });
+    h.controller.start();
+    await connectManager(h.manager, h.clock);
+
+    const failing = h.controller.onConnectionStateChange('connected');
+    await h.clock.advance(50);
+    await failing;
+    expect(h.bluetooth.writesReceived).toHaveLength(1);
+
+    // Throttled: a tick right now does nothing.
+    await h.controller.onConnectionStateChange('connected');
+    expect(h.bluetooth.writesReceived).toHaveLength(1);
+
+    // The node speaks for itself. It consumes the queue's own one-shot
+    // late-status guard on the way (same documented interaction as the
+    // retry test above), so a second notification is what actually lands.
+    for (let i = 0; i < 2; i += 1) {
+      h.bluetooth.simulateNotification(NODE_PERIPHERAL_ID, buildNodeNotification(h.netKey, h.appKey, onOffStatusPayload(1)));
+      await flushMicrotasks();
+    }
+    expect(h.device.availabilityCalls.at(-1)).toEqual({ available: true });
+
+    // ...and the next tick is free to re-read immediately, with no wait.
+    await h.controller.onConnectionStateChange('unavailable');
+    await h.controller.onConnectionStateChange('connected');
+    expect(h.bluetooth.writesReceived).toHaveLength(2);
+  });
+
+  test('a disconnect clears the backoff too — a link that went and came back is new information', async () => {
+    const h = setUp({
+      capabilities: new Set(['onoff']),
+      queueOptions: { timeoutMs: 50, maxAttempts: 1 },
+      responderOptions: { silentOnFirstAttemptForOpcodes: new Set([OP_ONOFF_GET]) },
+    });
+    await connectManager(h.manager, h.clock);
+
+    const failing = h.controller.onConnectionStateChange('connected');
+    await h.clock.advance(50);
+    await failing;
+    expect(h.bluetooth.writesReceived).toHaveLength(1);
+
+    await h.controller.onConnectionStateChange('unavailable');
+    // Not awaited: this retry's own reply is eaten by the queue's documented
+    // one-shot late-status guard (see the retry test above), so awaiting it
+    // would wait out the attempt timeout for no reason. What this test is
+    // about is WHETHER the Get went out at all, and when.
+    const retry = h.controller.onConnectionStateChange('connected').catch(() => undefined);
+    await flushMicrotasks();
+
+    expect(h.bluetooth.writesReceived).toHaveLength(2); // retried at once, not after 30 s
+    await h.clock.advance(50);
+    await retry;
+  });
+});
+
+// ===========================================================================
+// The brightness a colour/temperature command has to state — review finding
+// (final wave): unpinned, and user-visible when there is nothing to read.
+// ===========================================================================
+
+describe('the dim fraction a Light CTL / Light HSL Set carries', () => {
+  test('the no-value and no-capability fallbacks are both full brightness, deliberately', () => {
+    expect(__testing.currentDimFractionFallback('no-capability')).toBe(1);
+    expect(__testing.currentDimFractionFallback('no-value')).toBe(1);
+  });
+
+  test('a device whose dim is already known carries THAT brightness, not the fallback', async () => {
+    const h = setUp();
+    await connectManager(h.manager, h.clock);
+    await h.device.setCapabilityValue('dim', 0.25);
+
+    await h.controller.setLightTemperature(0.5);
+
+    const sent = decodeOurCommand(h.bluetooth.writesReceived[0]!.data, h.netKey, h.appKey);
+    expect(sent?.opcode).toBe(OP_CTL_SET);
+    // Table 6.71: CTL Lightness is the first 2-octet little-endian field.
+    expect(sent?.parameters.readUInt16LE(0)).toBe(__testing.fractionToWire(0.25));
+  });
+
+  test('a device whose dim has no value yet carries full brightness — the decision, pinned', async () => {
+    const h = setUp();
+    await connectManager(h.manager, h.clock);
+    expect(h.device.getCapabilityValue('dim')).toBeNull(); // nothing has populated it
+
+    await h.controller.setLightTemperature(0.5);
+
+    const sent = decodeOurCommand(h.bluetooth.writesReceived[0]!.data, h.netKey, h.appKey);
+    expect(sent?.parameters.readUInt16LE(0)).toBe(0xffff);
+  });
+
+  test('a device with no dim capability at all also carries full brightness', async () => {
+    const h = setUp({ capabilities: new Set(['light_hue', 'light_saturation']) });
+    await connectManager(h.manager, h.clock);
+
+    await h.controller.setColor(0.5, 0.5);
+
+    const sent = decodeOurCommand(h.bluetooth.writesReceived[0]!.data, h.netKey, h.appKey);
+    expect(sent?.opcode).toBe(OP_HSL_SET);
+    // Table 6.87: HSL Lightness is the first 2-octet little-endian field.
+    expect(sent?.parameters.readUInt16LE(0)).toBe(0xffff);
   });
 });
 
@@ -886,6 +1257,68 @@ describe('remove', () => {
 
     await expect(h.controller.remove()).resolves.toBeUndefined();
     expect(h.bluetooth.writesReceived).toHaveLength(0);
+  });
+});
+
+// ===========================================================================
+// Time to live — REVIEW FINDING (final wave). Every lighting command and
+// every node reset went out at TTL 0, inherited silently from an encoder
+// default that was correct only for the point-to-point pairing session.
+// Table 3.12 "TTL field values" defines 0 as "Network PDU has not been
+// relayed and will not be relayed", so a command for any bulb except the one
+// currently holding the single shared GATT connection was never forwarded by
+// anything — and the reviewer confirmed by execution that EVERY PDU in a
+// full end-to-end run carried it.
+//
+// These assert the LITERAL value on the wire, on both paths, decoded out of
+// the real Network PDU. The constant is deliberately not referenced: an
+// assertion against `RELAYED_TTL` would pass for any value that constant
+// happened to hold, which is precisely the tautology that let this through.
+// ===========================================================================
+
+describe('time to live', () => {
+  /** The TTL field of one written Network PDU, decoded rather than
+   *  recomputed — the fake has already stripped the Proxy PDU envelope. */
+  function ttlOf(write: { data: Buffer }, netKey: Buffer): number | undefined {
+    return decodeNetworkPdu({ networkKey: netKey, ivIndex: 0, pdu: write.data })?.ttl;
+  }
+
+  test('an application-key lighting command goes out at TTL 127, not 0', async () => {
+    const h = setUp();
+    await connectManager(h.manager, h.clock);
+
+    await h.controller.setOnOff(true);
+
+    expect(h.bluetooth.writesReceived).toHaveLength(1);
+    expect(ttlOf(h.bluetooth.writesReceived[0]!, h.netKey)).toBe(127);
+  });
+
+  test('every command shape — Set and Get, all four models — goes out at TTL 127', async () => {
+    const h = setUp();
+    await connectManager(h.manager, h.clock);
+
+    // The four Gets first: `onConnectionStateChange('connected')` is a no-op
+    // once anything has already proved the node reachable, and every Set
+    // below does exactly that by applying its own status.
+    await h.controller.onConnectionStateChange('connected'); // four Gets
+    await h.controller.setOnOff(true);
+    await h.controller.setDim(0.5);
+    await h.controller.setLightTemperature(0.25);
+    await h.controller.setColor(0.3, 0.7);
+
+    expect(h.bluetooth.writesReceived).toHaveLength(8);
+    const ttls = h.bluetooth.writesReceived.map((w) => ttlOf(w, h.netKey));
+    expect(new Set(ttls)).toEqual(new Set([127]));
+  });
+
+  test('a Config Node Reset goes out at TTL 127 too — the most expensive one to get wrong', async () => {
+    const h = setUp();
+    await connectManager(h.manager, h.clock);
+
+    await h.controller.remove();
+
+    expect(h.bluetooth.writesReceived).toHaveLength(1);
+    expect(ttlOf(h.bluetooth.writesReceived[0]!, h.netKey)).toBe(127);
   });
 });
 

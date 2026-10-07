@@ -56,7 +56,7 @@ import Homey from 'homey';
 import { NetworkStore, type SettingsPort } from './lib/adapter/store';
 import { ProxyConnectionManager, type ProxyConnectionState } from './lib/adapter/connection';
 import { TrafficQueue } from './lib/adapter/queue';
-import { type MeshLightController, type MeshTrafficPort } from './drivers/light/meshLight';
+import { type MeshLightController, type MeshClockPort, type MeshTrafficPort } from './drivers/light/meshLight';
 import { createRealClock } from './drivers/light/pairing';
 import { HomeyBluetoothPort } from './drivers/light/driver';
 
@@ -96,6 +96,10 @@ class BleMeshApp extends Homey.App {
   private store: NetworkStore | null = null;
   private manager: ProxyConnectionManager | null = null;
   private queue: TrafficQueue | null = null;
+  /** The ONE real clock this app owns — handed to the connection manager,
+   *  the traffic queue and every device controller, so "now" means the same
+   *  thing everywhere. Constructed lazily with the mesh itself. */
+  private clock: MeshClockPort | null = null;
   private pollTimer: NodeJS.Timeout | null = null;
   private lastConnectionStatus: ProxyConnectionState['status'] | null = null;
   private readonly controllers = new Set<MeshLightController>();
@@ -131,9 +135,9 @@ class BleMeshApp extends Homey.App {
   /** `device.ts#BleMeshAppHost`'s own requirement. `null` only when the
    *  mesh has never been started (no network key yet) — see this file's own
    *  module header. */
-  getMeshContext(): { readonly store: NetworkStore; readonly queue: MeshTrafficPort } | null {
-    if (this.store === null || this.queue === null) return null;
-    return { store: this.store, queue: this.queue };
+  getMeshContext(): { readonly store: NetworkStore; readonly queue: MeshTrafficPort; readonly clock: MeshClockPort } | null {
+    if (this.store === null || this.queue === null || this.clock === null) return null;
+    return { store: this.store, queue: this.queue, clock: this.clock };
   }
 
   /** `device.ts#BleMeshAppHost`'s own requirement — registers `controller`
@@ -170,6 +174,7 @@ class BleMeshApp extends Homey.App {
     const queue = new TrafficQueue(manager, clock);
     this.manager = manager;
     this.queue = queue;
+    this.clock = clock;
     manager.start();
     this.pollTimer = this.homey.setInterval(() => this.pollConnectionState(), CONNECTION_POLL_MS);
     this.log('mesh connection manager started');

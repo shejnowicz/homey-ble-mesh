@@ -52,6 +52,51 @@
  * module imports that implementation rather than re-deriving it, exactly as
  * the plan's "Type consistency" note intends.
  *
+ * THE PROXY PDU ENVELOPE (added in the final fix wave; this module used to
+ * write BARE Network PDUs and parse notifications as if they were bare,
+ * which no node can understand). Section 3.3.2 "GATT bearer": "The GATT
+ * bearer uses the Proxy protocol (see Section 6) to transmit and receive
+ * Proxy PDUs between two devices over a GATT connection." Section 7.2.3.1
+ * "Mesh Proxy Data In characteristic": "The characteristic value has the
+ * same format as the Proxy PDU." The envelope itself — the one-octet
+ * SAR/MessageType header, its segmentation rules, its reassembly rules and
+ * its 20-second SAR timeout — is transcribed and tested in
+ * `lib/mesh/packet/proxyPdu.ts`; this module does the I/O around it: it
+ * segments every outgoing Network PDU (`write` below), reassembles every
+ * incoming notification (`handleNotification`), delivers only completed
+ * Network PDU messages to its listeners, and DISCONNECTS when the
+ * specification says to (Section 6.3.2.2 "Reassembly": "Upon receiving a
+ * message with an unexpected value of the SAR field, the Proxy PDU Client
+ * shall disconnect."). `MAX_PROXY_PDU_LENGTH` below is the one engineering
+ * input that work needs.
+ *
+ * IV INDEX: A DESIGN CLAUSE DELIBERATELY NOT IMPLEMENTED, stated here
+ * rather than left looking implemented. The design says "The IV index is
+ * followed from the secure network beacons the nodes emit; we never start
+ * an IV update ourselves." The second half is true by construction — this
+ * app has no code that could start an IV Update procedure (Section 3.11.5
+ * "IV Update procedure"). The FIRST half is not implemented: a Secure
+ * Network beacon (Section 3.10.3 "Secure Network beacon": "The Secure
+ * Network beacon is used by nodes to identify the subnet and its security
+ * state.") arrives as a Proxy PDU with MessageType 0x01 (Table 6.3), and
+ * nothing here, or anywhere else in this app, decodes one — `proxyPdu.ts`
+ * classifies that type as unsupported and this module drops it. The stored
+ * `ivIndex` is therefore whatever pairing wrote and never moves.
+ * WHY THAT IS SAFE HERE, and the conditions under which it stops being
+ * safe: the IV Index is a network-wide value (Section 3.9.4 "IV Index":
+ * "The IV Index is a 32-bit value that is a shared network resource") that
+ * changes only through the IV Update procedure, which only a node already
+ * in the network can start. We own this network outright: three bulbs we
+ * provisioned ourselves, none of which is a Provisioner, and nothing in
+ * this app ever initiates an update. So the value this app wrote at
+ * pairing time is the value the network keeps. It stops being safe the
+ * moment a FOURTH party joins this network — another provisioner, a
+ * gateway, a node that itself starts an update — at which point every
+ * message this app sends would authenticate under the wrong IV Index and
+ * simply be dropped by every node, silently and permanently, until the app
+ * is re-paired. That is the failure to look for first if the whole mesh
+ * goes deaf at once after someone else touched it.
+ *
  * GATT SHAPE. Section 7.2.3 "Mesh Proxy Service characteristics", Table
  * 7.15: "Mesh Proxy Data In", Write Without Response, and "Mesh Proxy Data
  * Out", Notify — no acknowledgement at the GATT layer either way, which is
@@ -101,6 +146,13 @@
  */
 
 import { k3 } from '../mesh/crypto/derive';
+import {
+  acceptProxyPdu,
+  encodeProxyPdus,
+  PROXY_MESSAGE_TYPE_NETWORK_PDU,
+  PROXY_SAR_TIMEOUT_MS,
+  type ProxyReassemblyState,
+} from '../mesh/packet/proxyPdu';
 
 // Assigned Numbers, Section 3.4.1 "Services by Name": Mesh Proxy Service.
 export const MESH_PROXY_SERVICE_UUID = 0x1828;
@@ -258,6 +310,15 @@ export interface ProxyConnectionState {
   readonly peripheralId: string | null;
 }
 
+export interface ProxyConnectionOptions {
+  /** The maximum size of one outgoing Proxy PDU, header included. Defaults
+   *  to `MAX_PROXY_PDU_LENGTH`; see that constant for why it is an
+   *  engineering choice rather than a transcribed value, and why it is
+   *  injectable at all (a test that wants to observe segmentation, or to
+   *  avoid it, says so explicitly instead of depending on the default). */
+  readonly maxProxyPduLength?: number;
+}
+
 // --- Backoff schedule -------------------------------------------------
 //
 // Not a specification value — engineering choices, the same way store.ts's
@@ -293,6 +354,45 @@ function backoffDelayMs(failureStreak: number): number {
 // fake previously accepted and discarded `durationMs` entirely, so this
 // constant was never observed by anything).
 export const SCAN_DURATION_MS = 4000;
+
+/**
+ * The maximum size of ONE Proxy PDU this app writes, header included —
+ * Section 6.3 "Proxy PDU": "The size of the Proxy PDU is determined by the
+ * user of the Proxy protocol. For example, the GATT bearer defines the size
+ * of the Proxy PDU based on the ATT_MTU."
+ *
+ * NOT A SPECIFICATION VALUE — an engineering choice, the same way
+ * SCAN_DURATION_MS and the backoff constants above are, and the one in this
+ * module with the clearest route to being WRONG on hardware, so it is
+ * written down in full. What the specification does publish, and what it
+ * does not:
+ *   - Section 7.2.2.2.7 "ATT_MTU": "The server should support an ATT_MTU
+ *     size equal to or larger than 33 octets to be able to pass the content
+ *     of a full Proxy PDU (see Section 6.5)." That is a SHOULD on the
+ *     server, not a guarantee to the client, and an ATT_MTU of 33 leaves
+ *     exactly 30 octets of attribute value — one Proxy PDU header octet
+ *     plus the 29-octet maximum Network PDU that Table 3.10's own field
+ *     widths add up to (9 octets of header + a 16-octet maximum
+ *     TransportPDU + a 4-octet NetMIC).
+ *   - Section 5.2.2 "PB-GATT" states the consequence of a smaller one
+ *     plainly: "If the negotiated ATT_MTU is smaller than a required Proxy
+ *     PDU size, the transmission of the Mesh Provisioning Data In and Mesh
+ *     Provisioning Out characteristics always needs to be fragmented and
+ *     reassembled. Each PDU shall be fully reassembled before processing."
+ *   - Nothing in Mesh Protocol v1.1 fixes a minimum, because that belongs
+ *     to the Bluetooth Core Specification, which this project has not
+ *     fetched and therefore does not cite.
+ * Homey's own BLE API exposes no negotiated ATT_MTU at all (checked across
+ * `@types/homey`'s BleCharacteristic/BlePeripheral declarations: no MTU
+ * member of any kind), so this app cannot ask. 20 is therefore chosen as a
+ * deliberately pessimistic floor: small enough that it should fit any link
+ * a BLE stack will give us, at the cost of segmenting messages that a
+ * larger ATT_MTU would have carried whole. Segmenting unnecessarily is
+ * correct, just chattier; segmenting too little is a silently truncated or
+ * rejected write. ONE OF THE THINGS TO WATCH ON THE FIRST BULB: if traffic
+ * works but is slower than expected, this is the number to raise.
+ */
+export const MAX_PROXY_PDU_LENGTH = 20;
 
 interface ActiveConnection {
   readonly connection: ConnectionHandle;
@@ -340,11 +440,39 @@ export class ProxyConnectionManager {
    *  (nothing more should ever take effect); see the class doc comment. */
   private epoch = 0;
   private readonly notificationListeners = new Set<(data: Buffer) => void>();
+  /** The maximum size of one outgoing Proxy PDU, header included — see
+   *  MAX_PROXY_PDU_LENGTH. */
+  private readonly maxProxyPduLength: number;
+  /** The reassembly in progress on the Mesh Proxy Data Out characteristic,
+   *  if any (`proxyPdu.ts`'s own `undefined` convention). Reset whenever a
+   *  connection is established or torn down — a reassembly cannot survive
+   *  the link it was arriving over. */
+  private reassembly: ProxyReassemblyState | undefined;
+  /** Section 6.3.2.2's 20-second SAR transfer timeout. Armed when a
+   *  reassembly starts, cleared when it ends; a transfer that simply STOPS
+   *  arriving is invisible to `acceptProxyPdu`'s own on-arrival check, so
+   *  without this timer the specification's "when the timeout expires, the
+   *  Proxy PDU Client shall disconnect" would never fire at all. */
+  private sarTimer: TimerHandle | null = null;
+  /** True while a MULTI-PDU write is in flight — see `write` below. */
+  private segmentedWriteInFlight = false;
+  /** The reason for the most recent specification-mandated disconnect
+   *  (Section 6.3.2.2), or `null` if none has happened. Diagnostic only;
+   *  exposed so a test can assert WHY the link was dropped rather than
+   *  merely that it was. */
+  private lastProxyProtocolDisconnect: string | null = null;
 
-  constructor(bluetooth: BluetoothPort, clock: ClockPort, netKey: Buffer) {
+  constructor(bluetooth: BluetoothPort, clock: ClockPort, netKey: Buffer, options: ProxyConnectionOptions = {}) {
     if (netKey.length !== NET_KEY_LENGTH) {
       throw new Error(`ProxyConnectionManager: netKey must be ${NET_KEY_LENGTH} bytes, got ${netKey.length}`);
     }
+    const maxProxyPduLength = options.maxProxyPduLength ?? MAX_PROXY_PDU_LENGTH;
+    if (!Number.isInteger(maxProxyPduLength) || maxProxyPduLength < 2) {
+      throw new Error(
+        `ProxyConnectionManager: maxProxyPduLength must be an integer >= 2, got ${maxProxyPduLength}`,
+      );
+    }
+    this.maxProxyPduLength = maxProxyPduLength;
     this.bluetooth = bluetooth;
     this.clock = clock;
     // Copy before deriving: this module never retains a view into a buffer
@@ -364,6 +492,9 @@ export class ProxyConnectionManager {
    *  scheduled). Safe to call whether or not a connection is active. */
   stop(): void {
     this.epoch += 1;
+    // A reassembly cannot survive the link it was arriving over.
+    this.reassembly = undefined;
+    this.clearSarTimer();
     if (this.timer !== null) {
       this.clock.clearTimeout(this.timer);
       this.timer = null;
@@ -385,14 +516,62 @@ export class ProxyConnectionManager {
     return this.state;
   }
 
-  /** Writes to the active connection's Mesh Proxy Data In characteristic.
-   *  Rejects, naming why, when nothing is connected — there is no queue
-   *  here to hold the write for later (that is Task 5). */
+  /**
+   * Writes one complete NETWORK PDU to the active connection's Mesh Proxy
+   * Data In characteristic, wrapped in the Proxy PDU envelope and segmented
+   * across as many writes as `maxProxyPduLength` requires (Section 6.3.2.1
+   * "Segmentation", implemented in `proxyPdu.ts#encodeProxyPdus`). Callers
+   * hand over the bare Network PDU and never see the envelope — the queue
+   * above this module stays protocol-blind, as its own header requires.
+   * Rejects, naming why, when nothing is connected — there is no queue here
+   * to hold the write for later (that is the traffic queue's job).
+   *
+   * WHY A SECOND, OVERLAPPING SEGMENTED WRITE IS REFUSED RATHER THAN
+   * INTERLEAVED. Segments of one message must be "sent in order" (Section
+   * 6.3.2.1) and nothing else may arrive between them: a node that receives
+   * a first segment of message B in the middle of message A sees an
+   * unexpected SAR value and, per Section 6.3.2.2, disconnects. Callers
+   * here do not await each other — `TrafficQueue.attempt` deliberately
+   * fires `write()` without awaiting it, so a retry can begin while a
+   * previous, still-pending write holds the radio. Serialising instead of
+   * refusing would make the retry WAIT on a write that may never settle,
+   * silently converting a bounded retry into a hang; refusing hands the
+   * caller a rejection, which the queue already treats as "a reason to
+   * wait" and paces on its own timer. Single-PDU writes — every command
+   * this app sends when the link's ATT_MTU is generous — never set the
+   * flag, so this path costs nothing in the ordinary case.
+   */
   async write(data: Buffer): Promise<void> {
     if (this.active === null) {
       throw new Error('ProxyConnectionManager.write: no active proxy connection');
     }
-    await this.bluetooth.write(this.active.dataInHandle, Buffer.from(data));
+    const pdus = encodeProxyPdus(PROXY_MESSAGE_TYPE_NETWORK_PDU, data, this.maxProxyPduLength);
+    const handle = this.active.dataInHandle;
+    if (pdus.length === 1) {
+      await this.bluetooth.write(handle, pdus[0] as Buffer);
+      return;
+    }
+    if (this.segmentedWriteInFlight) {
+      throw new Error(
+        'ProxyConnectionManager.write: a segmented Proxy PDU write is already in flight; interleaving segments would make the node disconnect (Section 6.3.2.2)',
+      );
+    }
+    this.segmentedWriteInFlight = true;
+    try {
+      for (const pdu of pdus) {
+        await this.bluetooth.write(handle, pdu);
+      }
+    } finally {
+      this.segmentedWriteInFlight = false;
+    }
+  }
+
+  /** The reason for the most recent disconnect this module performed
+   *  because the specification required it (Section 6.3.2.2), or `null` if
+   *  that has never happened. Diagnostic only — nothing in the app's own
+   *  behaviour depends on it. */
+  getLastProxyProtocolDisconnect(): string | null {
+    return this.lastProxyProtocolDisconnect;
   }
 
   /** Registers a listener for every notification delivered on the Mesh
@@ -408,10 +587,82 @@ export class ProxyConnectionManager {
     };
   }
 
+  /**
+   * One notification on the Mesh Proxy Data Out characteristic — ONE Proxy
+   * PDU ("Each notification contains a single Proxy PDU." — Section 3.3.2
+   * "GATT bearer"), stripped of its envelope and reassembled before any
+   * listener sees it. Listeners only ever receive COMPLETE Network PDU
+   * messages: a mesh beacon or a proxy configuration message, both legal on
+   * this characteristic (Section 7.2.3.2.1 "Characteristic behavior"), is
+   * dropped here because nothing in this app consumes one — see the module
+   * header's IV INDEX note for the one design clause that rests on that.
+   */
   private handleNotification(data: Buffer): void {
-    for (const listener of this.notificationListeners) {
-      listener(Buffer.from(data));
+    const result = acceptProxyPdu(this.reassembly, data, this.clock.now());
+    switch (result.kind) {
+      case 'ignored':
+        this.reassembly = result.state;
+        return;
+      case 'incomplete':
+        this.reassembly = result.state;
+        this.armSarTimer();
+        return;
+      case 'disconnect':
+        this.disconnectOnProxyProtocolViolation(result.reason);
+        return;
+      case 'complete':
+        this.reassembly = undefined;
+        this.clearSarTimer();
+        if (result.messageType !== PROXY_MESSAGE_TYPE_NETWORK_PDU) return;
+        for (const listener of this.notificationListeners) {
+          listener(Buffer.from(result.message));
+        }
     }
+  }
+
+  /** (Re)arms the SAR transfer timeout for the reassembly now in progress.
+   *  Always restarted from the CURRENT segment rather than left running
+   *  from the first: `acceptProxyPdu` measures the real deadline from
+   *  `startedAtMs` and will reject a late segment on arrival regardless, so
+   *  this timer only has to guarantee that a transfer which stops arriving
+   *  is eventually noticed — it never shortens the real window. */
+  private armSarTimer(): void {
+    this.clearSarTimer();
+    this.sarTimer = this.clock.setTimeout(() => {
+      this.sarTimer = null;
+      if (this.reassembly === undefined) return;
+      this.disconnectOnProxyProtocolViolation(
+        'SAR transfer timed out (Section 6.3.2.2: the timeout for the SAR transfer is 20 seconds)',
+      );
+    }, PROXY_SAR_TIMEOUT_MS);
+  }
+
+  private clearSarTimer(): void {
+    if (this.sarTimer !== null) {
+      this.clock.clearTimeout(this.sarTimer);
+      this.sarTimer = null;
+    }
+  }
+
+  /**
+   * Section 6.3.2.2 "Reassembly" — the Proxy PDU Client "shall disconnect".
+   * Tears the active connection down exactly as a lost link would (same
+   * state, same rescan at the same backoff, so a protocol violation is
+   * recoverable rather than terminal) and records the reason for
+   * diagnostics. `scheduleNext` bumps the epoch, which is what stops the
+   * connection being torn down here from ever reporting anything later.
+   */
+  private disconnectOnProxyProtocolViolation(reason: string): void {
+    this.lastProxyProtocolDisconnect = reason;
+    this.reassembly = undefined;
+    this.clearSarTimer();
+    const active = this.active;
+    if (active === null) return;
+    this.active = null;
+    active.subscription.unsubscribe();
+    void this.bluetooth.disconnect(active.connection);
+    this.state = { status: 'unavailable', peripheralId: null };
+    this.scheduleNext(backoffDelayMs(this.failureStreak));
   }
 
   private scheduleNext(delayMs: number): void {
@@ -483,6 +734,10 @@ export class ProxyConnectionManager {
         return;
       }
 
+      // A fresh link starts with a clean reassembly, never whatever a
+      // previous one left half-arrived.
+      this.reassembly = undefined;
+      this.clearSarTimer();
       this.active = { connection, dataInHandle: dataIn.handle, subscription };
       this.state = { status: 'connected', peripheralId: candidate.peripheralId };
       this.onAttemptSettled(myEpoch, true);
@@ -505,6 +760,12 @@ export class ProxyConnectionManager {
 
   private handleDisconnect(): void {
     this.active = null;
+    // Same reason as `stop()`: a half-arrived message belongs to a link
+    // that no longer exists, and feeding its segments to the next
+    // connection's first notification would produce exactly the
+    // "unexpected SAR" state Section 6.3.2.2 disconnects over.
+    this.reassembly = undefined;
+    this.clearSarTimer();
     this.state = { status: 'unavailable', peripheralId: null };
     // failureStreak is 0 here: the connection that just dropped was itself
     // a SUCCESSFUL attempt, which reset it in onAttemptSettled. This is the

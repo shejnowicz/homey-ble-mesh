@@ -1,5 +1,13 @@
 import { randomBytes as nodeRandomBytes } from 'node:crypto';
 import {
+  acceptProxyPdu,
+  encodeProxyPdus,
+  PROXY_MESSAGE_TYPE_NETWORK_PDU,
+  PROXY_MESSAGE_TYPE_PROVISIONING_PDU,
+  type ProxyReassemblyState,
+} from '../../lib/mesh/packet/proxyPdu';
+import {
+  MAX_PROXY_PDU_LENGTH,
   MESH_PROVISIONING_DATA_IN_UUID,
   MESH_PROVISIONING_DATA_OUT_UUID,
   MESH_PROVISIONING_SERVICE_UUID,
@@ -16,7 +24,13 @@ import {
   type TimerHandle,
 } from '../../lib/adapter/connection';
 import { NetworkStore } from '../../lib/adapter/store';
-import { encodeMeshMessage, acceptIncomingPdu, type MeshReceiveState, type MeshReceiveContext } from '../../lib/mesh/packet/message';
+import {
+  encodeMeshMessage,
+  acceptIncomingPdu,
+  POINT_TO_POINT_TTL,
+  type MeshReceiveState,
+  type MeshReceiveContext,
+} from '../../lib/mesh/packet/message';
 import {
   beginProvisioning,
   step as provisioningStep,
@@ -72,13 +86,27 @@ import { mapCompositionToCapabilities, LIGHTING_SERVER_MODEL_IDS, type HomeyCapa
  * (`MESH_PROXY_DATA_IN/OUT_UUID`) to run the configuration exchange.
  * KNOWN SIMPLIFICATION, to verify on hardware: this assumes the node is
  * reachable again immediately, with no re-scan or settling delay between
- * disconnect and reconnect — consistent with this project's existing,
- * disclosed simplification that `connection.ts`/`queue.ts` write raw
- * Network PDU bytes directly to the Mesh Proxy Data In characteristic with
- * no Proxy PDU SAR/Message-Type envelope of their own (Section 6.3.1); if a
- * real bulb needs either a settling delay or that envelope, this is the
- * first place to look, the same way `machine.ts`'s own CMAC-only limitation
- * is documented as the first thing to suspect for a refused provisioning.
+ * disconnect and reconnect. If a real bulb needs a settling delay, this is
+ * the first place to look, the same way `machine.ts`'s own CMAC-only
+ * limitation is documented as the first thing to suspect for a refused
+ * provisioning.
+ *
+ * BOTH SESSIONS CARRY THE PROXY PDU ENVELOPE. This module used to write
+ * bare Provisioning PDUs and bare Network PDUs straight onto the Data In
+ * characteristics, disclosed as a simplification "to verify on hardware".
+ * That disclosure was wrong on its own terms — there was nothing to verify:
+ * Section 5.2.2 "PB-GATT" says it outright, "The Mesh Provisioning Data In
+ * and Mesh Provisioning Data Out characteristic formats use the Proxy PDU
+ * format defined in Section 6.3.1.", and Section 7.2.3.1 "Mesh Proxy Data
+ * In characteristic" says the same for the other pair, "The characteristic
+ * value has the same format as the Proxy PDU." `openSession` below now
+ * wraps and segments every write and reassembles every notification through
+ * `lib/mesh/packet/proxyPdu.ts`, with the MessageType each service's own
+ * behaviour clause prescribes (Provisioning PDU for the provisioning pair,
+ * Network PDU for the proxy pair — Table 6.3). This matters most for
+ * provisioning: a Provisioning Public Key PDU is 65 octets, far past one
+ * ATT write on a minimal link, so without segmentation the single most
+ * important message of the whole exchange could never arrive at all.
  *
  * RANDOMNESS ENTERS HERE. `machine.ts` deliberately takes its ephemeral ECDH
  * key pair and RandomProvisioner as caller-supplied inputs rather than
@@ -501,6 +529,7 @@ async function openSession(
   serviceUuid: number,
   dataInUuid: number,
   dataOutUuid: number,
+  messageType: number,
   clock: ClockPort,
   timeoutMs: number,
   stage: string,
@@ -528,9 +557,40 @@ async function openSession(
     );
   }
   const channel = new NotificationChannel();
-  await bounded(bluetooth.subscribe(dataOut.handle, (data) => channel.push(data)), `${stage}: subscribing to notifications`);
+  // THE PROXY PDU ENVELOPE, on both characteristic pairs — see the module
+  // header's own note. `reassembly` is this session's single in-flight
+  // reassembly (`proxyPdu.ts`'s `undefined` convention); it lives for the
+  // life of the connection and dies with it, because `openSession` is
+  // called once per connection and nothing here outlives that.
+  let reassembly: ProxyReassemblyState | undefined;
+  await bounded(
+    bluetooth.subscribe(dataOut.handle, (pdu) => {
+      const result = acceptProxyPdu(reassembly, pdu, clock.now());
+      reassembly = result.kind === 'incomplete' || result.kind === 'ignored' ? result.state : undefined;
+      // 'ignored' (an unsupported MessageType) and 'disconnect' (Section
+      // 6.3.2.2) both end here with nothing pushed: this session has no
+      // link of its own to drop — every one of its operations is already
+      // bounded by `timeoutMs` (see this function's own doc comment), so a
+      // violation surfaces as the stage timeout the caller already handles,
+      // naming the phase, rather than as a silent hang. That is why this
+      // session needs no SAR timer of its own either: 20 seconds is longer
+      // than any `timeoutMs` this project passes, so the stage timeout
+      // always fires first.
+      if (result.kind === 'complete' && result.messageType === messageType) channel.push(result.message);
+    }),
+    `${stage}: subscribing to notifications`,
+  );
   return {
-    write: (data: Buffer): Promise<void> => bounded(bluetooth.write(dataIn.handle, data), `${stage}: writing to the node`),
+    write: async (data: Buffer): Promise<void> => {
+      // Section 6.3.2.1 "Segmentation": the segments of one message are
+      // written in order, and nothing else goes out in between. This
+      // session is strictly request/response (`runProvisioningExchange`
+      // and `sendConfigRequest` both await each write), so there is no
+      // concurrent writer to interleave with.
+      for (const pdu of encodeProxyPdus(messageType, data, MAX_PROXY_PDU_LENGTH)) {
+        await bounded(bluetooth.write(dataIn.handle, pdu), `${stage}: writing to the node`);
+      }
+    },
     next: (): Promise<Buffer> => bounded(channel.next(), `${stage} stalled`),
     disconnect: (): Promise<void> => bounded(bluetooth.disconnect(connection), `${stage}: disconnecting`),
   };
@@ -551,6 +611,12 @@ export function connectForProvisioning(
     MESH_PROVISIONING_SERVICE_UUID,
     MESH_PROVISIONING_DATA_IN_UUID,
     MESH_PROVISIONING_DATA_OUT_UUID,
+    // Table 6.3: this pair carries Provisioning PDUs and nothing else —
+    // Section 7.1.3.1.1 "Characteristic behavior": "The Mesh Provisioning
+    // Data In characteristic shall support Proxy PDU messages containing
+    // Provisioning PDUs and shall not support other Proxy PDU type
+    // messages."
+    PROXY_MESSAGE_TYPE_PROVISIONING_PDU,
     clock,
     timeoutMs,
     'provisioning',
@@ -574,6 +640,8 @@ export function connectForConfiguration(
     MESH_PROXY_SERVICE_UUID,
     MESH_PROXY_DATA_IN_UUID,
     MESH_PROXY_DATA_OUT_UUID,
+    // Table 6.3: the configuration exchange rides ordinary Network PDUs.
+    PROXY_MESSAGE_TYPE_NETWORK_PDU,
     clock,
     timeoutMs,
     'configuration exchange',
@@ -650,6 +718,11 @@ async function sendConfigRequest(input: ConfigExchangeInput, accessPayload: Buff
     dst: input.nodeAddress,
     netKey: input.netKey,
     ivIndex: input.ivIndex,
+    // The one exchange in this app that genuinely IS point-to-point: this
+    // session holds its own GATT connection to the very node it is
+    // configuring, so there is nothing for a relay to do. See `message.ts`'s
+    // own TTL note for why this is now spelled out rather than defaulted.
+    ttl: POINT_TO_POINT_TTL,
     allocateSeq: input.allocateSeq,
   });
   for (const pdu of pdus) await input.session.write(pdu);

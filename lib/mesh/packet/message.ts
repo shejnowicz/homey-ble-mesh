@@ -83,9 +83,21 @@ const MAX_SEQ_ZERO_MASK = 0x1fff;
  *
  * KEY KIND. Config messages (Composition Data Get/Status, AppKey Add/
  * Status, Model App Bind/Status, Node Reset/Status) are ALWAYS secured with
- * the DEVICE KEY, never an application key — Section 4.3.1 "Model
- * behaviour": "A model shall... use a device key... for the Config model".
- * `drivers/light/pairing.ts`, this module's only caller so far, therefore
+ * the DEVICE KEY, never an application key. CITATION CORRECTED in the final
+ * fix wave: this comment used to cite `Section 4.3.1 "Model behaviour"` and
+ * quote "A model shall... use a device key... for the Config model". Both
+ * were wrong — Section 4.3.1 is "Supplemental parameter requirements", and
+ * that sentence appears nowhere in Mesh Protocol v1.1 (searched: neither
+ * "A model shall" nor "for the Config model" occurs in the document). The
+ * real statements are one per side of the exchange, each in that model's
+ * own Description subsection: Section 4.4.1.1 "Description" (under 4.4.1
+ * "Configuration Server model") — "The access layer security on the
+ * Configuration Server model shall use the device key." — and Section
+ * 4.4.2.1 "Description" (under 4.4.2 "Configuration Client model"), which
+ * is the role THIS app plays — "The access layer security on the
+ * Configuration Client model shall use the device key of the node
+ * supporting the Configuration Server model."
+ * `drivers/light/pairing.ts`, this module's first caller, therefore
  * only ever passes `keyKind: 'device'`; `keyKind: 'application'` is wired
  * through end to end anyway (not hardcoded to 'device') because the SAME
  * composition this module performs is exactly what a later task's device
@@ -93,11 +105,66 @@ const MAX_SEQ_ZERO_MASK = 0x1fff;
  * branch unexercised until that task is honestly disclosed below and in the
  * report, not hidden.
  *
- * TTL. `DEFAULT_CONFIG_TTL = 0` ("message shall not be relayed", Table
- * 3.67) — both parties in every exchange this module drives are the SAME
- * two nodes physically linked by the one GATT connection in use (us and the
- * node we are pairing/configuring), so there is nothing for a relay to do
- * and no reason to ask for one.
+ * TTL, AND THE DEFECT THAT HID BEHIND ITS OLD CITATION. This module used to
+ * carry one TTL constant, `DEFAULT_CONFIG_TTL = 0`, justified by a quoted
+ * "message shall not be relayed" attributed to Table 3.67. BOTH HALVES WERE
+ * WRONG. Table 3.67 is "CTL and TTL field format" — the two-field layout of
+ * one octet of the Network nonce (Section 3.9.5.1 "Network nonce") — and it
+ * says nothing about relaying at all; its TTL row's whole content is "See
+ * Section 3.4.4.4". And the quoted sentence appears nowhere in Mesh
+ * Protocol v1.1 (searched: "message shall not be relayed" has zero
+ * occurrences). The real source is Table 3.12 "TTL field values" (Section
+ * 3.4.4.4 "TTL"), whose first row reads, verbatim:
+ *
+ *     0 | Network PDU has not been relayed and will not be relayed.
+ *
+ * which is exactly why 0 was the right value for the exchange this module
+ * was FIRST written for, and exactly why it was the wrong one everywhere
+ * else: the device layer later reused this same encoder for lighting
+ * commands that must cross the mesh, and silently inherited a default that
+ * guarantees no node will ever forward them. A command for any bulb other
+ * than the one currently holding the GATT connection simply never arrived.
+ * A fabricated citation and the defect it was defending turned out to be
+ * the same mistake.
+ *
+ * SO THERE ARE NOW TWO CONSTANTS, and callers choose:
+ *   - `POINT_TO_POINT_TTL = 0` for the pairing and configuration session,
+ *     which genuinely is point-to-point — both parties are the SAME two
+ *     nodes physically linked by the one GATT connection in use (us and the
+ *     node we are pairing/configuring), so there is nothing for a relay to
+ *     do. Table 3.12's own note on that row says the same thing from the
+ *     receiver's side: "The use of the TTL value of zero allows a node to
+ *     transmit a Network PDU that it knows will not be relayed, and
+ *     therefore the receiving node can determine that the sending node is a
+ *     single radio link away."
+ *   - `RELAYED_TTL = 0x7F` for everything that has to reach a node we are
+ *     not connected to — the design's own "The bulbs relay for each other
+ *     without our help."
+ *
+ * WHERE 0x7F COMES FROM, stated carefully because the obvious answer does
+ * not exist. Mesh Protocol v1.1 defines a Default TTL STATE (Section 4.2.8
+ * "Default TTL": "The Default TTL state determines the TTL value used when
+ * sending messages.") and gives its permitted values in Table 4.23 "Default
+ * TTL values" — "0x00, 0x02–0x7F | The Default TTL state" and "0x01,
+ * 0x80–0xFF | Prohibited" — but it publishes NO numeric default for it.
+ * That is a checked negative, not an assumption: the document states its
+ * own convention for such a thing (Section 4.2 "State definitions": "If a
+ * default value is defined for a state, it represents the value of the
+ * state of the node immediately after the node is provisioned"), uses the
+ * phrase "The default value of the X state is ..." for dozens of other
+ * states, and uses it for the Default TTL state nowhere. So there is no
+ * published number to transcribe FOR THE DEFAULT, and the value here is
+ * instead transcribed from the only row of Table 3.12 that describes a
+ * freshly-originated, fully relayable message:
+ *
+ *     127 | Network PDU has not been relayed and can be relayed.
+ *
+ * 127 is 0x7F: the largest value the field can hold (Section 3.4.4.4: "The
+ * TTL field is a 7-bit field."), inside Table 4.23's permitted range, and
+ * the maximum reach the specification offers — which for three bulbs in one
+ * building is simply "as far as it ever needs to go". Being generous here
+ * costs nothing: TTL bounds how far a message may travel, and this network
+ * has no distant parts to protect from it.
  *
  * NULLISH CONVENTION: `null` for "no Service Data of interest" is
  * connection.ts's own convention (`findServiceData`); this module instead
@@ -110,9 +177,19 @@ const MAX_SEQ_ZERO_MASK = 0x1fff;
  * and writes through this function with no translation in between.
  */
 
-/** Table 3.67: TTL=0 means "this message shall not be relayed" — see the
- *  module header's TTL note for why that is always the right value here. */
-export const DEFAULT_CONFIG_TTL = 0;
+/** Table 3.12 "TTL field values", row 0, verbatim: "Network PDU has not
+ *  been relayed and will not be relayed." The right value ONLY for an
+ *  exchange whose two parties are the two ends of one GATT link — see the
+ *  module header's TTL note. */
+export const POINT_TO_POINT_TTL = 0;
+
+/** Table 3.12 "TTL field values", row 127, verbatim: "Network PDU has not
+ *  been relayed and can be relayed." Everything that has to reach a node
+ *  this app is not itself connected to — see the module header's TTL note
+ *  for why this is transcribed from Table 3.12 rather than from a published
+ *  Default TTL default, which Mesh Protocol v1.1 does not have. */
+export const RELAYED_TTL = 0x7f;
+
 
 export interface MeshMessageKey {
   /** 128-bit application key or device key. */
@@ -133,7 +210,15 @@ export interface EncodeMeshMessageInput extends MeshMessageKey {
   readonly dst: number;
   readonly netKey: Buffer;
   readonly ivIndex: number;
-  readonly ttl?: number; // default DEFAULT_CONFIG_TTL
+  /**
+   * REQUIRED, with no default — see the module header's TTL note. This used
+   * to be optional and fall back to 0, and that fallback is exactly how
+   * every lighting command and every node reset went out unrelayable: a
+   * second caller adopted the encoder without ever naming a TTL, and
+   * nothing made it choose. `POINT_TO_POINT_TTL` and `RELAYED_TTL` are the
+   * two answers; there is no third, and no silent one.
+   */
+  readonly ttl: number;
   /** Hands out the next sequence number — see the module header's SEQUENCE
    *  NUMBERS note for why this must be called exactly once per Network PDU
    *  this function sends, never computed by hand. */
@@ -151,7 +236,7 @@ export interface EncodeMeshMessageInput extends MeshMessageKey {
  * the longer one.
  */
 export function encodeMeshMessage(input: EncodeMeshMessageInput): Buffer[] {
-  const ttl = input.ttl ?? DEFAULT_CONFIG_TTL;
+  const ttl = input.ttl;
   const akf = input.keyKind === 'application';
   const aid = akf ? (input.aid ?? 0) : 0;
 

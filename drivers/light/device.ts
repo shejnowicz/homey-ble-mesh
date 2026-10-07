@@ -32,7 +32,12 @@
 // only capability handled that way; see meshLight.ts's own module header
 // for why (no wire traffic, nothing to gate under the testable seam).
 import Homey from 'homey';
-import { MeshLightController, type DeviceCapabilityPort, type MeshTrafficPort } from './meshLight';
+import {
+  MeshLightController,
+  type DeviceCapabilityPort,
+  type MeshClockPort,
+  type MeshTrafficPort,
+} from './meshLight';
 import type { NetworkStore } from '../../lib/adapter/store';
 
 /** What `app.ts`'s `BleMeshApp` exposes in-process. `getMeshContext()`
@@ -42,7 +47,7 @@ import type { NetworkStore } from '../../lib/adapter/store';
  *  app.ts/device.ts already rely on) — handled defensively here anyway
  *  rather than assumed away. */
 export interface BleMeshAppHost {
-  getMeshContext(): { readonly store: NetworkStore; readonly queue: MeshTrafficPort } | null;
+  getMeshContext(): { readonly store: NetworkStore; readonly queue: MeshTrafficPort; readonly clock: MeshClockPort } | null;
   /** Registers a controller to receive `onConnectionStateChange` calls
    *  whenever the shared proxy connection's status changes. Returns an
    *  unsubscribe function — called from `onUninit` below so a removed or
@@ -81,6 +86,10 @@ class LightDevice extends Homey.Device {
     const controller = new MeshLightController({
       queue: context.queue,
       store: context.store,
+      // The app's own single real clock — the controller needs `now()` to
+      // rate-limit its re-read retries (meshLight.ts's own "ONE UNREACHABLE
+      // BULB" note), and this file is not allowed to own wall-clock time.
+      clock: context.clock,
       device: capabilityPort(this),
       address,
     });

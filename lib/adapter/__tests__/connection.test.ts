@@ -6,6 +6,7 @@ import {
   MESH_PROXY_DATA_IN_UUID,
   MESH_PROXY_DATA_OUT_UUID,
   MESH_PROVISIONING_SERVICE_UUID,
+  MAX_PROXY_PDU_LENGTH,
   SCAN_DURATION_MS,
   findServiceData,
   type BluetoothPort,
@@ -15,6 +16,7 @@ import {
 } from '../connection';
 import { FakeBluetoothPort } from './fakeBluetooth';
 import { createFakeClock } from './fakeClock';
+import { PROXY_SAR_TIMEOUT_MS } from '../../mesh/packet/proxyPdu';
 import { NETWORK_ID_ADVERTISING_SAMPLE, hex } from './vectors';
 
 /**
@@ -195,6 +197,80 @@ describe('selection', () => {
     await clock.advance(0);
 
     expect(bluetooth.connectCalls).toEqual(['ours']);
+  });
+
+  /**
+   * REVIEW FINDING (final wave): the identity comparison itself was
+   * weakenable three ways with the whole suite green — compare only
+   * `serviceData[1]`, compare only a leading PREFIX, or relax the length
+   * check to `>=` — because the one negative case above ("a foreign
+   * network") uses a WHOLLY DIFFERENT key, whose derived Network ID
+   * differs in essentially every byte. A test that a single-byte
+   * comparison already passes cannot be the thing protecting this check.
+   *
+   * TWO near misses are needed, not one, because the two weakenings differ
+   * in WHERE they stop looking, and each is built from our own genuine
+   * Network ID with the correct identification type and the correct length:
+   *   - `head-match` shares the LEADING byte and differs from the second
+   *     octet onward, so a comparison that stops after one byte accepts it;
+   *   - `tail-differs` is our Network ID with only its LAST byte changed, so
+   *     any comparison over a prefix — of any length short of the whole —
+   *     accepts it.
+   * Both were MEASURED: before `tail-differs` existed, replacing the check
+   * with a four-octet prefix comparison passed the entire suite.
+   *
+   * The length check is a different story, recorded honestly rather than
+   * padded with a test that cannot fail: relaxing `!==` to `<` is
+   * BEHAVIOUR-PRESERVING here, because `Buffer.equals` compares lengths
+   * too, so an over-long advertisement is rejected by the byte comparison
+   * whether or not the length check ran. `too-long` below is kept as the
+   * case that shows that, not as a pin on the length check itself.
+   *
+   * This is the design's own explicit neighbour-protection clause ("checks
+   * that the advertised network identity derives from *our* network key so
+   * a neighbour's installation can never be mistaken for ours"), held by
+   * cases that can actually discriminate.
+   */
+  test('near-miss identities — one sharing our leading byte, one differing only in its last — are both rejected', async () => {
+    const ourKey = randomBytes(16);
+    const ourNetworkId = k3(ourKey);
+
+    const headMatch = Buffer.from(ourNetworkId);
+    for (let i = 1; i < headMatch.length; i += 1) headMatch[i] = (headMatch[i] as number) ^ 0xff;
+    expect(headMatch[0]).toBe(ourNetworkId[0]);
+    expect(headMatch.equals(ourNetworkId)).toBe(false);
+
+    const tailDiffers = Buffer.from(ourNetworkId);
+    const last = tailDiffers.length - 1;
+    tailDiffers[last] = (tailDiffers[last] as number) ^ 0xff;
+    expect(tailDiffers.subarray(0, last).equals(ourNetworkId.subarray(0, last))).toBe(true);
+    expect(tailDiffers.equals(ourNetworkId)).toBe(false);
+
+    const { bluetooth, clock, manager } = setUp(ourKey);
+    // Both stronger than the genuine node, so either one being accepted
+    // changes which peripheral is connected to.
+    bluetooth.addNode({
+      id: 'head-match',
+      rssi: -10,
+      serviceDataOverride: Buffer.concat([Buffer.from([0x00]), headMatch]),
+    });
+    bluetooth.addNode({
+      id: 'tail-differs',
+      rssi: -12,
+      serviceDataOverride: Buffer.concat([Buffer.from([0x00]), tailDiffers]),
+    });
+    bluetooth.addNode({
+      id: 'too-long',
+      rssi: -15,
+      serviceDataOverride: Buffer.concat([Buffer.from([0x00]), ourNetworkId, Buffer.from([0x5a])]),
+    });
+    bluetooth.addNode({ id: 'ours', rssi: -60, networkKey: ourKey });
+
+    manager.start();
+    await clock.advance(0);
+
+    expect(bluetooth.connectCalls).toEqual(['ours']);
+    expect(manager.getState()).toEqual({ status: 'connected', peripheralId: 'ours' });
   });
 
   test('a node advertising no Mesh Proxy Service data at all is never selected', async () => {
@@ -481,6 +557,258 @@ describe('epoch guards against stale or superseded port callbacks', () => {
   });
 });
 
+/**
+ * THE PROXY PDU ENVELOPE, at the layer that actually drives the radio —
+ * `lib/mesh/packet/__tests__/proxyPdu.test.ts` pins the bytes against the
+ * transcribed tables; these pin that this module USES them, in both
+ * directions, and that it does what Section 6.3.2.2 says when a peer
+ * violates the protocol.
+ *
+ * The defect these close: every write this app made carried a BARE Network
+ * PDU, and every notification was handed to listeners as if it were bare.
+ * Both halves passed 889 tests, because the fake recorded whatever it was
+ * given — which is why `fakeBluetooth.ts` now speaks the protocol too (see
+ * its own module header).
+ */
+describe('the Proxy PDU envelope (Section 6.3 "Proxy PDU")', () => {
+  test('a write that fits goes out as ONE Proxy PDU: SAR 0b00, MessageType 0x00 (Network PDU), then the PDU itself', async () => {
+    const netKey = randomBytes(16);
+    const { bluetooth, clock, manager } = setUp(netKey);
+    bluetooth.addNode({ id: 'A', rssi: -50, networkKey: netKey });
+    manager.start();
+    await clock.advance(0);
+
+    await manager.write(Buffer.from([0xde, 0xad, 0xbe, 0xef]));
+
+    // The literal header octet, written out rather than computed: Table 6.2
+    // SAR 0b00 ("Data field contains a complete message") in the two most
+    // significant bits, Table 6.3 MessageType 0x00 ("Network PDU") in the
+    // remaining six.
+    expect(bluetooth.rawWritesReceived.map((w) => w.data.toString('hex'))).toEqual(['00deadbeef']);
+    // ...and the node reassembles it back to exactly what we asked to send.
+    expect(bluetooth.writesReceived.map((w) => w.data.toString('hex'))).toEqual(['deadbeef']);
+    expect(bluetooth.writesReceived[0]?.messageType).toBe(0x00);
+  });
+
+  test('a write larger than one Proxy PDU is segmented in order, filling every PDU but the last', async () => {
+    const netKey = randomBytes(16);
+    const bluetooth = new FakeBluetoothPort();
+    const clock = createFakeClock();
+    // A deliberately tiny PDU size so the segmentation is small enough to
+    // write out byte for byte: 1 header octet + 3 data octets.
+    const manager = new ProxyConnectionManager(bluetooth, clock, netKey, { maxProxyPduLength: 4 });
+    bluetooth.addNode({ id: 'A', rssi: -50, networkKey: netKey });
+    manager.start();
+    await clock.advance(0);
+
+    const message = Buffer.from([0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07]);
+    await manager.write(message);
+
+    expect(bluetooth.rawWritesReceived.map((w) => w.data.toString('hex'))).toEqual([
+      '40010203', // 0b01_000000: first segment
+      '80040506', // 0b10_000000: continuation segment
+      'c007', //     0b11_000000: last segment, not filled
+    ]);
+    // Every segment went to the Data In characteristic, not the notify one.
+    for (const write of bluetooth.rawWritesReceived) {
+      expect(write.characteristicUuid).toBe(MESH_PROXY_DATA_IN_UUID);
+    }
+    // The node's own reassembly produces exactly the message we handed in —
+    // one logical message, not three.
+    expect(bluetooth.writesReceived.map((w) => w.data.toString('hex'))).toEqual([message.toString('hex')]);
+  });
+
+  test('a message arriving in several notifications reaches the listener ONCE, whole', async () => {
+    const netKey = randomBytes(16);
+    const bluetooth = new FakeBluetoothPort();
+    const clock = createFakeClock();
+    const manager = new ProxyConnectionManager(bluetooth, clock, netKey, { maxProxyPduLength: 4 });
+    bluetooth.addNode({ id: 'A', rssi: -50, networkKey: netKey });
+    manager.start();
+    await clock.advance(0);
+
+    const received: Buffer[] = [];
+    manager.onNotification((data) => received.push(data));
+
+    // Three raw PDUs on the wire, each one its own notification.
+    bluetooth.simulateRawNotification('A', Buffer.from([0x40, 0x11, 0x22]));
+    expect(received).toHaveLength(0); // nothing delivered mid-message
+    bluetooth.simulateRawNotification('A', Buffer.from([0x80, 0x33, 0x44]));
+    expect(received).toHaveLength(0);
+    bluetooth.simulateRawNotification('A', Buffer.from([0xc0, 0x55]));
+
+    expect(received.map((b) => b.toString('hex'))).toEqual(['1122334455']);
+  });
+
+  test('a notification that is not a Network PDU (a mesh beacon) is never delivered to a listener', async () => {
+    const netKey = randomBytes(16);
+    const { bluetooth, clock, manager } = setUp(netKey);
+    bluetooth.addNode({ id: 'A', rssi: -50, networkKey: netKey });
+    manager.start();
+    await clock.advance(0);
+
+    const received: Buffer[] = [];
+    manager.onNotification((data) => received.push(data));
+    // 0b00_000001: a complete message of MessageType 0x01, "Mesh Beacon"
+    // (Table 6.3) — legal on this characteristic, and consumed by nothing
+    // in this app (see connection.ts's own IV INDEX note).
+    bluetooth.simulateRawNotification('A', Buffer.from([0x01, 0xaa, 0xbb]));
+
+    expect(received).toEqual([]);
+    expect(manager.getState().status).toBe('connected'); // ignored, not disconnected over
+  });
+
+  test('an unexpected SAR value disconnects the link and rescans, naming why (Section 6.3.2.2)', async () => {
+    const netKey = randomBytes(16);
+    const { bluetooth, clock, manager } = setUp(netKey);
+    bluetooth.addNode({ id: 'A', rssi: -50, networkKey: netKey });
+    manager.start();
+    await clock.advance(0);
+    expect(manager.getState()).toEqual({ status: 'connected', peripheralId: 'A' });
+
+    const received: Buffer[] = [];
+    manager.onNotification((data) => received.push(data));
+    // 0b10_000000: a continuation segment with nothing being reassembled.
+    bluetooth.simulateRawNotification('A', Buffer.from([0x80, 0x01]));
+
+    expect(manager.getState()).toEqual({ status: 'unavailable', peripheralId: null });
+    expect(manager.getLastProxyProtocolDisconnect()).toMatch(/unexpected SAR value 0b10/);
+    expect(received).toEqual([]);
+
+    // Recoverable, not terminal: the ordinary rescan brings the link back.
+    await clock.advance(0);
+    expect(manager.getState()).toEqual({ status: 'connected', peripheralId: 'A' });
+  });
+
+  test('a reassembly that simply stops arriving disconnects after the 20-second SAR timeout', async () => {
+    const netKey = randomBytes(16);
+    const { bluetooth, clock, manager } = setUp(netKey);
+    bluetooth.addNode({ id: 'A', rssi: -50, networkKey: netKey });
+    manager.start();
+    await clock.advance(0);
+
+    bluetooth.simulateRawNotification('A', Buffer.from([0x40, 0x11])); // a first segment, then silence
+
+    await clock.advance(PROXY_SAR_TIMEOUT_MS - 1);
+    expect(manager.getState().status).toBe('connected'); // still waiting, correctly
+
+    await clock.advance(1);
+    expect(manager.getLastProxyProtocolDisconnect()).toMatch(/SAR transfer timed out/);
+    // The rescan this schedules reconnects on the same tick, so the
+    // observable proof the link was dropped is the recorded reason above
+    // plus the second connect attempt below.
+    expect(bluetooth.connectCalls).toEqual(['A', 'A']);
+  });
+
+  test('a completed message cancels the SAR timeout rather than leaving it to fire later', async () => {
+    const netKey = randomBytes(16);
+    const { bluetooth, clock, manager } = setUp(netKey);
+    bluetooth.addNode({ id: 'A', rssi: -50, networkKey: netKey });
+    manager.start();
+    await clock.advance(0);
+
+    bluetooth.simulateRawNotification('A', Buffer.from([0x40, 0x11]));
+    bluetooth.simulateRawNotification('A', Buffer.from([0xc0, 0x22]));
+
+    await clock.advance(PROXY_SAR_TIMEOUT_MS * 2);
+    expect(manager.getLastProxyProtocolDisconnect()).toBeNull();
+    expect(bluetooth.connectCalls).toEqual(['A']); // never dropped, never re-attempted
+  });
+
+  test('a disconnection abandons a half-arrived message rather than carrying it into the next link', async () => {
+    const netKey = randomBytes(16);
+    const { bluetooth, clock, manager } = setUp(netKey);
+    bluetooth.addNode({ id: 'A', rssi: -50, networkKey: netKey });
+    manager.start();
+    await clock.advance(0);
+
+    bluetooth.simulateRawNotification('A', Buffer.from([0x40, 0x11])); // first segment, then the link drops
+    bluetooth.simulateDisconnect('A');
+    await clock.advance(0); // reconnects
+
+    const received: Buffer[] = [];
+    manager.onNotification((data) => received.push(data));
+    // On the NEW link, a fresh complete message. If the old reassembly had
+    // survived, this would be "a complete message mid-reassembly" and the
+    // manager would disconnect over it instead of delivering it.
+    bluetooth.simulateRawNotification('A', Buffer.from([0x00, 0x99]));
+
+    expect(received.map((b) => b.toString('hex'))).toEqual(['99']);
+    expect(manager.getLastProxyProtocolDisconnect()).toBeNull();
+  });
+
+  test('a second segmented write while one is still in flight is refused rather than interleaved', async () => {
+    const netKey = randomBytes(16);
+    const bluetooth = new FakeBluetoothPort();
+    const clock = createFakeClock();
+    const manager = new ProxyConnectionManager(bluetooth, clock, netKey, { maxProxyPduLength: 4 });
+    bluetooth.addNode({ id: 'A', rssi: -50, networkKey: netKey });
+    manager.start();
+    await clock.advance(0);
+    bluetooth.setWriteBehavior('A', 'hold');
+
+    const first = manager.write(Buffer.from([0x01, 0x02, 0x03, 0x04]));
+    const firstRejection = expect(first).rejects.toThrow(/held/); // settled at the end of this test
+    await Promise.resolve();
+
+    await expect(manager.write(Buffer.from([0x05, 0x06, 0x07, 0x08]))).rejects.toThrow(
+      /a segmented Proxy PDU write is already in flight/,
+    );
+    // The held message's own first segment is the only thing on the wire —
+    // no segment of the second message got in between.
+    expect(bluetooth.rawWritesReceived.map((w) => w.data.toString('hex'))).toEqual(['40010203']);
+
+    bluetooth.releaseWrite('A', 0, { ok: false, err: new Error('held write abandoned') });
+    await firstRejection;
+  });
+
+  test('a single-PDU write is never refused, however many are already pending', async () => {
+    const netKey = randomBytes(16);
+    const { bluetooth, clock, manager } = setUp(netKey);
+    bluetooth.addNode({ id: 'A', rssi: -50, networkKey: netKey });
+    manager.start();
+    await clock.advance(0);
+    bluetooth.setWriteBehavior('A', 'hold');
+
+    const a = manager.write(Buffer.from([0x01]));
+    const b = manager.write(Buffer.from([0x02]));
+    const settled = Promise.all([
+      expect(a).rejects.toThrow('abandoned a'),
+      expect(b).rejects.toThrow('abandoned b'),
+    ]);
+    await Promise.resolve();
+
+    expect(bluetooth.rawWritesReceived.map((w) => w.data.toString('hex'))).toEqual(['0001', '0002']);
+    bluetooth.releaseWrite('A', 0, { ok: false, err: new Error('abandoned a') });
+    bluetooth.releaseWrite('A', 1, { ok: false, err: new Error('abandoned b') });
+    await settled;
+  });
+
+  test('rejects a maxProxyPduLength that leaves no room for Data, naming it', () => {
+    const bluetooth = new FakeBluetoothPort();
+    const clock = createFakeClock();
+    expect(() => new ProxyConnectionManager(bluetooth, clock, randomBytes(16), { maxProxyPduLength: 1 })).toThrow(
+      'ProxyConnectionManager: maxProxyPduLength must be an integer >= 2, got 1',
+    );
+  });
+
+  test('MAX_PROXY_PDU_LENGTH is the documented conservative floor, and is what the manager uses by default', async () => {
+    expect(MAX_PROXY_PDU_LENGTH).toBe(20);
+
+    const netKey = randomBytes(16);
+    const { bluetooth, clock, manager } = setUp(netKey);
+    bluetooth.addNode({ id: 'A', rssi: -50, networkKey: netKey });
+    manager.start();
+    await clock.advance(0);
+
+    // Exactly one octet more than the default allows in a single PDU, so
+    // the default itself is what decides this is two writes rather than one.
+    await manager.write(Buffer.alloc(MAX_PROXY_PDU_LENGTH, 0x7e));
+    expect(bluetooth.rawWritesReceived).toHaveLength(2);
+    expect(bluetooth.rawWritesReceived[0]?.data).toHaveLength(MAX_PROXY_PDU_LENGTH);
+  });
+});
+
 describe('write and notifications', () => {
   test('write() rejects, naming why, when nothing is connected', async () => {
     const { manager } = setUp(randomBytes(16));
@@ -573,10 +901,13 @@ describe('write and notifications', () => {
 
     expect(captured).not.toBeNull();
     expect(captured).not.toBe(original); // a distinct Buffer instance...
-    expect((captured as unknown as Buffer).equals(original)).toBe(true); // ...with the same bytes
+    // ...carrying the Proxy PDU envelope around those same bytes: SAR 0b00
+    // (a complete message, Table 6.2) and MessageType 0x00 (Network PDU,
+    // Table 6.3) pack to 0x00, followed by the Network PDU itself.
+    expect((captured as unknown as Buffer).toString('hex')).toBe('00010203');
 
     original.fill(0xff); // mutate the CALLER's own buffer after the call returns
-    expect((captured as unknown as Buffer).equals(Buffer.from([0x01, 0x02, 0x03]))).toBe(true); // unaffected
+    expect((captured as unknown as Buffer).toString('hex')).toBe('00010203'); // unaffected
   });
 
   test('a Data Out notification is delivered to a registered listener', async () => {

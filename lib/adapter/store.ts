@@ -81,6 +81,20 @@ export interface NetworkState {
   readonly netKeyIndex: number | null;
   readonly appKey: Buffer | null;
   readonly appKeyIndex: number | null;
+  /**
+   * NOTHING IN THIS APP EVER CHANGES THIS AFTER PAIRING WRITES IT, and that
+   * is a design clause deliberately not implemented rather than an
+   * oversight — stated here as well as at the one place that could have
+   * implemented it, because this is where a reader would otherwise assume
+   * it was being kept up to date. The design says "The IV index is followed
+   * from the secure network beacons the nodes emit; we never start an IV
+   * update ourselves." The second half holds by construction. The first
+   * half does not: a Secure Network beacon arrives as a Proxy PDU of
+   * MessageType 0x01 and nothing decodes one. See
+   * `lib/adapter/connection.ts`'s own "IV INDEX" note for why that is safe
+   * for a network we own outright, and for the single condition that would
+   * make it unsafe.
+   */
   readonly ivIndex: number;
   readonly ourUnicastAddress: number | null;
   readonly nextUnicastAddress: number;

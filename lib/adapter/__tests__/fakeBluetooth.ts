@@ -81,10 +81,49 @@
  * open for, and no reconnect timing to get right. None of its required
  * test scenarios exercise any of the four, so none are touched here; they
  * remain exactly as documented for whichever task next needs one.
+ *
+ * THIS FAKE SPEAKS THE PROXY PDU PROTOCOL (final fix wave). A real bulb
+ * never sees a bare Network PDU or a bare Provisioning PDU: both
+ * characteristic pairs carry the Proxy PDU envelope (Mesh Protocol v1.1
+ * Section 7.2.3.1 "Mesh Proxy Data In characteristic": "The characteristic
+ * value has the same format as the Proxy PDU."; Section 5.2.2 "PB-GATT":
+ * "The Mesh Provisioning Data In and Mesh Provisioning Data Out
+ * characteristic formats use the Proxy PDU format defined in Section
+ * 6.3.1."). Before this round this fixture accepted and recorded whatever
+ * bytes it was handed, which is precisely why an app that sent no envelope
+ * at all passed 889 tests. It now behaves like the Proxy PDU Server it is
+ * pretending to be:
+ *   - `write()` feeds every PDU through `proxyPdu.ts#acceptProxyPdu`, per
+ *     (peripheral, characteristic), and only records a COMPLETE message in
+ *     `writesReceived` — so every existing assertion on that array keeps
+ *     meaning "one entry per logical message", segmented or not, and an
+ *     `AutoResponder` is still called once per logical message;
+ *     `rawWritesReceived` keeps the untouched GATT writes for a test that
+ *     wants to see the envelope bytes themselves.
+ *   - `simulateNotification()` and an `AutoResponder`'s replies are
+ *     SEGMENTED on the way out, exactly as a node's would be, so the
+ *     manager's own reassembly path is exercised by the whole suite rather
+ *     than only by its own unit tests.
+ *   - a write the specification says a Proxy PDU Server "shall disconnect"
+ *     over (Section 6.3.2.2 "Reassembly") THROWS here instead, naming the
+ *     violation. That is deliberately LOUDER than a real node: a fixture
+ *     that silently dropped the link would surface as a test timeout three
+ *     layers from the cause, and the one mutation this guard exists to
+ *     catch — removing the envelope again — is exactly the one that must
+ *     never pass quietly. An unsupported/RFU message type throws for the
+ *     same reason: this app only ever writes two of Table 6.3's types.
  */
 
 import { k3 } from '../../mesh/crypto/derive';
 import {
+  acceptProxyPdu,
+  encodeProxyPdus,
+  PROXY_MESSAGE_TYPE_NETWORK_PDU,
+  PROXY_MESSAGE_TYPE_PROVISIONING_PDU,
+  type ProxyReassemblyState,
+} from '../../mesh/packet/proxyPdu';
+import {
+  MAX_PROXY_PDU_LENGTH,
   MESH_PROVISIONING_DATA_IN_UUID,
   MESH_PROVISIONING_DATA_OUT_UUID,
   MESH_PROVISIONING_SERVICE_UUID,
@@ -250,6 +289,10 @@ export class FakeBluetoothPort implements BluetoothPort {
   private readonly notifyCallbacks = new Map<string, (data: Buffer) => void>();
   private readonly readValues = new Map<string, Buffer>();
   private readonly heldWrites = new Map<string, HeldWrite[]>();
+  /** One in-flight Proxy PDU reassembly per (peripheral, characteristic) —
+   *  see the module header's "THIS FAKE SPEAKS THE PROXY PDU PROTOCOL"
+   *  note. Cleared whenever the link to that peripheral goes away. */
+  private readonly writeReassembly = new Map<string, ProxyReassemblyState>();
 
   /** `clock`, if given, is what `scan()` actually waits on for its
    *  `durationMs` — see the module header's "SCAN TIMING" note. Omit it
@@ -271,7 +314,12 @@ export class FakeBluetoothPort implements BluetoothPort {
    *  the Data Out handle in connection.ts passes every test here, because
    *  nothing previously distinguished "wrote to the right peripheral" from
    *  "wrote to the right CHARACTERISTIC on that peripheral." */
-  readonly writesReceived: Array<{ peripheralId: string; characteristicUuid: number; data: Buffer }> = [];
+  readonly writesReceived: Array<{ peripheralId: string; characteristicUuid: number; data: Buffer; messageType: number }> = [];
+  /** Every GATT write exactly as it arrived — envelope octet included, one
+   *  entry per `write()` call rather than per logical message. The place to
+   *  look when a test is about the envelope itself (its SAR values, its
+   *  segment sizes) rather than about the message inside it. */
+  readonly rawWritesReceived: Array<{ peripheralId: string; characteristicUuid: number; data: Buffer }> = [];
   /** Every `durationMs` a caller passed to `scan()`, in order — review
    *  finding: this fixture previously accepted and ignored that argument
    *  entirely, so connection.ts's SCAN_DURATION_MS constant was never
@@ -466,18 +514,42 @@ export class FakeBluetoothPort implements BluetoothPort {
   simulateNotification(id: string, data: Buffer): void {
     const node = this.node(id);
     const dataOutUuid = node.gattProfile === 'provisioning' ? MESH_PROVISIONING_DATA_OUT_UUID : MESH_PROXY_DATA_OUT_UUID;
+    const messageType = node.gattProfile === 'provisioning' ? PROXY_MESSAGE_TYPE_PROVISIONING_PDU : PROXY_MESSAGE_TYPE_NETWORK_PDU;
     const key = notifyKey(id, dataOutUuid);
     const callback = this.notifyCallbacks.get(key);
     if (!callback) {
       throw new Error(`FakeBluetoothPort.simulateNotification: "${id}" has no active Data Out subscription`);
     }
-    callback(Buffer.from(data));
+    // A node wraps and segments what it notifies, exactly as this fixture's
+    // caller's own transport does — "Each notification contains a single
+    // Proxy PDU." (Section 3.3.2 "GATT bearer"), so one logical message can
+    // be several callbacks.
+    for (const pdu of encodeProxyPdus(messageType, data, MAX_PROXY_PDU_LENGTH)) callback(pdu);
+  }
+
+  /** Delivers ONE raw Proxy PDU with no wrapping or segmentation at all —
+   *  for a test that needs to put a specific envelope (a malformed one, a
+   *  stray continuation segment, an unsupported message type) on the wire.
+   *  `simulateNotification` above is the ordinary route. */
+  simulateRawNotification(id: string, pdu: Buffer): void {
+    const node = this.node(id);
+    const dataOutUuid = node.gattProfile === 'provisioning' ? MESH_PROVISIONING_DATA_OUT_UUID : MESH_PROXY_DATA_OUT_UUID;
+    const callback = this.notifyCallbacks.get(notifyKey(id, dataOutUuid));
+    if (!callback) {
+      throw new Error(`FakeBluetoothPort.simulateRawNotification: "${id}" has no active Data Out subscription`);
+    }
+    callback(Buffer.from(pdu));
   }
 
   private clearNotifyCallbacksFor(peripheralId: string): void {
     const prefix = `${peripheralId}:`;
     for (const key of [...this.notifyCallbacks.keys()]) {
       if (key.startsWith(prefix)) this.notifyCallbacks.delete(key);
+    }
+    // A half-arrived Proxy PDU belongs to the link it was arriving over —
+    // see connection.ts's own identical reset on every disconnect.
+    for (const key of [...this.writeReassembly.keys()]) {
+      if (key.startsWith(prefix)) this.writeReassembly.delete(key);
     }
   }
 
@@ -578,11 +650,20 @@ export class FakeBluetoothPort implements BluetoothPort {
     const handle = this.requireConnectedCharacteristic(characteristic);
     const node = this.node(handle.peripheralId);
     if (node.dropWrites) return; // Write Without Response: silently discarded, no error either way
-    this.writesReceived.push({
+    this.rawWritesReceived.push({
       peripheralId: handle.peripheralId,
       characteristicUuid: handle.characteristicUuid,
       data: Buffer.from(data),
     });
+    const message = this.acceptWrittenProxyPdu(handle, data);
+    if (message !== null) {
+      this.writesReceived.push({
+        peripheralId: handle.peripheralId,
+        characteristicUuid: handle.characteristicUuid,
+        data: message.message,
+        messageType: message.messageType,
+      });
+    }
     if (node.writeBehavior === 'fail') {
       throw new Error(`FakeBluetoothPort.write: configured to fail for "${handle.peripheralId}"`);
     }
@@ -614,13 +695,55 @@ export class FakeBluetoothPort implements BluetoothPort {
       // Data Out — the wrong one, since this write (and so this reply)
       // belongs to whichever service `handle` itself was discovered under.
       const dataOutUuid = handle.serviceUuid === MESH_PROVISIONING_SERVICE_UUID ? MESH_PROVISIONING_DATA_OUT_UUID : MESH_PROXY_DATA_OUT_UUID;
-      const replies = node.autoResponder(Buffer.from(data), handle.characteristicUuid);
+      const messageType =
+        handle.serviceUuid === MESH_PROVISIONING_SERVICE_UUID ? PROXY_MESSAGE_TYPE_PROVISIONING_PDU : PROXY_MESSAGE_TYPE_NETWORK_PDU;
+      // The responder is handed the REASSEMBLED message, so it sees one
+      // call per logical message exactly as it did before this fixture
+      // learned the envelope — and is never called at all for a segment
+      // that merely continues one (`message === null`), which is the same
+      // "no reply for THIS write" case `AutoResponder` already documents.
+      if (message === null) return;
+      const replies = node.autoResponder(Buffer.from(message.message), handle.characteristicUuid);
       if (replies && replies.length > 0) {
         const callback = this.notifyCallbacks.get(notifyKey(handle.peripheralId, dataOutUuid));
         if (callback) {
-          for (const reply of replies) callback(Buffer.from(reply));
+          for (const reply of replies) {
+            for (const pdu of encodeProxyPdus(messageType, reply, MAX_PROXY_PDU_LENGTH)) callback(pdu);
+          }
         }
       }
+    }
+  }
+
+  /**
+   * The Proxy PDU Server half of this fixture — see the module header.
+   * Returns the complete message once its last segment has arrived, `null`
+   * while a message is still arriving, and THROWS for anything the
+   * specification says a server shall disconnect over, or for a message
+   * type this app never writes.
+   */
+  private acceptWrittenProxyPdu(
+    handle: FakeCharacteristicHandle,
+    pdu: Buffer,
+  ): { readonly messageType: number; readonly message: Buffer } | null {
+    const key = notifyKey(handle.peripheralId, handle.characteristicUuid);
+    const result = acceptProxyPdu(this.writeReassembly.get(key), pdu, this.clock?.now() ?? 0);
+    switch (result.kind) {
+      case 'complete':
+        this.writeReassembly.delete(key);
+        return { messageType: result.messageType, message: result.message };
+      case 'incomplete':
+        this.writeReassembly.set(key, result.state);
+        return null;
+      case 'ignored':
+        throw new Error(
+          `FakeBluetoothPort.write: "${handle.peripheralId}" was written something it cannot interpret as a Proxy PDU it supports — ${result.reason}. A real node would ignore this silently; this fixture fails loudly (see its module header).`,
+        );
+      case 'disconnect':
+        this.writeReassembly.delete(key);
+        throw new Error(
+          `FakeBluetoothPort.write: "${handle.peripheralId}" received a Proxy PDU the specification says it shall disconnect over — ${result.reason} (Section 6.3.2.2). A real node would drop the link; this fixture fails loudly (see its module header).`,
+        );
     }
   }
 

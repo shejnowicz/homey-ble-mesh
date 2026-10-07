@@ -1,5 +1,12 @@
 import { randomBytes } from 'node:crypto';
-import { encodeMeshMessage, acceptIncomingPdu, DEFAULT_CONFIG_TTL, type MeshReceiveState, type MeshReceiveContext } from '../message';
+import {
+  encodeMeshMessage,
+  acceptIncomingPdu,
+  POINT_TO_POINT_TTL,
+  RELAYED_TTL,
+  type MeshReceiveState,
+  type MeshReceiveContext,
+} from '../message';
 import { decodeNetworkPdu, encodeNetworkPdu } from '../network';
 import { decodeUnsegmentedAccess, decodeSegmentedAccess } from '../lowerTransport';
 
@@ -51,6 +58,7 @@ describe('encodeMeshMessage', () => {
       dst: NODE_ADDRESS,
       netKey: NET_KEY,
       ivIndex: 0,
+      ttl: POINT_TO_POINT_TTL,
       allocateSeq,
     });
     expect(pdus).toHaveLength(1);
@@ -58,11 +66,32 @@ describe('encodeMeshMessage', () => {
     expect(net).not.toBeNull();
     expect(net?.src).toBe(OUR_ADDRESS);
     expect(net?.dst).toBe(NODE_ADDRESS);
-    expect(net?.ttl).toBe(DEFAULT_CONFIG_TTL);
+    expect(net?.ttl).toBe(0); // POINT_TO_POINT_TTL, asserted as the literal value
     expect(decodeUnsegmentedAccess(net?.transportPdu as Buffer)).not.toBeNull();
   });
 
-  test('defaults TTL to DEFAULT_CONFIG_TTL (0) but honours an explicit override', () => {
+  /**
+   * REVIEW FINDING (final wave): the TTL this encoder put on the wire used
+   * to be asserted as `expect(net?.ttl).toBe(DEFAULT_CONFIG_TTL)` — the
+   * constant against itself, a tautology that passes for ANY value the
+   * constant happens to hold and therefore could not tell 0 from anything
+   * else. It passed while every lighting command and every node reset went
+   * out at TTL 0, which Table 3.12 defines as "Network PDU has not been
+   * relayed and will not be relayed": unreachable for any bulb but the one
+   * holding the connection. These assert the LITERAL values the two
+   * constants must have, and that the encoder puts exactly those on the
+   * wire.
+   */
+  test('the two TTL constants are the literal values Table 3.12 publishes for their two meanings', () => {
+    expect(POINT_TO_POINT_TTL).toBe(0); // "has not been relayed and will not be relayed"
+    expect(RELAYED_TTL).toBe(127); // "has not been relayed and can be relayed" — 0x7F
+  });
+
+  test.each([
+    ['the point-to-point value', POINT_TO_POINT_TTL, 0],
+    ['the relayed value', RELAYED_TTL, 127],
+    ['an arbitrary in-range value, so the field is carried rather than pinned', 5, 5],
+  ])('%s reaches the wire exactly as asked', (_name, ttl, expected) => {
     const { allocateSeq } = makeSeqAllocator();
     const pdus = encodeMeshMessage({
       accessPayload: Buffer.from([0x80, 0x08, 0x00]),
@@ -72,11 +101,69 @@ describe('encodeMeshMessage', () => {
       dst: NODE_ADDRESS,
       netKey: NET_KEY,
       ivIndex: 0,
-      ttl: 5,
+      ttl,
       allocateSeq,
     });
     const net = decodeNetworkPdu({ networkKey: NET_KEY, ivIndex: 0, pdu: pdus[0] as Buffer });
-    expect(net?.ttl).toBe(5);
+    expect(net?.ttl).toBe(expected);
+  });
+
+  /**
+   * The application-key path's AKF flag and AID identifier had ZERO
+   * coverage (review finding, final wave): both could be zeroed and the
+   * whole suite stayed green, because this project's own receive path
+   * ignores them symmetrically — it already knows which key to try. A real
+   * node does not: Section 3.5.2.1 "Unsegmented Access message", Table 3.17
+   * "Unsegmented Access message format" defines AKF ("Application Key
+   * Flag") and AID ("Application key identifier"), and Section 3.6.4.2
+   * "Receiving an Upper Transport PDU" says what a receiver does with
+   * them — "the TransMIC field shall be authenticated against the device
+   * key or the Device Key Candidate (see Section 3.11.8.1) or the known
+   * application keys for which the AKF and AID fields match". A wrong AKF
+   * or AID therefore means the bulb never tries our key at all and the
+   * command is silently dropped. Asserted here on the LITERAL bits of the
+   * Lower Transport PDU's first octet, decoded rather than recomputed.
+   */
+  test('an application-key message carries AKF=1 and the literal AID bits; a device-key one carries AKF=0 and AID=0', () => {
+    const aid = 0x2b; // 6 bits, not 0 and not all-ones, so neither a cleared nor a saturated field passes
+    const app = encodeMeshMessage({
+      accessPayload: Buffer.from([0x82, 0x02, 0x01, 0x07]),
+      key: APP_KEY,
+      keyKind: 'application',
+      aid,
+      src: OUR_ADDRESS,
+      dst: NODE_ADDRESS,
+      netKey: NET_KEY,
+      ivIndex: 0,
+      ttl: RELAYED_TTL,
+      allocateSeq: makeSeqAllocator().allocateSeq,
+    });
+    const appNet = decodeNetworkPdu({ networkKey: NET_KEY, ivIndex: 0, pdu: app[0] as Buffer });
+    const appHeader = (appNet as { transportPdu: Buffer }).transportPdu[0] as number;
+    // Table 3.17: SEG(1) || AKF(1) || AID(6), the first row taking the most
+    // significant bit (Section 3.1.1). Written as literal bits, not as a
+    // recomputation of what the encoder did.
+    expect(appHeader & 0b1000_0000).toBe(0b0000_0000); // SEG = 0, unsegmented
+    expect(appHeader & 0b0100_0000).toBe(0b0100_0000); // AKF = 1, application key
+    expect(appHeader & 0b0011_1111).toBe(0x2b); // AID, verbatim
+    expect(appHeader).toBe(0b0110_1011);
+
+    const device = encodeMeshMessage({
+      accessPayload: Buffer.from([0x80, 0x08, 0x00]),
+      key: DEVICE_KEY,
+      keyKind: 'device',
+      // Deliberately supplied and deliberately ignored: a device-key
+      // message's AKF is 0, so there is no identifier to carry.
+      aid,
+      src: OUR_ADDRESS,
+      dst: NODE_ADDRESS,
+      netKey: NET_KEY,
+      ivIndex: 0,
+      ttl: POINT_TO_POINT_TTL,
+      allocateSeq: makeSeqAllocator().allocateSeq,
+    });
+    const deviceNet = decodeNetworkPdu({ networkKey: NET_KEY, ivIndex: 0, pdu: device[0] as Buffer });
+    expect((deviceNet as { transportPdu: Buffer }).transportPdu[0]).toBe(0b0000_0000);
   });
 
   test('a long access payload segments, and calls allocateSeq EXACTLY ONCE PER NETWORK PDU SENT — the regression this task was rejected over', () => {
@@ -92,6 +179,7 @@ describe('encodeMeshMessage', () => {
       dst: NODE_ADDRESS,
       netKey: NET_KEY,
       ivIndex: 0,
+      ttl: POINT_TO_POINT_TTL,
       allocateSeq,
     });
     expect(pdus).toHaveLength(3);
@@ -127,6 +215,7 @@ describe('encodeMeshMessage', () => {
         dst: NODE_ADDRESS,
         netKey: NET_KEY,
         ivIndex: 0,
+        ttl: POINT_TO_POINT_TTL,
         allocateSeq: brokenAllocateSeq,
       }),
     ).toThrow('SeqAuth contiguity broken');
@@ -143,6 +232,7 @@ describe('encodeMeshMessage', () => {
       dst: NODE_ADDRESS,
       netKey: NET_KEY,
       ivIndex: 0,
+      ttl: POINT_TO_POINT_TTL,
       allocateSeq,
     });
     expect(pdus).toHaveLength(1);
@@ -171,6 +261,7 @@ describe('acceptIncomingPdu', () => {
       dst: OUR_ADDRESS,
       netKey: NET_KEY,
       ivIndex: 0,
+      ttl: POINT_TO_POINT_TTL,
       allocateSeq,
     });
   }
@@ -221,6 +312,7 @@ describe('acceptIncomingPdu', () => {
       dst: OUR_ADDRESS,
       netKey: foreignNetKey,
       ivIndex: 0,
+      ttl: POINT_TO_POINT_TTL,
       allocateSeq,
     });
     const context: MeshReceiveContext = { key: DEVICE_KEY, keyKind: 'device', netKey: NET_KEY, ivIndex: 0, expectedSrc: NODE_ADDRESS };

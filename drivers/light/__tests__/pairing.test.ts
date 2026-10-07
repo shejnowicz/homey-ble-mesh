@@ -24,7 +24,13 @@ import {
   type DiscoveredCharacteristic,
   type Subscription,
 } from '../../../lib/adapter/connection';
-import { encodeMeshMessage, acceptIncomingPdu, type MeshReceiveState, type MeshReceiveContext } from '../../../lib/mesh/packet/message';
+import {
+  encodeMeshMessage,
+  acceptIncomingPdu,
+  POINT_TO_POINT_TTL,
+  type MeshReceiveState,
+  type MeshReceiveContext,
+} from '../../../lib/mesh/packet/message';
 import { encodeProvisioningPdu, type ProvisioningCapabilities } from '../../../lib/mesh/provisioning/pdu';
 import type { EphemeralKeyPair } from '../../../lib/mesh/provisioning/machine';
 import { decodeNetworkPdu } from '../../../lib/mesh/packet/network';
@@ -293,6 +299,9 @@ function installConfigResponder(
       dst: ourAddress,
       netKey: TEST_NET_KEY,
       ivIndex: 0,
+      // This fake node is answering over the very link it is connected by —
+      // the same point-to-point exchange `pairing.ts` itself uses.
+      ttl: POINT_TO_POINT_TTL,
       allocateSeq: allocateNodeSeq,
     });
 
@@ -526,6 +535,27 @@ describe('a successful pairing', () => {
     expect(bluetooth.writesReceived).toHaveLength(10);
     const configWrites = bluetooth.writesReceived.slice(6);
     expect(configWrites.every((w) => w.peripheralId === 'bulb-1')).toBe(true);
+
+    // THE PROXY PDU ENVELOPE, on both sessions and with the RIGHT message
+    // type on each (review finding, final wave — before this round both
+    // sessions wrote bare PDUs, which no node can interpret). Table 6.3:
+    // 0x03 Provisioning PDU for the Mesh Provisioning characteristics,
+    // 0x00 Network PDU for the Mesh Proxy ones. `writesReceived` here is
+    // the REASSEMBLED message the fake node put back together, so the fact
+    // these ten exist at all is already the envelope working end to end.
+    expect(bluetooth.writesReceived.slice(0, 6).map((w) => w.messageType)).toEqual([0x03, 0x03, 0x03, 0x03, 0x03, 0x03]);
+    expect(configWrites.map((w) => w.messageType)).toEqual([0x00, 0x00, 0x00, 0x00]);
+
+    // ...and SEGMENTATION is not theoretical here: a Provisioning Public Key
+    // PDU is 65 octets, far past one write on a minimal link, so it reaches
+    // the node as several raw GATT writes carrying first/continuation/last
+    // SAR values. Counted on the raw writes, which is where the envelope is
+    // visible at all.
+    expect(bluetooth.rawWritesReceived.length).toBeGreaterThan(bluetooth.writesReceived.length);
+    const sarValues = new Set(bluetooth.rawWritesReceived.map((w) => ((w.data[0] as number) >> 6) & 0b11));
+    expect(sarValues.has(0b01)).toBe(true); // a first segment
+    expect(sarValues.has(0b10)).toBe(true); // a continuation segment
+    expect(sarValues.has(0b11)).toBe(true); // a last segment
     // The first config write's Network PDU decrypts to exactly Config
     // Composition Data Get (opcode 0x8008, page 0) under OUR netKey and
     // device key, addressed FROM us TO the node — i.e. the driver really
@@ -927,6 +957,7 @@ describe('element attribution', () => {
             dst: ourAddress,
             netKey: TEST_NET_KEY,
             ivIndex: 0,
+            ttl: POINT_TO_POINT_TTL,
             allocateSeq: allocateNodeSeq,
           });
         let count = 0;
@@ -1015,6 +1046,7 @@ describe('a node that answers a Config request with the wrong status message typ
             dst: 1,
             netKey: TEST_NET_KEY,
             ivIndex: 0,
+            ttl: POINT_TO_POINT_TTL,
             allocateSeq: allocateNodeSeq,
           }),
         );

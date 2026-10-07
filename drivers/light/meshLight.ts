@@ -16,7 +16,12 @@ import {
   decodeLightHslStatus,
   type LightHslStatus,
 } from '../../lib/models/lighting';
-import { encodeMeshMessage, acceptIncomingPdu, type MeshReceiveContext } from '../../lib/mesh/packet/message';
+import {
+  encodeMeshMessage,
+  acceptIncomingPdu,
+  RELAYED_TTL,
+  type MeshReceiveContext,
+} from '../../lib/mesh/packet/message';
 import { encodeAccessMessage, type AccessMessage } from '../../lib/mesh/packet/access';
 import { encodeConfigNodeReset, decodeConfigStatus } from '../../lib/mesh/config/client';
 import { k4 } from '../../lib/mesh/crypto/derive';
@@ -61,13 +66,15 @@ import type { HomeyCapability } from '../../lib/models/capabilities';
  * the brief): "THE TRANSACTION IDENTIFIER LIVES ONE LAYER UP, DELIBERATELY
  * ... The allocator therefore belongs in the device layer (Task 7), which
  * calls `encodeGenericOnOffSet({ tid, ... })` ONCE per logical command and
- * hands this queue the resulting bytes; every RETRY this module performs
- * simply re-sends that exact, unchanged buffer." This module is exactly
- * that caller: `allocateTid()` below is consulted ONCE per `set*` method
- * invocation (never per retry — the queue's own retry resends the identical
- * `Buffer` this module built once), which is what makes "a retransmission
- * carries the same identifier" fall out for free rather than needing to be
- * remembered. One counter per node instance (not per model) is deliberate —
+ * hands this queue a `build()` that re-encodes those same parameters per
+ * attempt." This module is exactly that caller: `allocateTid()` below is
+ * consulted ONCE per `set*` method invocation, and the resulting ACCESS
+ * PAYLOAD (which carries the identifier) is built once, while the NETWORK
+ * PDU around it (which carries the sequence number) is rebuilt on every
+ * attempt — so "a retransmission carries the same identifier" and "a
+ * retransmission carries a fresh sequence number" are each true for their
+ * own reason rather than one being an accident of the other. See queue.ts's
+ * own "A RETRY REBUILDS ITS BYTES" note for the defect that corrected. One counter per node instance (not per model) is deliberate —
  * the specification only requires uniqueness within (SRC, DST) inside a
  * 6-second window per RECEIVING model (Section 3.3.1.2.2 restated per model
  * in `lighting.ts`'s own JSDoc), so a single shared, incrementing,
@@ -89,6 +96,34 @@ import type { HomeyCapability } from '../../lib/models/capabilities';
  * `queue.onUnsolicited`, by contrast, genuinely does not know which model is
  * coming, so it tries each of the four decoders in turn — safe because the
  * four opcodes are disjoint (Assigned Numbers), so at most one ever matches.
+ *
+ * ONE UNREACHABLE BULB MUST NOT SATURATE THE SHARED QUEUE (review finding,
+ * final wave — the measured defect, not a theoretical one). `app.ts`'s
+ * connection poll deliberately fans `onConnectionStateChange('connected')`
+ * out to EVERY controller on EVERY tick, to close an earlier finding where a
+ * controller whose own re-read had failed stayed latched unavailable with
+ * nothing polling on its behalf. But a controller whose node is silent never
+ * sets `connected`, so before this round every single tick started another
+ * full `reReadState()` — each one enqueuing up to four Gets that take the
+ * whole bounded-retry budget to fail, onto the ONE queue every device
+ * shares. A reviewer measured it: two hundred ticks, two hundred re-reads
+ * started, sixteen settled, a backlog of one hundred and eighty-four growing
+ * linearly, and a user's command on a WORKING bulb queued behind all of it.
+ * That is a direct breach of the clause the queue exists for — "All mesh
+ * traffic passes through one queue so commands never flood the network".
+ *
+ * THE FIX IS TO MAKE THE RETRY EXPLICIT AND RATE-LIMITED rather than
+ * re-entrant: `reReadInFlight` below means a tick arriving while a re-read
+ * is still running is a no-op (one at a time, never a pile), and
+ * `nextReReadAtMs` plus a doubling backoff means a FAILED re-read is not
+ * retried on the very next tick either. A success, or any status heard from
+ * the node, clears both. The shape mirrors `connection.ts`'s own
+ * failure-streak backoff deliberately — the same problem (an attempt that
+ * keeps failing must get slower, not faster) solved the same way, with the
+ * same cap so it never grows without bound. This module therefore now takes
+ * a `clock` port, for `now()` only: there is no timer here, because the
+ * app's own poll already provides the ticks and this module only has to
+ * decide which of them to act on.
  *
  * AVAILABILITY IS CONNECTION-LEVEL, NOT PER-NODE. The design's own words —
  * "One connection serves the whole mesh" and "When no node answers, the
@@ -195,9 +230,20 @@ export interface MeshTrafficPort {
   onUnsolicited(listener: (data: Buffer) => void): () => void;
 }
 
+/** Exactly the one `ClockPort` member this module needs — see the module
+ *  header's "ONE UNREACHABLE BULB" note. A real `ClockPort`
+ *  (`lib/adapter/connection.ts`) and the test `FakeClock` both satisfy this
+ *  structurally, with no adapter code; the narrowing is the same move
+ *  `queue.ts`'s `TrafficPort` and this module's own `MeshTrafficPort`
+ *  already make. Only `now()`: this module owns no timer. */
+export interface MeshClockPort {
+  now(): number;
+}
+
 export interface MeshLightControllerDeps {
   readonly queue: MeshTrafficPort;
   readonly store: NetworkStore;
+  readonly clock: MeshClockPort;
   readonly device: DeviceCapabilityPort;
   /** This node's unicast address — Homey's own device `data.id`, parsed
    *  (see `pairing.ts#PairedDeviceDescriptor`'s own doc comment: "task 7's
@@ -270,6 +316,51 @@ function kelvinToHomey(kelvin: number): number {
 
 function errorMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
+}
+
+/**
+ * Light CTL Set and Light HSL Set both carry a MANDATORY Lightness field —
+ * there is no "leave the brightness alone" encoding in either message — so a
+ * colour or colour-temperature change always has to state a brightness.
+ * Normally it states the one Homey already shows (`currentDimFraction` reads
+ * the `dim` capability). This function is the two cases where there is
+ * nothing to read, and it exists as a named, exported function rather than
+ * two bare `return 1`s because this was an UNPINNED and USER-VISIBLE
+ * fallback (review finding, final wave): on a device whose brightness has no
+ * value yet, the first colour-temperature change sends FULL brightness, so
+ * adjusting warmth on a dimmed lamp makes it jump to full.
+ *
+ * THE DECISION, deliberately, with the alternatives weighed rather than the
+ * first answer kept:
+ *   - `'no-capability'`: the device exposes no `dim` at all, so Homey has no
+ *     brightness control for it and full is the only value that means
+ *     anything. Not a guess.
+ *   - `'no-value'`: the device HAS `dim` but nothing has ever populated it.
+ *     Every option here is a blind guess, so the choice is which guess does
+ *     least damage. 0 is strictly worse — Lightness 0 turns the lamp OFF, so
+ *     a user nudging the warmth would be left in the dark. A middle value is
+ *     an equally blind guess with no advantage and a stranger result. Full
+ *     it stays; it is the only guess that leaves the lamp visible and whose
+ *     effect the user can see and immediately undo.
+ * WHY THE WINDOW IS NARROW IN PRACTICE, which is what makes the above
+ * acceptable rather than merely least-bad: `reReadState()` issues a Light
+ * Lightness Get on every reconnection and `applyDecodedStatus` writes `dim`
+ * from any status at all, so `'no-value'` only holds between a device being
+ * created and the first status ever arriving from its node — during which
+ * the device is also marked unavailable. ONE OF THE THINGS TO WATCH ON THE
+ * FIRST BULB: if a temperature change ever visibly jumps the brightness,
+ * this is the reason, and the fix is to make the command wait for a
+ * Lightness read rather than to change the number here.
+ */
+const DIM_FRACTION_FALLBACKS: Readonly<Record<'no-capability' | 'no-value', number>> = {
+  // The same value for both, reached by two different arguments — kept as
+  // two entries so each can be changed, and mutated, independently.
+  'no-capability': 1,
+  'no-value': 1,
+};
+
+export function currentDimFractionFallback(reason: 'no-capability' | 'no-value'): number {
+  return DIM_FRACTION_FALLBACKS[reason];
 }
 
 // ===========================================================================
@@ -360,6 +451,29 @@ const ALL_MODELS: ReadonlyArray<LightingModel<unknown>> = [ONOFF_MODEL, LIGHTNES
  *  construction (`start()`) and whenever the shared connection drops. */
 export const CONNECTION_UNAVAILABLE_MESSAGE = 'Mesh connection unavailable — no node has answered';
 
+// ===========================================================================
+// Re-read backoff — see the module header's "ONE UNREACHABLE BULB" note. Not
+// specification values; engineering choices, the same way connection.ts's own
+// backoff constants and queue.ts's timeouts are, and chosen against the same
+// yardstick: one failed `reReadState()` already costs up to four queued Gets
+// each burning the queue's full bounded-retry budget, so even the FIRST
+// backoff step has to be comfortably longer than that, or the "rate limit"
+// would only be a formality.
+// ===========================================================================
+
+const RE_READ_BACKOFF_BASE_MS = 30_000;
+const RE_READ_BACKOFF_MAX_MS = 300_000;
+/** Capped well before the doubling could produce an unreasonably large
+ *  number — purely defensive, exactly as connection.ts's own
+ *  MAX_FAILURE_STREAK is. */
+const MAX_RE_READ_FAILURE_STREAK = 8;
+
+function reReadBackoffMs(failureStreak: number): number {
+  if (failureStreak <= 0) return 0;
+  const scaled = RE_READ_BACKOFF_BASE_MS * 2 ** (failureStreak - 1);
+  return Math.min(scaled, RE_READ_BACKOFF_MAX_MS);
+}
+
 /**
  * Owns one provisioned node's commands, status and availability — the
  * design's "Commands and state"/"Availability" sections for exactly one
@@ -376,16 +490,29 @@ export class MeshLightController {
   private readonly queue: MeshTrafficPort;
   private readonly store: NetworkStore;
   private readonly device: DeviceCapabilityPort;
+  private readonly clock: MeshClockPort;
   private readonly address: number;
 
   private nextTid = 0;
   private connected = false;
   private unsubscribeUnsolicited: (() => void) | null = null;
+  /** True while a `reReadState()` is running — see the module header's "ONE
+   *  UNREACHABLE BULB" note. The single thing that stops the app's poll from
+   *  starting a new full state read every tick against a silent node. */
+  private reReadInFlight = false;
+  /** Consecutive failed re-reads, driving `reReadBackoffMs`. Cleared by any
+   *  success, by any status heard from the node, and by a genuine disconnect
+   *  (a link that has gone and come back is new information, not a
+   *  continuation of the old failure). */
+  private reReadFailureStreak = 0;
+  /** The earliest `clock.now()` at which another re-read may start. */
+  private nextReReadAtMs = 0;
 
   constructor(deps: MeshLightControllerDeps) {
     this.queue = deps.queue;
     this.store = deps.store;
     this.device = deps.device;
+    this.clock = deps.clock;
     this.address = deps.address;
   }
 
@@ -422,17 +549,37 @@ export class MeshLightController {
   async onConnectionStateChange(status: 'connected' | 'unavailable'): Promise<void> {
     if (status === 'unavailable') {
       this.connected = false;
+      // The shared link itself went away; whatever this node's own recent
+      // failures were, they are no longer the reason it is unreachable, so
+      // the next 'connected' tick gets a clean, immediate attempt.
+      this.reReadFailureStreak = 0;
+      this.nextReReadAtMs = 0;
       await this.device.setUnavailable(CONNECTION_UNAVAILABLE_MESSAGE);
       return;
     }
     if (this.connected) return;
+    // THE TWO GUARDS — see the module header's "ONE UNREACHABLE BULB" note.
+    // Without the first, the app's poll starts a fresh four-Get state read
+    // every tick against a node that is not answering, onto the one queue
+    // every device shares. Without the second, the retry resumes the instant
+    // the previous one gives up, which for a node that is simply gone is the
+    // same flood at a slower constant rate.
+    if (this.reReadInFlight) return;
+    if (this.clock.now() < this.nextReReadAtMs) return;
+    this.reReadInFlight = true;
     try {
       await this.reReadState();
+      this.reReadFailureStreak = 0;
+      this.nextReReadAtMs = 0;
       this.connected = true;
       await this.device.setAvailable();
     } catch (err) {
       this.connected = false;
+      this.reReadFailureStreak = Math.min(this.reReadFailureStreak + 1, MAX_RE_READ_FAILURE_STREAK);
+      this.nextReReadAtMs = this.clock.now() + reReadBackoffMs(this.reReadFailureStreak);
       await this.device.setUnavailable(`node did not respond after reconnecting (${errorMessage(err)})`);
+    } finally {
+      this.reReadInFlight = false;
     }
   }
 
@@ -440,10 +587,15 @@ export class MeshLightController {
 
   async setOnOff(value: boolean): Promise<void> {
     const tid = this.allocateTid();
-    const data = this.buildApplicationPdu(encodeGenericOnOffSet({ onOff: value ? 1 : 0, tid }));
+    // The ACCESS payload is built once — it carries the transaction
+    // identifier, which must be identical across retries. The NETWORK PDU
+    // around it is rebuilt per attempt, because it carries the sequence
+    // number, which must differ. See queue.ts's own "A RETRY REBUILDS ITS
+    // BYTES" note.
+    const accessPayload = encodeGenericOnOffSet({ onOff: value ? 1 : 0, tid });
     await this.setOptimistic('onoff', value); // design: "sets the capability immediately"
     const reply = await this.queue.send({
-      data,
+      build: () => this.buildApplicationPdu(accessPayload),
       isStatus: (pdu) => this.tryDecodeModel(ONOFF_MODEL, pdu) !== null,
       description: `Generic OnOff Set (node ${this.address})`,
     });
@@ -453,10 +605,10 @@ export class MeshLightController {
 
   async setDim(value: number): Promise<void> {
     const tid = this.allocateTid();
-    const data = this.buildApplicationPdu(encodeLightLightnessSet({ lightness: fractionToWire(value), tid }));
+    const accessPayload = encodeLightLightnessSet({ lightness: fractionToWire(value), tid });
     await this.setOptimistic('dim', clamp01(value));
     const reply = await this.queue.send({
-      data,
+      build: () => this.buildApplicationPdu(accessPayload),
       isStatus: (pdu) => this.tryDecodeModel(LIGHTNESS_MODEL, pdu) !== null,
       description: `Light Lightness Set (node ${this.address})`,
     });
@@ -466,17 +618,15 @@ export class MeshLightController {
 
   async setLightTemperature(value: number): Promise<void> {
     const tid = this.allocateTid();
-    const data = this.buildApplicationPdu(
-      encodeLightCtlSet({
-        lightness: fractionToWire(this.currentDimFraction()),
-        temperature: homeyToKelvin(value),
-        deltaUv: 0, // not exposed to Homey — see lighting.ts's own field doc comment.
-        tid,
-      }),
-    );
+    const accessPayload = encodeLightCtlSet({
+      lightness: fractionToWire(this.currentDimFraction()),
+      temperature: homeyToKelvin(value),
+      deltaUv: 0, // not exposed to Homey — see lighting.ts's own field doc comment.
+      tid,
+    });
     await this.setOptimistic('light_temperature', clamp01(value));
     const reply = await this.queue.send({
-      data,
+      build: () => this.buildApplicationPdu(accessPayload),
       isStatus: (pdu) => this.tryDecodeModel(CTL_MODEL, pdu) !== null,
       description: `Light CTL Set (node ${this.address})`,
     });
@@ -490,18 +640,16 @@ export class MeshLightController {
    *  values even when the user only dragged one of the two controls. */
   async setColor(hue: number, saturation: number): Promise<void> {
     const tid = this.allocateTid();
-    const data = this.buildApplicationPdu(
-      encodeLightHslSet({
-        lightness: fractionToWire(this.currentDimFraction()),
-        hue: fractionToWire(hue),
-        saturation: fractionToWire(saturation),
-        tid,
-      }),
-    );
+    const accessPayload = encodeLightHslSet({
+      lightness: fractionToWire(this.currentDimFraction()),
+      hue: fractionToWire(hue),
+      saturation: fractionToWire(saturation),
+      tid,
+    });
     await this.setOptimistic('light_hue', clamp01(hue));
     await this.setOptimistic('light_saturation', clamp01(saturation));
     const reply = await this.queue.send({
-      data,
+      build: () => this.buildApplicationPdu(accessPayload),
       isStatus: (pdu) => this.tryDecodeModel(HSL_MODEL, pdu) !== null,
       description: `Light HSL Set (node ${this.address})`,
     });
@@ -557,10 +705,14 @@ export class MeshLightController {
     await this.device.setCapabilityValue(capability, value);
   }
 
+  /** The brightness to put in a Light CTL Set / Light HSL Set, which both
+   *  carry a mandatory Lightness field — see `currentDimFractionFallback`
+   *  for the decision about what happens when there is nothing to read. */
   private currentDimFraction(): number {
-    if (!this.device.hasCapability('dim')) return 1;
+    if (!this.device.hasCapability('dim')) return currentDimFractionFallback('no-capability');
     const value = this.device.getCapabilityValue('dim');
-    return typeof value === 'number' && Number.isFinite(value) ? clamp01(value) : 1;
+    if (typeof value !== 'number' || !Number.isFinite(value)) return currentDimFractionFallback('no-value');
+    return clamp01(value);
   }
 
   /** The network/application-key material every ordinary (non-Config)
@@ -594,6 +746,12 @@ export class MeshLightController {
       dst: this.address,
       netKey,
       ivIndex,
+      // RELAYED, not the point-to-point 0 this encoder used to default to:
+      // this command has to reach THIS node, which is almost never the node
+      // currently holding the single shared GATT connection — see
+      // `message.ts`'s own TTL note, and the design's "The bulbs relay for
+      // each other without our help."
+      ttl: RELAYED_TTL,
       allocateSeq: () => this.store.allocateSequenceBlock(),
     });
     if (pdus.length !== 1) {
@@ -632,6 +790,12 @@ export class MeshLightController {
   private async applyDecodedStatus<S>(model: LightingModel<S>, status: S): Promise<void> {
     await model.applyStatus(this.device, status);
     this.connected = true;
+    // Hearing from the node is evidence it is reachable, so the re-read
+    // backoff that was throttling attempts against its silence no longer
+    // applies — otherwise a bulb that came back would stay throttled for up
+    // to five minutes after it had already proved itself.
+    this.reReadFailureStreak = 0;
+    this.nextReReadAtMs = 0;
     await this.device.setAvailable();
   }
 
@@ -673,9 +837,8 @@ export class MeshLightController {
   }
 
   private async getAndApply<S>(model: LightingModel<S>, getPayload: Buffer): Promise<void> {
-    const data = this.buildApplicationPdu(getPayload);
     const reply = await this.queue.send({
-      data,
+      build: () => this.buildApplicationPdu(getPayload),
       isStatus: (pdu) => this.tryDecodeModel(model, pdu) !== null,
       description: `${model.name} Get (node ${this.address})`,
     });
@@ -713,24 +876,39 @@ export class MeshLightController {
    */
   private async sendNodeReset(deviceKey: Buffer): Promise<void> {
     const { netKey, ivIndex, ourAddress } = this.currentNetworkContext();
-    const pdus = encodeMeshMessage({
-      accessPayload: encodeConfigNodeReset(),
-      key: deviceKey,
-      keyKind: 'device',
-      src: ourAddress,
-      dst: this.address,
-      netKey,
-      ivIndex,
-      allocateSeq: () => this.store.allocateSequenceBlock(),
-    });
-    if (pdus.length !== 1) {
-      throw new Error(
-        `meshLight: expected exactly one Network PDU for node ${this.address}'s Config Node Reset, got ${pdus.length}`,
-      );
-    }
+    const buildResetPdu = (): Buffer => {
+      const pdus = encodeMeshMessage({
+        accessPayload: encodeConfigNodeReset(),
+        key: deviceKey,
+        keyKind: 'device',
+        src: ourAddress,
+        dst: this.address,
+        netKey,
+        ivIndex,
+        // Relayed for the same reason a lighting command is: removal happens
+        // long after pairing, over the shared proxy connection, and the node
+        // being reset is almost never the one that connection is held to. A
+        // reset that is never forwarded leaves the bulb bound to a network
+        // nobody owns — the exact outcome the design's removal clause exists
+        // to prevent, which makes this the single most expensive place in
+        // the app to get the TTL wrong.
+        ttl: RELAYED_TTL,
+        allocateSeq: () => this.store.allocateSequenceBlock(),
+      });
+      if (pdus.length !== 1) {
+        throw new Error(
+          `meshLight: expected exactly one Network PDU for node ${this.address}'s Config Node Reset, got ${pdus.length}`,
+        );
+      }
+      return pdus[0] as Buffer;
+    };
     const receiveContext: MeshReceiveContext = { key: deviceKey, keyKind: 'device', netKey, ivIndex, expectedSrc: this.address };
     const reply = await this.queue.send({
-      data: pdus[0] as Buffer,
+      // Rebuilt per attempt, for the same reason every lighting command is:
+      // a Config Node Reset has no transaction identifier at all, but it does
+      // have a sequence number, and a replayed one is discarded. See
+      // queue.ts's own "A RETRY REBUILDS ITS BYTES" note.
+      build: buildResetPdu,
       isStatus: (pdu) => this.decodeDeviceMessage(receiveContext, pdu) !== null,
       description: `Config Node Reset (node ${this.address})`,
     });
@@ -746,4 +924,16 @@ export class MeshLightController {
 // themselves (see the module header's unit-conversion section) — kept out
 // of the class's own public surface since nothing outside this module and
 // its tests needs them as a caller-facing API.
-export const __testing = { fractionToWire, wireToFraction, homeyToKelvin, kelvinToHomey, MIN_PRACTICAL_KELVIN, MAX_PRACTICAL_KELVIN };
+export const __testing = {
+  fractionToWire,
+  wireToFraction,
+  homeyToKelvin,
+  kelvinToHomey,
+  currentDimFractionFallback,
+  MIN_PRACTICAL_KELVIN,
+  MAX_PRACTICAL_KELVIN,
+  RE_READ_BACKOFF_BASE_MS,
+  RE_READ_BACKOFF_MAX_MS,
+  MAX_RE_READ_FAILURE_STREAK,
+  reReadBackoffMs,
+};

@@ -22,11 +22,46 @@ import { SCAN_DURATION_MS, type ClockPort, type TimerHandle } from './connection
  * itself, so it is testable without a radio. More importantly, it is
  * PROTOCOL-AGNOSTIC: it knows nothing about opcodes, transaction
  * identifiers, source/destination addresses, or what a "Status" message
- * looks like. A `QueuedCommand` carries its own wire bytes (`data`,
- * supplied already fully encoded by the caller) and its own correlation
+ * looks like. A `QueuedCommand` builds its own wire bytes (`build()`, which
+ * returns them already fully encoded) and carries its own correlation
  * predicate (`isStatus`, which decides whether an inbound notification
  * answers THIS command). This queue only ever serialises, retries and
  * times out; it never decodes a byte of what it carries.
+ *
+ * A RETRY REBUILDS ITS BYTES; IT DOES NOT RESEND A SNAPSHOT. This corrects a
+ * defect that survived the whole project. The reasoning below (THE
+ * TRANSACTION IDENTIFIER...) is left standing because it is still right
+ * about the identifier -- it was simply SILENT about the other thing living
+ * inside the same bytes.
+ *
+ * A `QueuedCommand` used to carry `data: Buffer`, a finished snapshot, and
+ * every retry re-sent that exact buffer. That made "a retransmission carries
+ * the same transaction identifier" fall out for free, which is true and
+ * valuable. But a mesh Network PDU also carries a SEQUENCE NUMBER, and Mesh
+ * Protocol v1.1's replay rule applies to it. Section 3.9.8 "Message replay
+ * protection" -- the rule `lib/adapter/store.ts`'s own block allocator was
+ * built for -- says it directly: "If a valid message has been received from
+ * an originating element with a specific IVISeq value, any future messages
+ * from the same originating element that contain an IVISeq value that is
+ * lower than or equal to the last valid IVISeq value are very likely
+ * replayed messages and shall be discarded." (IVISeq is the IV Index and the
+ * sequence number together; ours never moves, so the sequence number is the
+ * whole of it here.) So a byte-identical retry can only ever succeed in the
+ * ONE case where the original never reached the node's model at all. In the
+ * single most likely reason to retry -- the command ARRIVED and the status
+ * was lost on the way back -- every retry is discarded as a replay, and the
+ * user is told the command failed on a lamp that did change.
+ *
+ * `QueuedCommand.build()` therefore replaces `QueuedCommand.data`: the queue
+ * asks the caller for the bytes ONCE PER ATTEMPT, and the caller rebuilds
+ * them with the SAME transaction identifier (allocated once, in the device
+ * layer, per logical command) and a FRESH sequence number. The two
+ * properties that have to hold together now each hold for the reason it is
+ * actually true, instead of one of them being an accident of the other. This
+ * is the fourth appearance of this hazard in this project -- the block
+ * allocator was built for it, a per-segment bypass nearly defeated it, a
+ * duplicated store instance nearly defeated it again, and here it had been
+ * reintroduced deliberately, for a reason that never required it.
  *
  * THE TRANSACTION IDENTIFIER LIVES ONE LAYER UP, DELIBERATELY. The task
  * brief flags this as a decision to argue, not a detail to pick silently.
@@ -35,19 +70,21 @@ import { SCAN_DURATION_MS, type ClockPort, type TimerHandle } from './connection
  * command must carry the SAME transaction identifier; a new command gets a
  * different one; uniqueness is scoped to one (source, destination) pair
  * within a six-second window. This module could not honour that rule even
- * if it tried to: it has no notion of source or destination addresses (a
- * `QueuedCommand.data` is opaque bytes to it) and, more fundamentally, it
+ * if it tried to: it has no notion of source or destination addresses (what
+ * `QueuedCommand.build()` returns is opaque bytes to it) and, more
+ * fundamentally, it
  * cannot tell "the caller wants to retransmit the same logical command"
  * apart from "the caller issued a brand new one" -- that distinction is
  * pure CALLER INTENT (a user tapping a switch twice is two new commands; a
  * queue giving up and trying again is one retransmission), which only
- * whoever constructs `QueuedCommand.data` can know. The allocator therefore
+ * whoever writes `QueuedCommand.build()` can know. The allocator therefore
  * belongs in the device layer (Task 7), which calls
  * `encodeGenericOnOffSet({ tid, ... })` ONCE per logical command and hands
- * this queue the resulting bytes; every RETRY this module performs simply
- * re-sends that exact, unchanged buffer (see `attempt` below), so the "same
- * identifier for a retransmission" rule is satisfied for free, without this
- * module ever knowing a TID exists. Had the allocator lived here instead,
+ * this queue a `build()` that re-encodes those same parameters per attempt
+ * (see the correction above), so the "same identifier for a retransmission"
+ * rule is satisfied by the caller allocating the TID once per logical
+ * command, without this module ever knowing a TID exists. Had the allocator
+ * lived here instead,
  * this module would have needed to grow address/opcode awareness just to
  * decide "is this a retry of the last command or a new one", which is
  * exactly the layering violation `lib/models` being protocol-pure and
@@ -164,7 +201,21 @@ import { SCAN_DURATION_MS, type ClockPort, type TimerHandle } from './connection
  * "timeout" -- the task brief's own requirement).
  */
 export interface QueuedCommand {
-  readonly data: Buffer;
+  /**
+   * Produces the exact bytes for ONE attempt -- called once per attempt,
+   * never once per command (see the module header's "A RETRY REBUILDS ITS
+   * BYTES" note). The caller is responsible for what must stay the SAME
+   * across attempts (the transaction identifier, allocated once per logical
+   * command) and what must CHANGE (the sequence number, allocated fresh per
+   * Network PDU, or a receiving node discards the retry as a replay). This
+   * module never looks inside what comes back; it only copies it before
+   * handing it to the transport.
+   *
+   * A `build()` that throws is treated exactly like a `write()` that
+   * rejects -- recorded as this attempt's cause and left to the attempt's
+   * own timer to pace, never allowed to escape `send()`.
+   */
+  build(): Buffer;
   /** Called with every inbound notification while this command is the
    *  active one. Must be cheap and side-effect-free: it may be called
    *  once more than strictly necessary (see the module header's note on
@@ -192,6 +243,10 @@ export interface TrafficQueueOptions {
   /** Total attempts for one logical command, INCLUDING the first --
    *  "bounded a number of times" per the design, never unbounded. */
   readonly maxAttempts?: number;
+  /** How many commands may be WAITING (not counting the one in flight)
+   *  before `send()` refuses rather than queuing. See
+   *  `DEFAULT_MAX_BACKLOG`. */
+  readonly maxBacklog?: number;
 }
 
 // Engineering choices, not specification values -- see TrafficQueueOptions
@@ -210,13 +265,35 @@ export interface TrafficQueueOptions {
 export const DEFAULT_TIMEOUT_MS = SCAN_DURATION_MS * 2;
 export const DEFAULT_MAX_ATTEMPTS = 3;
 
+/**
+ * THE BACKLOG IS BOUNDED (review finding, final wave). The design clause this
+ * queue exists for is "All mesh traffic passes through one queue so commands
+ * never flood the network" -- and an UNBOUNDED backlog breaks it from the
+ * other end: a producer that enqueues faster than this queue can drain does
+ * not flood the radio, it floods memory, and every command behind the pile
+ * waits for all of it. A reviewer measured exactly that happening with one
+ * unreachable bulb: two hundred poll ticks produced two hundred state
+ * re-reads started, sixteen settled, and a backlog of one hundred and
+ * eighty-four growing linearly, with a user's command on a WORKING bulb
+ * queued behind the lot.
+ *
+ * The producer side of that is fixed where it belongs (drivers/light/
+ * meshLight.ts's own in-flight flag and backoff). This bound is the second
+ * half, and it is here because a queue that can only ever grow is a design
+ * defect regardless of who is feeding it: refusing immediately tells the
+ * caller the truth now, whereas accepting means promising something this
+ * queue has no prospect of delivering in any useful time.
+ *
+ * Not a specification value -- an engineering choice, like the two constants
+ * above. 32 is comfortably more than this design can legitimately produce at
+ * once (three bulbs, at most four Gets each on a reconnect, plus whatever the
+ * user is pressing) and small enough that reaching it means something is
+ * genuinely wrong rather than merely busy.
+ */
+export const DEFAULT_MAX_BACKLOG = 32;
+
 interface QueueEntry {
   readonly command: QueuedCommand;
-  /** An immutable snapshot taken at `send()` time -- never the caller's
-   *  own buffer, so a caller mutating what it passed in after `send()`
-   *  returns (while this command is still sitting in the backlog, or
-   *  being retried) can never change what actually goes out on the wire. */
-  readonly data: Buffer;
   readonly resolve: (data: Buffer) => void;
   readonly reject: (err: Error) => void;
 }
@@ -280,6 +357,7 @@ export class TrafficQueue {
   private readonly clock: ClockPort;
   private readonly timeoutMs: number;
   private readonly maxAttempts: number;
+  private readonly maxBacklog: number;
 
   private readonly backlog: QueueEntry[] = [];
   private active: ActiveEntry | null = null;
@@ -295,10 +373,15 @@ export class TrafficQueue {
     if (!Number.isInteger(maxAttempts) || maxAttempts < 1) {
       throw new Error(`TrafficQueue: maxAttempts must be an integer >= 1, got ${maxAttempts}`);
     }
+    const maxBacklog = options.maxBacklog ?? DEFAULT_MAX_BACKLOG;
+    if (!Number.isInteger(maxBacklog) || maxBacklog < 1) {
+      throw new Error(`TrafficQueue: maxBacklog must be an integer >= 1, got ${maxBacklog}`);
+    }
     this.transport = transport;
     this.clock = clock;
     this.timeoutMs = timeoutMs;
     this.maxAttempts = maxAttempts;
+    this.maxBacklog = maxBacklog;
     this.transport.onNotification((data) => this.handleNotification(data));
   }
 
@@ -311,7 +394,15 @@ export class TrafficQueue {
    */
   send(command: QueuedCommand): Promise<Buffer> {
     return new Promise<Buffer>((resolve, reject) => {
-      this.backlog.push({ command, data: Buffer.from(command.data), resolve, reject });
+      if (this.backlog.length >= this.maxBacklog) {
+        reject(
+          new Error(
+            `${command.description}: the mesh traffic queue is full (${this.maxBacklog} commands already waiting) — refusing rather than growing the backlog`,
+          ),
+        );
+        return;
+      }
+      this.backlog.push({ command, resolve, reject });
       this.pump();
     });
   }
@@ -341,16 +432,15 @@ export class TrafficQueue {
   }
 
   /**
-   * Makes one attempt at `entry`: writes its bytes (unchanged from the
-   * first attempt -- see `QueueEntry.data`'s own doc comment, and the
-   * module header's TID note), copied again here so the transport can
-   * never mutate this entry's own stored snapshot (the global "never
-   * retain a view into a buffer you do not own" constraint applies to what
-   * this module HANDS OUT, not only to what it receives -- a port that
-   * wrote into the buffer it was given would otherwise corrupt every later
-   * retry of the same command), and starts this attempt's timeout. The
-   * timeout is armed BEFORE `write()` settles, not after, so a slow or
-   * failing write cannot itself consume time outside what `timeoutMs`
+   * Makes one attempt at `entry`: asks the command to BUILD this attempt's
+   * bytes (see the module header's "A RETRY REBUILDS ITS BYTES" note, and
+   * its TID note for what stays the same across attempts), copies them so
+   * the transport can never mutate what the caller handed back (the global
+   * "never retain a view into a buffer you do not own" constraint applies to
+   * what this module HANDS OUT, not only to what it receives), and starts
+   * this attempt's timeout. The timeout is armed BEFORE `build()` or
+   * `write()` runs, not after, so a slow or failing write -- or a `build()`
+   * that throws -- cannot itself consume time outside what `timeoutMs`
    * already bounds.
    */
   private attempt(entry: ActiveEntry): void {
@@ -358,7 +448,22 @@ export class TrafficQueue {
     entry.lastError = null;
     const token = entry.attemptsMade;
     entry.timer = this.clock.setTimeout(() => this.onAttemptTimedOut(entry, token), this.timeoutMs);
-    this.transport.write(Buffer.from(entry.data)).catch((err: unknown) => {
+    let data: Buffer;
+    try {
+      // ONCE PER ATTEMPT -- see the module header's "A RETRY REBUILDS ITS
+      // BYTES" note. The copy below is still this module's own: `build()` is
+      // caller code and is free to hand back a buffer it keeps a reference
+      // to, and the transport is free to write into whatever it is given.
+      data = Buffer.from(entry.command.build());
+    } catch (err: unknown) {
+      // Treated exactly like a write() rejection: a reason to WAIT (the timer
+      // armed above paces the retry), not a reason to retry instantly from
+      // inside this frame -- and never allowed to escape, since `attempt`
+      // runs synchronously inside `send()` for the first command.
+      entry.lastError = err instanceof Error ? err : new Error(String(err));
+      return;
+    }
+    this.transport.write(data).catch((err: unknown) => {
       // A later attempt may already have started (the timeout for THIS
       // attempt fired before this rejection arrived) -- `token` no longer
       // matching means this rejection is stale and must change nothing.

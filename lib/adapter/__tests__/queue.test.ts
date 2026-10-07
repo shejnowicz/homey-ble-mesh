@@ -2,7 +2,13 @@ import { randomBytes } from 'node:crypto';
 import { ProxyConnectionManager, SCAN_DURATION_MS } from '../connection';
 import { FakeBluetoothPort } from './fakeBluetooth';
 import { createFakeClock, type FakeClock } from './fakeClock';
-import { TrafficQueue, DEFAULT_TIMEOUT_MS, DEFAULT_MAX_ATTEMPTS, type QueuedCommand } from '../queue';
+import {
+  TrafficQueue,
+  DEFAULT_TIMEOUT_MS,
+  DEFAULT_MAX_ATTEMPTS,
+  DEFAULT_MAX_BACKLOG,
+  type QueuedCommand,
+} from '../queue';
 
 /** Waits a full macrotask turn, same technique (and same reason) as
  *  fakeClock.ts's own private `flushMicrotasks`: a rejection released via
@@ -49,7 +55,7 @@ function flushMicrotasks(): Promise<void> {
  * specifically about reconnection or about never having connected at all.
  */
 
-function setUp(options?: { timeoutMs?: number; maxAttempts?: number; realtimeScan?: boolean }): {
+function setUp(options?: { timeoutMs?: number; maxAttempts?: number; maxBacklog?: number; realtimeScan?: boolean }): {
   bluetooth: FakeBluetoothPort;
   clock: FakeClock;
   manager: ProxyConnectionManager;
@@ -60,7 +66,11 @@ function setUp(options?: { timeoutMs?: number; maxAttempts?: number; realtimeSca
   const bluetooth = new FakeBluetoothPort(options?.realtimeScan === true ? clock : undefined);
   const manager = new ProxyConnectionManager(bluetooth, clock, netKey);
   bluetooth.addNode({ id: 'A', rssi: -50, networkKey: netKey });
-  const queue = new TrafficQueue(manager, clock, { timeoutMs: options?.timeoutMs, maxAttempts: options?.maxAttempts });
+  const queue = new TrafficQueue(manager, clock, {
+    timeoutMs: options?.timeoutMs,
+    maxAttempts: options?.maxAttempts,
+    maxBacklog: options?.maxBacklog,
+  });
   return { bluetooth, clock, manager, queue };
 }
 
@@ -87,6 +97,96 @@ describe('constructor validation', () => {
     expect(() => new TrafficQueue(manager, clock, { maxAttempts })).toThrow(
       `TrafficQueue: maxAttempts must be an integer >= 1, got ${maxAttempts}`,
     );
+  });
+
+  test.each([0, -1, 2.5])('rejects a maxBacklog that is not a positive integer (%p), naming it', (maxBacklog) => {
+    const { manager, clock } = setUp();
+    expect(() => new TrafficQueue(manager, clock, { maxBacklog })).toThrow(
+      `TrafficQueue: maxBacklog must be an integer >= 1, got ${maxBacklog}`,
+    );
+  });
+});
+
+/**
+ * THE BOUNDED BACKLOG — review finding (final wave). The design clause this
+ * queue exists for is "All mesh traffic passes through one queue so commands
+ * never flood the network", and an unbounded backlog breaks it from the
+ * producer end: a reviewer MEASURED two hundred poll ticks producing two
+ * hundred state re-reads started, sixteen settled, and a backlog of one
+ * hundred and eighty-four growing linearly, with a user's command on a
+ * WORKING bulb stuck behind all of it.
+ *
+ * These tests MEASURE rather than assert that something eventually
+ * happened: they count what the backlog actually reaches under sustained
+ * over-production, and check that the number stops going up.
+ */
+describe('the backlog is bounded', () => {
+  test('a flood is refused at the bound rather than queued, and the refusal names the command and the bound', async () => {
+    const { bluetooth, clock, manager, queue } = setUp({ timeoutMs: 1000, maxAttempts: 1, maxBacklog: 4 });
+    await connect(manager, clock);
+
+    const outcomes: Array<'queued' | 'refused'> = [];
+    const settled: Array<Promise<unknown>> = [];
+    for (let i = 0; i < 50; i += 1) {
+      const p = queue
+        .send({ build: () => Buffer.from([i & 0xff]), description: `command ${i}`, isStatus: () => false })
+        .then(
+          () => undefined,
+          (err: Error) => {
+            if (/queue is full/.test(err.message)) outcomes[i] = 'refused';
+            return undefined;
+          },
+        );
+      if (outcomes[i] === undefined) outcomes[i] = 'queued';
+      settled.push(p);
+    }
+    await Promise.resolve();
+
+    // MEASURED: one command in flight plus a backlog that never exceeds the
+    // bound — 5 accepted out of 50 offered, 45 refused immediately. An
+    // unbounded queue accepts all 50 and writes the 50th only after 49
+    // timeouts.
+    const queued = outcomes.filter((o) => o === 'queued').length;
+    expect(queued).toBe(5);
+    expect(outcomes.filter((o) => o === 'refused')).toHaveLength(45);
+    expect(bluetooth.writesReceived).toHaveLength(1); // exactly one in flight, as always
+
+    // The refusal is specific, not a generic timeout.
+    await expect(
+      queue.send({ build: () => Buffer.from([0xff]), description: 'one more', isStatus: () => false }),
+    ).rejects.toThrow('one more: the mesh traffic queue is full (4 commands already waiting) — refusing rather than growing the backlog');
+
+    // Drain, so nothing is left unhandled.
+    for (let i = 0; i < 6; i += 1) await clock.advance(1000);
+    await Promise.all(settled);
+  });
+
+  test('space freed by a settled command is reusable — the bound throttles, it does not latch', async () => {
+    const { clock, manager, queue } = setUp({ timeoutMs: 1000, maxAttempts: 1, maxBacklog: 1 });
+    await connect(manager, clock);
+
+    const inFlight = queue.send({ build: () => Buffer.from([0x01]), description: 'A', isStatus: () => false });
+    const waiting = queue.send({ build: () => Buffer.from([0x02]), description: 'B', isStatus: () => false });
+    const rejections = Promise.all([
+      expect(inFlight).rejects.toThrow('A: no status'),
+      expect(waiting).rejects.toThrow('B: no status'),
+    ]);
+    await expect(
+      queue.send({ build: () => Buffer.from([0x03]), description: 'C', isStatus: () => false }),
+    ).rejects.toThrow(/queue is full/);
+
+    await clock.advance(1000); // A gives up, B starts, the backlog empties
+
+    const accepted = queue.send({ build: () => Buffer.from([0x04]), description: 'D', isStatus: () => false });
+    const acceptedRejection = expect(accepted).rejects.toThrow('D: no status');
+    await clock.advance(1000);
+    await clock.advance(1000);
+    await rejections;
+    await acceptedRejection;
+  });
+
+  test('DEFAULT_MAX_BACKLOG is 32', () => {
+    expect(DEFAULT_MAX_BACKLOG).toBe(32);
   });
 });
 
@@ -117,7 +217,7 @@ describe('defaults', () => {
     const { bluetooth, clock, manager, queue } = setUp(); // no overrides at all
     await connect(manager, clock);
 
-    const promise = queue.send({ data: Buffer.from([0x01]), description: 'test command', isStatus: () => false });
+    const promise = queue.send({ build: () => Buffer.from([0x01]), description: 'test command', isStatus: () => false });
     const rejection = expect(promise).rejects.toThrow(
       `test command: no status received after ${DEFAULT_MAX_ATTEMPTS} attempts`,
     );
@@ -151,8 +251,8 @@ describe('serialisation', () => {
     const { bluetooth, clock, manager, queue } = setUp();
     await connect(manager, clock);
 
-    const a: QueuedCommand = { data: Buffer.from([0xa1]), description: 'command A', isStatus: (n) => n.equals(Buffer.from([0xf1])) };
-    const b: QueuedCommand = { data: Buffer.from([0xa2]), description: 'command B', isStatus: (n) => n.equals(Buffer.from([0xf2])) };
+    const a: QueuedCommand = { build: () => Buffer.from([0xa1]), description: 'command A', isStatus: (n) => n.equals(Buffer.from([0xf1])) };
+    const b: QueuedCommand = { build: () => Buffer.from([0xa2]), description: 'command B', isStatus: (n) => n.equals(Buffer.from([0xf2])) };
 
     const pA = queue.send(a);
     const pB = queue.send(b);
@@ -184,9 +284,9 @@ describe('serialisation', () => {
     const { bluetooth, clock, manager, queue } = setUp();
     await connect(manager, clock);
 
-    const a = queue.send({ data: Buffer.from([0xa1]), description: 'A', isStatus: (n) => n.equals(Buffer.from([0xf1])) });
-    const b = queue.send({ data: Buffer.from([0xa2]), description: 'B', isStatus: (n) => n.equals(Buffer.from([0xf2])) });
-    const c = queue.send({ data: Buffer.from([0xa3]), description: 'C', isStatus: (n) => n.equals(Buffer.from([0xf3])) });
+    const a = queue.send({ build: () => Buffer.from([0xa1]), description: 'A', isStatus: (n) => n.equals(Buffer.from([0xf1])) });
+    const b = queue.send({ build: () => Buffer.from([0xa2]), description: 'B', isStatus: (n) => n.equals(Buffer.from([0xf2])) });
+    const c = queue.send({ build: () => Buffer.from([0xa3]), description: 'C', isStatus: (n) => n.equals(Buffer.from([0xf3])) });
 
     expect(bluetooth.writesReceived.map((w) => w.data.toString('hex'))).toEqual(['a1']);
 
@@ -214,14 +314,14 @@ describe('serialisation', () => {
     const { bluetooth, clock, manager, queue } = setUp({ timeoutMs: 1000, maxAttempts: 1 });
     await connect(manager, clock);
 
-    const a = queue.send({ data: Buffer.from([0xa1]), description: 'A', isStatus: () => false });
+    const a = queue.send({ build: () => Buffer.from([0xa1]), description: 'A', isStatus: () => false });
     // `toThrow` with a plain string is a SUBSTRING match -- "after 1 attempt"
     // is itself a substring of "after 1 attempts", so that form cannot tell
     // the singular grammar apart from a mutation that leaves it always
     // plural (review finding). Anchored with `$` so only the exact,
     // singular ending matches.
     const aRejection = expect(a).rejects.toThrow(/^A: no status received after 1 attempt$/);
-    const b = queue.send({ data: Buffer.from([0xa2]), description: 'B', isStatus: (n) => n.equals(Buffer.from([0xf2])) });
+    const b = queue.send({ build: () => Buffer.from([0xa2]), description: 'B', isStatus: (n) => n.equals(Buffer.from([0xf2])) });
 
     expect(bluetooth.writesReceived.map((w) => w.data.toString('hex'))).toEqual(['a1']); // B still waiting behind A
 
@@ -252,7 +352,7 @@ describe('a command whose status arrives', () => {
 
     const data = Buffer.from([0x11, 0x22]);
     const status = Buffer.from([0x33, 0x44]);
-    const promise = queue.send({ data, description: 'test command', isStatus: (n) => n.equals(status) });
+    const promise = queue.send({ build: () => data, description: 'test command', isStatus: (n) => n.equals(status) });
 
     bluetooth.simulateNotification('A', status);
 
@@ -291,7 +391,7 @@ describe('a command whose status arrives', () => {
     const pendingBeforeSend = clock.pendingCount();
 
     const status = Buffer.from([0x77]);
-    const promise = queue.send({ data: Buffer.from([0x01]), description: 'test command', isStatus: (n) => n.equals(status) });
+    const promise = queue.send({ build: () => Buffer.from([0x01]), description: 'test command', isStatus: (n) => n.equals(status) });
     expect(clock.pendingCount()).toBe(pendingBeforeSend + 1); // this attempt's own timer is now pending
 
     bluetooth.simulateNotification('A', status); // resolves well before timeoutMs elapses
@@ -320,7 +420,7 @@ describe('bounded retries', () => {
     const { bluetooth, clock, manager, queue } = setUp({ timeoutMs: 1000, maxAttempts: 3 });
     await connect(manager, clock);
 
-    const promise = queue.send({ data: Buffer.from([0x01]), description: 'Generic OnOff Set 0x0042', isStatus: () => false });
+    const promise = queue.send({ build: () => Buffer.from([0x01]), description: 'Generic OnOff Set 0x0042', isStatus: () => false });
     const rejection = expect(promise).rejects.toThrow('Generic OnOff Set 0x0042: no status received after 3 attempts');
 
     await clock.advance(1000); // attempt 1 times out -> retry (attempt 2)
@@ -355,7 +455,7 @@ describe('bounded retries', () => {
     const { clock, queue } = setUp({ timeoutMs: 1000, maxAttempts: 2 });
     // Deliberately never call connect(): manager.write() always rejects.
 
-    const promise = queue.send({ data: Buffer.from([0x01]), description: 'test command', isStatus: () => false });
+    const promise = queue.send({ build: () => Buffer.from([0x01]), description: 'test command', isStatus: () => false });
     const rejection = expect(promise).rejects.toThrow(
       'test command: no status received after 2 attempts (last attempt: ProxyConnectionManager.write: no active proxy connection)',
     );
@@ -392,7 +492,7 @@ describe('bounded retries', () => {
     await connect(manager, clock);
     bluetooth.setWriteBehavior('A', 'fail'); // attempt 1's write rejects immediately, with a fixed, named cause
 
-    const promise = queue.send({ data: Buffer.from([0x01]), description: 'test command', isStatus: () => false });
+    const promise = queue.send({ build: () => Buffer.from([0x01]), description: 'test command', isStatus: () => false });
     let caught: Error | undefined;
     promise.catch((err: Error) => {
       caught = err;
@@ -460,7 +560,7 @@ describe('disconnection mid-command', () => {
     expect(bluetooth.writesReceived).toHaveLength(0);
 
     const status = Buffer.from([0x42]);
-    const promise = queue.send({ data: Buffer.from([0x01]), description: 'test command', isStatus: (n) => n.equals(status) });
+    const promise = queue.send({ build: () => Buffer.from([0x01]), description: 'test command', isStatus: (n) => n.equals(status) });
     let settled = false;
     promise.then(
       () => {
@@ -508,7 +608,7 @@ describe('disconnection mid-command', () => {
     expect(bluetooth.connectCalls).toEqual(['A']);
 
     const status = Buffer.from([0x99]);
-    const promise = queue.send({ data: Buffer.from([0x01]), description: 'test command', isStatus: (n) => n.equals(status) });
+    const promise = queue.send({ build: () => Buffer.from([0x01]), description: 'test command', isStatus: (n) => n.equals(status) });
     expect(bluetooth.writesReceived).toHaveLength(1); // the first attempt's write went out before the disconnect
 
     bluetooth.simulateDisconnect('A'); // the link drops while we are waiting for a status
@@ -548,7 +648,7 @@ describe('unsolicited statuses', () => {
     queue.onUnsolicited((data) => received.push(data));
 
     const expectedStatus = Buffer.from([0x55]);
-    const promise = queue.send({ data: Buffer.from([0x01]), description: 'test command', isStatus: (n) => n.equals(expectedStatus) });
+    const promise = queue.send({ build: () => Buffer.from([0x01]), description: 'test command', isStatus: (n) => n.equals(expectedStatus) });
 
     const unsolicited = Buffer.from([0x66]); // does not satisfy isStatus
     bluetooth.simulateNotification('A', unsolicited);
@@ -652,14 +752,14 @@ describe('the subtle case: a late status for an abandoned command', () => {
 
     const isOnOffStatus = (n: Buffer): boolean => n.length >= 1 && n[0] === 0x01;
 
-    const a = queue.send({ data: Buffer.from([0xa0]), description: 'command A', isStatus: isOnOffStatus });
+    const a = queue.send({ build: () => Buffer.from([0xa0]), description: 'command A', isStatus: isOnOffStatus });
     const aRejection = expect(a).rejects.toThrow('command A: no status received after 2 attempts');
     await clock.advance(1000); // attempt 1 times out -> retry
     await clock.advance(1000); // attempt 2 times out -> A gives up
     await aRejection;
     expect(bluetooth.writesReceived).toHaveLength(2); // A's two attempts
 
-    const b = queue.send({ data: Buffer.from([0xb0]), description: 'command B', isStatus: isOnOffStatus });
+    const b = queue.send({ build: () => Buffer.from([0xb0]), description: 'command B', isStatus: isOnOffStatus });
     expect(bluetooth.writesReceived).toHaveLength(3); // B's first attempt
 
     // The late straggler: A's real (belated) status, arriving only now --
@@ -695,7 +795,7 @@ describe('the subtle case: a late status for an abandoned command', () => {
     const received: Buffer[] = [];
     queue.onUnsolicited((data) => received.push(data));
 
-    const a = queue.send({ data: Buffer.from([0x01]), description: 'command A', isStatus: () => false });
+    const a = queue.send({ build: () => Buffer.from([0x01]), description: 'command A', isStatus: () => false });
     // Anchored regex, not a plain substring -- see the identical note on
     // the "not stranded forever" test above; "after 1 attempt" is a
     // substring of "after 1 attempts" either way.
@@ -725,7 +825,7 @@ describe('the subtle case: a late status for an abandoned command', () => {
     queue.onUnsolicited((data) => received.push(data));
 
     const promise = queue.send({
-      data: Buffer.from([0x01]),
+      build: () => Buffer.from([0x01]),
       description: 'test command',
       isStatus: () => {
         throw new Error('predicate exploded');
@@ -745,30 +845,103 @@ describe('the subtle case: a late status for an abandoned command', () => {
 
 describe('defensive copying', () => {
   /**
-   * Mirrors connection.test.ts's own "passes k3 a copy" test, applied to
-   * this module's own global-constraint obligation: `send()` must take an
-   * immutable snapshot immediately, since a caller is free to reuse or
-   * mutate its buffer right after calling `send()`, while the command may
-   * still be sitting in the backlog or being retried much later.
+   * REPLACES "send() snapshots the command data", which pinned the OLD
+   * contract this round deliberately removed: the queue no longer takes a
+   * snapshot at `send()` time, it asks the caller to BUILD the bytes once
+   * per attempt (see queue.ts's "A RETRY REBUILDS ITS BYTES" note). The
+   * obligation that remains is the one still in this module's gift: the
+   * caller's returned buffer is copied before it reaches the transport.
+   *
+   * MUTATION PROOF: dropping the `Buffer.from(...)` in `attempt()` and
+   * passing the builder's own buffer straight through fails this test,
+   * because `builderBuffer` below is reused across attempts exactly as a
+   * real caller's might be, and the hostile transport scribbles on it.
    */
-  test('send() snapshots the command data -- mutating the caller\'s buffer afterward does not change what gets (re)sent', async () => {
-    const { bluetooth, clock, manager, queue } = setUp({ timeoutMs: 1000, maxAttempts: 2 });
-    await connect(manager, clock);
+  test('a transport that mutates what it was given cannot corrupt the builder\'s own buffer', async () => {
+    const clock = createFakeClock();
+    const written: Buffer[] = [];
+    const builderBuffer = Buffer.from([0x01, 0x02]); // the SAME buffer every attempt
+    const mutatingTransport = {
+      write: async (data: Buffer): Promise<void> => {
+        written.push(Buffer.from(data));
+        data.fill(0xee);
+      },
+      onNotification: (): (() => void) => () => {},
+    };
+    const queue = new TrafficQueue(mutatingTransport, clock, { timeoutMs: 1000, maxAttempts: 2 });
 
-    const data = Buffer.from([0x01, 0x02]);
-    const promise = queue.send({ data, description: 'test command', isStatus: () => false });
-    // Attached before the promise ever settles -- see the other tests'
-    // identical pattern; attaching the rejection handler only after both
-    // `advance()` calls below left a window where Node saw an unhandled
-    // rejection and failed the test with it directly, rather than letting
-    // this test's own assertions run.
+    const promise = queue.send({ build: () => builderBuffer, description: 'test command', isStatus: () => false });
     const rejection = expect(promise).rejects.toThrow('test command: no status received after 2 attempts');
-    data.fill(0xff); // mutate the caller's own buffer right after send() returns
 
     await clock.advance(1000); // attempt 1 times out -> retry (attempt 2)
-    expect(bluetooth.writesReceived.map((w) => w.data.toString('hex'))).toEqual(['0102', '0102']);
+    expect(written.map((b) => b.toString('hex'))).toEqual(['0102', '0102']); // NOT ['0102', 'eeee']
+    expect(builderBuffer.toString('hex')).toBe('0102'); // the caller's own buffer, untouched
 
-    await clock.advance(1000); // attempt 2 times out -> final failure, not the point of this test
+    await clock.advance(1000);
+    await rejection;
+  });
+
+  /**
+   * The new contract itself, pinned by counting: `build()` is consulted
+   * once per ATTEMPT, not once per command. A queue that called it once and
+   * cached the result would pass every OTHER test in this file (the bytes
+   * would be identical and everything would still settle) — this is the one
+   * that can tell the difference, and it is the whole of C4's mechanism.
+   */
+  test('build() is called exactly once per attempt, and each attempt writes what that call returned', async () => {
+    const { bluetooth, clock, manager, queue } = setUp({ timeoutMs: 1000, maxAttempts: 3 });
+    await connect(manager, clock);
+
+    let builds = 0;
+    const promise = queue.send({
+      build: () => {
+        builds += 1;
+        return Buffer.from([0xa0 + builds]); // a different buffer per attempt, so the writes are distinguishable
+      },
+      description: 'test command',
+      isStatus: () => false,
+    });
+    const rejection = expect(promise).rejects.toThrow('test command: no status received after 3 attempts');
+
+    expect(builds).toBe(1);
+    await clock.advance(1000);
+    expect(builds).toBe(2);
+    await clock.advance(1000);
+    expect(builds).toBe(3);
+    await clock.advance(1000);
+    await rejection;
+
+    expect(builds).toBe(3); // bounded by maxAttempts, not one more
+    expect(bluetooth.writesReceived.map((w) => w.data.toString('hex'))).toEqual(['a1', 'a2', 'a3']);
+  });
+
+  /**
+   * A `build()` that throws must behave exactly like a `write()` that
+   * rejects: recorded as this attempt's cause, paced by this attempt's own
+   * timer, and never escaping `send()` — which it would, synchronously,
+   * if `attempt()` did not catch it, because the first attempt runs inside
+   * the `send()` call itself.
+   */
+  test('a build() that throws fails the command honestly rather than escaping send()', async () => {
+    const { clock, manager, queue } = setUp({ timeoutMs: 1000, maxAttempts: 2 });
+    await connect(manager, clock);
+
+    let promise: Promise<Buffer> | null = null;
+    expect(() => {
+      promise = queue.send({
+        build: () => {
+          throw new Error('mesh network is not initialized');
+        },
+        description: 'test command',
+        isStatus: () => false,
+      });
+    }).not.toThrow();
+
+    const rejection = expect(promise as unknown as Promise<Buffer>).rejects.toThrow(
+      'test command: no status received after 2 attempts (last attempt: mesh network is not initialized)',
+    );
+    await clock.advance(1000);
+    await clock.advance(1000);
     await rejection;
   });
 
@@ -797,7 +970,7 @@ describe('defensive copying', () => {
     const queue = new TrafficQueue(mutatingTransport, clock, { timeoutMs: 1000, maxAttempts: 2 });
 
     const original = Buffer.from([0x01, 0x02]);
-    const promise = queue.send({ data: original, description: 'test command', isStatus: () => false });
+    const promise = queue.send({ build: () => original, description: 'test command', isStatus: () => false });
     // Review finding: this was a bare `toThrow()` (an assertion that cannot
     // fail on message content) in the very round that reported eliminating
     // those. This transport's `write()` always resolves, so the failure is
@@ -841,7 +1014,7 @@ describe('a write() that settles late, after its own attempt has already been su
     await connect(manager, clock);
     bluetooth.setWriteBehavior('A', 'hold');
 
-    const promise = queue.send({ data: Buffer.from([0x01]), description: 'test command', isStatus: () => false });
+    const promise = queue.send({ build: () => Buffer.from([0x01]), description: 'test command', isStatus: () => false });
     const rejection = expect(promise).rejects.toThrow('test command: no status received after 3 attempts');
     expect(bluetooth.writesReceived).toHaveLength(1); // attempt 1's write is held open, deliberately never settled
 
@@ -885,7 +1058,7 @@ describe('a write() that settles late, after its own attempt has already been su
     await connect(manager, clock);
     bluetooth.setWriteBehavior('A', 'hold');
 
-    const promise = queue.send({ data: Buffer.from([0x01]), description: 'test command', isStatus: () => false });
+    const promise = queue.send({ build: () => Buffer.from([0x01]), description: 'test command', isStatus: () => false });
     const rejection = expect(promise).rejects.toThrow(
       'test command: no status received after 2 attempts (last attempt: FakeBluetoothPort.write: configured to fail for "A")',
     );
