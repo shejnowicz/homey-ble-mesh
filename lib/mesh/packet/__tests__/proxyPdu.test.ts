@@ -15,6 +15,8 @@ import {
   PROXY_SAR_LAST,
   PROXY_SAR_SHIFT,
   PROXY_SAR_TIMEOUT_MS,
+  MAX_NETWORK_PDU_LENGTH,
+  MAX_SUPPORTED_PROVISIONING_PDU_LENGTH,
   type ProxyReassemblyResult,
   type ProxyReassemblyState,
 } from '../proxyPdu';
@@ -225,12 +227,23 @@ describe('acceptProxyPdu (Section 6.3.2.2 "Reassembly")', () => {
     expect(result.kind === 'complete' && result.message).toEqual(message);
   });
 
-  test('round-trips every message length across a segment boundary', () => {
-    for (let length = 1; length <= 40; length += 1) {
+  /**
+   * Per MessageType, because each now has its own maximum (Section
+   * 6.3.2.2's length conditions — see this file's own finding-3 block at the
+   * end). The lengths swept here stop at each type's maximum rather than at
+   * one shared number: a Network PDU of 40 octets is not a long message,
+   * it is an illegal one, and asserting it round-trips would be asserting
+   * the opposite of what the specification says.
+   */
+  test.each([
+    ['a Network PDU', PROXY_MESSAGE_TYPE_NETWORK_PDU, MAX_NETWORK_PDU_LENGTH],
+    ['a Provisioning PDU', PROXY_MESSAGE_TYPE_PROVISIONING_PDU, MAX_SUPPORTED_PROVISIONING_PDU_LENGTH],
+  ])('round-trips every legal %s length across a segment boundary', (_name, messageType, maxLength) => {
+    for (let length = 1; length <= maxLength; length += 1) {
       // Distinct, non-palindromic contents: byte i is i+1, so reversal and
       // mis-ordering are both detectable at every length.
       const message = Buffer.from(Array.from({ length }, (_, i) => (i + 1) & 0xff));
-      const result = feed(encodeProxyPdus(PROXY_MESSAGE_TYPE_NETWORK_PDU, message, 8));
+      const result = feed(encodeProxyPdus(messageType, message, 8));
       expect(result.kind).toBe('complete');
       expect(result.kind === 'complete' && result.message).toEqual(message);
     }
@@ -381,5 +394,124 @@ describe('defensive copying', () => {
       0,
     );
     expect(completed.kind === 'complete' && completed.message).toEqual(Buffer.from([0x11, 0x22, 0x33]));
+  });
+});
+
+/**
+ * FINAL RE-REVIEW, FINDING 3 (LOW). Section 6.3.2.2's disconnect list is
+ * four bullets long, not one, and this module implemented only the
+ * unexpected-SAR sentence while its header asserted the list was complete.
+ * A reviewer measured the consequence: feeding one first segment and then
+ * continuations, `acceptProxyPdu` returned `'incomplete'` 5 001 times and
+ * accumulated 95 019 octets into a single in-progress Network PDU
+ * reassembly, when the maximal Network PDU is 29 octets. The only bound was
+ * the 20-second window and the link's throughput.
+ */
+describe('Section 6.3.2.2\'s length conditions (final re-review, finding 3)', () => {
+  test('the two maxima are what Table 3.10 and Table 5.36 add up to', () => {
+    // Table 3.10: IVI(1)+NID(7)+CTL(1)+TTL(7)+SEQ(24)+SRC(16)+DST(16) = 72
+    // bits = 9 octets of header. The TransportPDU/NetMIC pair maxes out at
+    // 20 octets either way round: CTL=0 gives a 4-octet NetMIC over a
+    // 16-octet Access message (Table 3.17's 1 + 15, Table 3.18's 4 + 12),
+    // CTL=1 an 8-octet NetMIC over a 12-octet Control message (Table 3.19's
+    // 1 + 11, Table 3.22's 4 + 8).
+    expect(MAX_NETWORK_PDU_LENGTH).toBe(9 + 20);
+    // Table 5.17's Padding(2)+Type(6) octet, plus the largest Parameters
+    // field among the ten Provisioning PDU types this project supports:
+    // Table 5.36's Public Key X (32) + Public Key Y (32).
+    expect(MAX_SUPPORTED_PROVISIONING_PDU_LENGTH).toBe(1 + 64);
+  });
+
+  test('a complete Network PDU of exactly the maximal size is accepted', () => {
+    const message = Buffer.alloc(MAX_NETWORK_PDU_LENGTH, 0x5a);
+    const result = acceptProxyPdu(undefined, Buffer.concat([Buffer.from([0x00]), message]), 0);
+    expect(result.kind).toBe('complete');
+    expect(result.kind === 'complete' && result.message).toEqual(message);
+  });
+
+  test('a complete Network PDU ONE octet longer is disconnected over, naming the condition', () => {
+    const message = Buffer.alloc(MAX_NETWORK_PDU_LENGTH + 1, 0x5a);
+    const result = acceptProxyPdu(undefined, Buffer.concat([Buffer.from([0x00]), message]), 0);
+    expect(result.kind).toBe('disconnect');
+    expect(result.kind === 'disconnect' && result.reason).toMatch(
+      /Data field .*30 octets.* longer than the maximal size of a Network PDU \(29/,
+    );
+  });
+
+  test('a REASSEMBLY cannot grow past the maximum either — the measured 95 019-octet accumulation', () => {
+    // The reviewer's own repro, bounded: one first segment, then
+    // continuations forever. Before this change every one of these returned
+    // 'incomplete' and the accumulated length just kept growing.
+    let state: ProxyReassemblyState | undefined;
+    let disconnectedAfter: number | null = null;
+    for (let i = 0; i < 5001; i += 1) {
+      const pdu = Buffer.concat([Buffer.from([i === 0 ? 0x40 : 0x80]), Buffer.alloc(19, 0x11)]);
+      const result = acceptProxyPdu(state, pdu, 0);
+      if (result.kind === 'disconnect') {
+        disconnectedAfter = i;
+        expect(result.reason).toMatch(/longer than the maximal size of a Network PDU \(29/);
+        break;
+      }
+      expect(result.kind).toBe('incomplete');
+      state = result.kind === 'incomplete' ? result.state : undefined;
+    }
+    // 19 Data octets per segment: one segment is 19, two are 38 — past 29.
+    expect(disconnectedAfter).toBe(1);
+  });
+
+  /**
+   * Not merely the mirror of the complete-message case. A FIRST segment
+   * whose own Data field is already over the maximum is something only a
+   * PEER can produce — `encodeProxyPdus` never would, because it is bounded
+   * by `maxPduLength` — and a peer can, on any link whose ATT_MTU was
+   * negotiated up (a Proxy PDU's size is "determined by the user of the
+   * Proxy protocol", Section 6.3, not fixed by this app's own choice for
+   * what it SENDS). Without this check the oversized message is accepted
+   * octet for octet and only rejected once a later segment pushes the
+   * running total over — i.e. never, if the sender simply stops. I added
+   * this test after mutation-testing found removing the first-segment check
+   * changed nothing observable.
+   */
+  test('a FIRST segment whose own Data field already exceeds the maximum is disconnected over on arrival', () => {
+    const oversized = Buffer.concat([Buffer.from([0x40]), Buffer.alloc(MAX_NETWORK_PDU_LENGTH + 1, 0x5a)]);
+    const result = acceptProxyPdu(undefined, oversized, 0);
+    expect(result.kind).toBe('disconnect');
+    expect(result.kind === 'disconnect' && result.reason).toMatch(/maximal size of a Network PDU \(29/);
+  });
+
+  test('the boundary is on the TOTAL, not on any one segment: 29 octets in three segments completes', () => {
+    const message = Buffer.alloc(MAX_NETWORK_PDU_LENGTH, 0x5a);
+    const result = feed(encodeProxyPdus(PROXY_MESSAGE_TYPE_NETWORK_PDU, message, 11));
+    expect(result.kind).toBe('complete');
+    expect(result.kind === 'complete' && result.message).toEqual(message);
+  });
+
+  test('...and one octet more, split the same way, disconnects on the segment that crosses it', () => {
+    const message = Buffer.alloc(MAX_NETWORK_PDU_LENGTH + 1, 0x5a);
+    const result = feed(encodeProxyPdus(PROXY_MESSAGE_TYPE_NETWORK_PDU, message, 11));
+    expect(result.kind).toBe('disconnect');
+    expect(result.kind === 'disconnect' && result.reason).toMatch(/maximal size of a Network PDU/);
+  });
+
+  test('a Provisioning PDU gets its OWN, larger maximum — the 65-octet Public Key PDU still reassembles', () => {
+    const publicKeyPdu = Buffer.alloc(MAX_SUPPORTED_PROVISIONING_PDU_LENGTH, 0x7e);
+    const result = feed(encodeProxyPdus(PROXY_MESSAGE_TYPE_PROVISIONING_PDU, publicKeyPdu, 20));
+    expect(result.kind).toBe('complete');
+    expect(result.kind === 'complete' && result.message).toEqual(publicKeyPdu);
+  });
+
+  test('a Provisioning PDU one octet past that maximum is disconnected over, naming its own condition', () => {
+    const tooLong = Buffer.alloc(MAX_SUPPORTED_PROVISIONING_PDU_LENGTH + 1, 0x7e);
+    const result = feed(encodeProxyPdus(PROXY_MESSAGE_TYPE_PROVISIONING_PDU, tooLong, 20));
+    expect(result.kind).toBe('disconnect');
+    expect(result.kind === 'disconnect' && result.reason).toMatch(
+      /longer than the maximal size of a supported Provisioning PDU \(65/,
+    );
+  });
+
+  test('the Network PDU maximum is not applied to a Provisioning PDU (a shared cap would reject the Public Key PDU)', () => {
+    const justPastNetwork = Buffer.alloc(MAX_NETWORK_PDU_LENGTH + 1, 0x7e);
+    const result = acceptProxyPdu(undefined, Buffer.concat([Buffer.from([0x03]), justPastNetwork]), 0);
+    expect(result.kind).toBe('complete');
   });
 });

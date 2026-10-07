@@ -114,11 +114,51 @@
  *     the first segment established: the Data field is defined as "a
  *     message defined by the MessageType field", singular, so one
  *     reassembly cannot carry two of them.
+ * THE LENGTH CONDITIONS, the rest of Section 6.3.2.2's list, transcribed in
+ * full (the module used to quote only the unexpected-SAR sentence above and
+ * then claim the list was complete, which is how a reassembly here grew to
+ * 95 019 octets in a reviewer's measurement — the maximal Network PDU is
+ * 29). The section states the list twice, once per role, identically; this
+ * is the Client copy, verbatim:
+ *
+ *   "Upon receiving a Proxy PDU matching one of the following conditions,
+ *   the Proxy PDU Client shall disconnect:
+ *     The MessageType field equal to a Network PDU and the Data field
+ *     longer than the maximal size of a Network PDU (see Section 3.4.4)
+ *     The MessageType field equal to a Mesh Beacon and the Data field
+ *     longer than the maximal size of a Mesh Beacon (see Section 3.10)
+ *     The MessageType field equal to a Proxy Configuration and the Data
+ *     field longer than the maximal size of a proxy configuration message
+ *     (see Section 6.6)
+ *     The MessageType field equal to a Provisioning PDU and the Data field
+ *     longer than the maximal size of a supported Provisioning PDU (see
+ *     Section 5.4.1)"
+ *
+ * TWO OF THE FOUR ARE UNREACHABLE HERE, and that is not an omission: Mesh
+ * Beacon (0x01) and Proxy Configuration (0x02) are not supported by this
+ * app, so Section 6.3.2 "Behavior"'s own "shall ignore this message" —
+ * checked BEFORE any of this, see `messageTypeIsSupported` — has already
+ * disposed of them. The two that remain are implemented, with their maxima
+ * below.
+ *
+ * "THE DATA FIELD", DURING A REASSEMBLY, IS THE WHOLE MESSAGE, which is the
+ * one reading these conditions can have inside a section titled
+ * "Reassembly": for a complete (0b00) PDU the Data field already IS the
+ * message, and for a segmented transfer "the Data field" of the message
+ * being assembled is the concatenation Section 6.3.2.1 defines the segments
+ * as dividing. So the limit is checked against the RUNNING TOTAL, which
+ * subsumes the per-PDU check (a single complete PDU's total is its own Data
+ * length) and is the only reading under which a reassembly is bounded at
+ * all. The alternative — comparing each segment's own Data field, which can
+ * never exceed one Proxy PDU — would make the condition unreachable by
+ * construction for every segmented message, which cannot be what a
+ * disconnect rule in the reassembly section means.
+ *
  * Everything NOT on that list is treated conservatively as `'ignored'`
  * (keeping any reassembly in progress intact), because the specification's
  * own disconnect list is explicit and a disconnect is the expensive
  * outcome: an empty PDU, a header with no Data at all, and — per Section
- * 6.3.2 "Behavior", quoted in `MESSAGE_TYPE_IS_SUPPORTED` below — any
+ * 6.3.2 "Behavior", quoted in `messageTypeIsSupported` below — any
  * message type this app does not support.
  *
  * STATELESS BY DESIGN, exactly like `reassembly.ts` and `message.ts` next
@@ -163,6 +203,82 @@ export const PROXY_MESSAGE_TYPE_RFU_FIRST = 0x04;
  *  seconds. When the timeout expires, the Proxy PDU Client shall
  *  disconnect." */
 export const PROXY_SAR_TIMEOUT_MS = 20_000;
+
+/**
+ * "the maximal size of a Network PDU (see Section 3.4.4)" — Section 6.3.2.2.
+ * The document publishes no number; Section 3.4.4 publishes the field
+ * widths, and these are what they add up to.
+ *
+ * Table 3.10 "Network PDU field definitions": IVI 1 bit, NID 7, CTL 1, TTL
+ * 7, SEQ 24, SRC 16, DST 16 — 72 bits, so 9 octets before the payload. The
+ * remaining two rows are "TransportPDU | 8 to 128" and "NetMIC | 32 or 64",
+ * which read alone would allow 9 + 16 + 8 = 33; but the two are not
+ * independent. Section 3.4.4.3 "CTL": "If the CTL field is set to 0, the
+ * NetMIC is a 32-bit field and the Lower Transport PDU contains an Access
+ * message. If the CTL field is set to 1, the NetMIC is a 64-bit field and
+ * the Lower Transport PDU contains a Transport Control message." So:
+ *   - CTL = 0, a 4-octet NetMIC over an Access message, whose own maximum
+ *     is 16 octets either form — Table 3.17 "Unsegmented Access message
+ *     format" (SEG+AKF+AID = 1 octet, Upper Transport Access PDU "40 to
+ *     120" bits = 15) and Table 3.18 "Segmented Access message format"
+ *     (4 octets of header, "Segment m | 8 to 96" = 12). 9 + 16 + 4 = 29.
+ *   - CTL = 1, an 8-octet NetMIC over a Control message, whose maximum is
+ *     12 octets either form — Table 3.19 "Unsegmented Control message
+ *     format" (1 octet, "Parameters | 0 to 88" = 11) and Table 3.22
+ *     "Segmented Control message format" (4 octets, "Segment m | 8 to 64"
+ *     = 8). 9 + 12 + 8 = 29.
+ * Both branches land on the same number, which is also the number Section
+ * 7.2.2.2.7 "ATT_MTU" implies from the other direction: "The server should
+ * support an ATT_MTU size equal to or larger than 33 octets to be able to
+ * pass the content of a full Proxy PDU (see Section 6.5)." — 33 less the
+ * 3 octets of ATT overhead is 30, one Proxy PDU header octet plus 29.
+ */
+export const MAX_NETWORK_PDU_LENGTH = 29;
+
+/**
+ * "the maximal size of a SUPPORTED Provisioning PDU (see Section 5.4.1)" —
+ * Section 6.3.2.2, and the emphasis is the specification's own: the bound
+ * is over the PDU types the implementation supports, not over everything
+ * Section 5.4.1 defines. This project supports Types 0x00-0x09 (see
+ * `lib/mesh/provisioning/pdu.ts`), and the largest of those is the
+ * Provisioning Public Key PDU.
+ *
+ * Table 5.17 "Provisioning PDU format" gives a 1-octet header (Padding 2
+ * bits, Type 6 bits) followed by "Parameters | variable". Table 5.36
+ * "Provisioning Public Key PDU Parameters Format": "Public Key X | 32" and
+ * "Public Key Y | 32" octets. 1 + 64 = 65. Nothing else this project
+ * supports comes close — the next largest is Provisioning Data at 1 + 25 +
+ * 8 = 34 (Table 5.39), then Confirmation/Random at 1 + 32 (Tables 5.37 and
+ * 5.38, whose field is "16 or 32" octets).
+ *
+ * The deliberately per-app part of this is the word "supported": a project
+ * that later implements Provisioning Record Response (Type 0x0B) would have
+ * to raise this, and `pdu.ts`'s own type list is where that would be
+ * noticed.
+ */
+export const MAX_SUPPORTED_PROVISIONING_PDU_LENGTH = 65;
+
+/** The maximal message size for one of the two MessageTypes this app
+ *  supports — see the two constants above, and `messageTypeIsSupported`
+ *  for why no other type ever reaches this. */
+function maxMessageLengthFor(messageType: number): number {
+  return messageType === PROXY_MESSAGE_TYPE_NETWORK_PDU
+    ? MAX_NETWORK_PDU_LENGTH
+    : MAX_SUPPORTED_PROVISIONING_PDU_LENGTH;
+}
+
+/** Section 6.3.2.2's length conditions, as one check over the message
+ *  length assembled so far — see the module header. `null` when the message
+ *  is within its maximum. */
+function tooLongReason(messageType: number, length: number): string | null {
+  const max = maxMessageLengthFor(messageType);
+  if (length <= max) return null;
+  const what =
+    messageType === PROXY_MESSAGE_TYPE_NETWORK_PDU
+      ? `the maximal size of a Network PDU (${max} octets, Section 3.4.4)`
+      : `the maximal size of a supported Provisioning PDU (${max} octets, Section 5.4.1)`;
+  return `MessageType 0x${messageType.toString(16).padStart(2, '0')} with a Data field of ${length} octets, longer than ${what} — Section 6.3.2.2`;
+}
 
 /**
  * Section 6.3.2 "Behavior": "Upon receiving a message with the Message Type
@@ -325,9 +441,13 @@ export function acceptProxyPdu(state: ProxyReassemblyState | undefined, pdu: Buf
           reason: 'unexpected SAR value 0b00 (a complete message) while a segmented message was still being reassembled',
         };
       }
+      {
+        const tooLong = tooLongReason(messageType, data.length);
+        if (tooLong !== null) return { kind: 'disconnect', state: undefined, reason: tooLong };
+      }
       return { kind: 'complete', state: undefined, messageType, message: Buffer.from(data) };
 
-    case PROXY_SAR_FIRST:
+    case PROXY_SAR_FIRST: {
       if (state !== undefined) {
         return {
           kind: 'disconnect',
@@ -335,7 +455,10 @@ export function acceptProxyPdu(state: ProxyReassemblyState | undefined, pdu: Buf
           reason: 'unexpected SAR value 0b01 (a first segment) while a segmented message was still being reassembled',
         };
       }
+      const tooLong = tooLongReason(messageType, data.length);
+      if (tooLong !== null) return { kind: 'disconnect', state: undefined, reason: tooLong };
       return { kind: 'incomplete', state: { messageType, segments: [Buffer.from(data)], startedAtMs: nowMs } };
+    }
 
     case PROXY_SAR_CONTINUATION:
     case PROXY_SAR_LAST: {
@@ -355,6 +478,15 @@ export function acceptProxyPdu(state: ProxyReassemblyState | undefined, pdu: Buf
             .padStart(2, '0')} established by the first segment of this message`,
         };
       }
+      // The running total, not this segment alone — see the module header's
+      // "THE DATA FIELD, DURING A REASSEMBLY, IS THE WHOLE MESSAGE" note.
+      // Summing the segments rather than carrying a length in the state
+      // keeps `ProxyReassemblyState` the three published fields it already
+      // is, and costs nothing: the sum is now bounded by the very limit it
+      // is checking.
+      const assembledLength = state.segments.reduce((total, segment) => total + segment.length, 0) + data.length;
+      const tooLong = tooLongReason(state.messageType, assembledLength);
+      if (tooLong !== null) return { kind: 'disconnect', state: undefined, reason: tooLong };
       const segments = [...state.segments, Buffer.from(data)];
       if (sar === PROXY_SAR_CONTINUATION) {
         return { kind: 'incomplete', state: { ...state, segments } };
