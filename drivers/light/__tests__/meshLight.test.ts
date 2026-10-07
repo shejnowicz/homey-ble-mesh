@@ -1973,3 +1973,180 @@ describe('createSerialProbeRunner', () => {
     expect(await Promise.all([runner.run(async () => 1), runner.run(async () => 2)])).toEqual([1, 2]);
   });
 });
+
+// ===========================================================================
+// THE BACKFILL PROBE'S TRIGGER — coordinator ruling, after this change first
+// hung it off device `onInit`.
+//
+// Homey runs the APP's own `onInit` (which merely starts the connection
+// manager SCANNING) to completion before any device's `onInit`, so a probe
+// started at device init writes its first message at a proxy connection that
+// does not exist yet. It survived only because `queue.ts` retries a failed
+// write three times and that happened to outlast a scan plus a connect —
+// a margin nobody designed, which shrinks the day a scan runs long, a second
+// bulb joins, or the connection backoff has already climbed. The probe would
+// then burn its whole budget against a link that was never up and leave the
+// node unmeasured: precisely the state this mechanism exists to end, on
+// precisely the owner's one unmeasured lamp.
+//
+// It now fires from the first `'connected'` transition in which this node
+// ACTUALLY ANSWERED a full re-read. `app.ts` delivers `'connected'` on EVERY
+// poll tick rather than only on change (a deliberate earlier fix), so these
+// tests are mostly about that: a tick storm must produce exactly one probe,
+// and a probe still in flight must never be started alongside itself.
+// ===========================================================================
+
+/** Wraps the real serial runner and records one promise per probe STARTED,
+ *  so a test can count probes and still settle them. Counting at the runner
+ *  is counting what actually ran, not what some flag says. */
+function recordingProbeRunner(): { runner: ProbeRunnerPort; runs: Array<Promise<unknown>> } {
+  const inner = createSerialProbeRunner();
+  const runs: Array<Promise<unknown>> = [];
+  return {
+    runner: {
+      run<T>(task: () => Promise<T>): Promise<T> {
+        const promise = inner.run(task);
+        runs.push(promise);
+        return promise;
+      },
+    },
+    runs,
+  };
+}
+
+describe('the backfill probe is triggered by the first connection, not by construction', () => {
+  const SILENT_QUEUE = { timeoutMs: 50, maxAttempts: 1 };
+
+  test('nothing is probed until the node has actually answered', async () => {
+    const { runner, runs } = recordingProbeRunner();
+    const h = setUp({ declaredModels: DECLARES_EVERYTHING, responderOptions: ANSWERS_EVERYTHING, probeRunner: runner });
+    await connectManager(h.manager, h.clock);
+
+    // The controller exists, is started, and the shared link is up — and
+    // still nothing has been probed, because nothing has told this
+    // controller its own node is reachable.
+    h.controller.start();
+    expect(runs).toHaveLength(0);
+
+    await h.controller.onConnectionStateChange('connected');
+    await Promise.all(runs);
+
+    expect(runs).toHaveLength(1);
+    expect(h.store.getState().nodes[0]?.probe?.models.genericOnOff).toBe('supported');
+  });
+
+  test('A TICK STORM PRODUCES EXACTLY ONE PROBE', async () => {
+    // app.ts calls `onConnectionStateChange('connected')` on every poll tick,
+    // not only on change. Ten ticks must not be ten probes onto the one
+    // queue every bulb shares.
+    const { runner, runs } = recordingProbeRunner();
+    const h = setUp({ declaredModels: DECLARES_EVERYTHING, responderOptions: ANSWERS_EVERYTHING, probeRunner: runner });
+    await connectManager(h.manager, h.clock);
+
+    for (let tick = 0; tick < 10; tick++) await h.controller.onConnectionStateChange('connected');
+    await Promise.all(runs);
+
+    expect(runs).toHaveLength(1);
+  });
+
+  test('a probe STILL IN FLIGHT is never started alongside itself', async () => {
+    // The node answers its re-read but then goes silent on the probe's own
+    // range query, so the probe is still waiting on the queue's timer while
+    // the next ticks arrive.
+    const { runner, runs } = recordingProbeRunner();
+    const h = setUp({
+      declaredModels: DECLARES_EVERYTHING,
+      queueOptions: SILENT_QUEUE,
+      probeRunner: runner,
+      responderOptions: { silentOpcodes: new Set([OP_CTL_SET]) }, // no temperatureRangeReply either
+    });
+    await connectManager(h.manager, h.clock);
+
+    await h.controller.onConnectionStateChange('connected');
+    expect(runs).toHaveLength(1); // started, and demonstrably not yet finished:
+    for (let tick = 0; tick < 5; tick++) await h.controller.onConnectionStateChange('connected');
+    expect(runs).toHaveLength(1);
+
+    await runWhileAdvancing(Promise.all(runs), h.clock, SILENT_QUEUE.timeoutMs);
+    expect(runs).toHaveLength(1);
+    expect(h.store.getState().nodes[0]?.probe?.models.lightCtl).toBe('unsupported');
+  });
+
+  test('a DISCONNECT AND RECONNECT does not probe a second time', async () => {
+    // This is the cycle the `connected` flag alone does not cover — it is
+    // cleared by the disconnect, so the reconnect genuinely reaches the
+    // trigger again. Here the first probe SUCCEEDED, so the stored
+    // measurement is what turns the second attempt away; the test below is
+    // the one that isolates `backfillAttempted`.
+    const { runner, runs } = recordingProbeRunner();
+    const h = setUp({ declaredModels: DECLARES_EVERYTHING, responderOptions: ANSWERS_EVERYTHING, probeRunner: runner });
+    await connectManager(h.manager, h.clock);
+
+    await h.controller.onConnectionStateChange('connected');
+    await Promise.all(runs);
+    expect(runs).toHaveLength(1);
+
+    await h.controller.onConnectionStateChange('unavailable');
+    await h.controller.onConnectionStateChange('connected');
+    await Promise.all(runs);
+
+    expect(runs).toHaveLength(1);
+  });
+
+  test('...nor when the first probe stored NOTHING, which is where only `backfillAttempted` can help', async () => {
+    // A node declaring no lighting model at all is probed (it has no stored
+    // measurement) and learns nothing worth storing, so the record stays
+    // unmeasured — exactly as a node that timed out would. The stored
+    // measurement therefore cannot turn the reconnect away, and "at most
+    // once per device per app run" rests on `backfillAttempted` alone.
+    const { runner, runs } = recordingProbeRunner();
+    const h = setUp({ responderOptions: ANSWERS_EVERYTHING, probeRunner: runner }); // no declaredModels
+    await connectManager(h.manager, h.clock);
+
+    await h.controller.onConnectionStateChange('connected');
+    await Promise.all(runs);
+    expect(runs).toHaveLength(1);
+    expect(h.store.getState().nodes[0]?.probe).toBeUndefined();
+
+    await h.controller.onConnectionStateChange('unavailable');
+    await h.controller.onConnectionStateChange('connected');
+    await Promise.all(runs);
+
+    expect(runs).toHaveLength(1);
+  });
+
+  test('a connection whose RE-READ FAILS probes nothing — the node has not answered', async () => {
+    // The whole point of moving the trigger: never start a probe against a
+    // link this node has not proved it is on.
+    const { runner, runs } = recordingProbeRunner();
+    const h = setUp({
+      declaredModels: DECLARES_EVERYTHING,
+      queueOptions: SILENT_QUEUE,
+      probeRunner: runner,
+      responderOptions: { silentOpcodes: new Set([OP_ONOFF_GET, OP_LIGHTNESS_GET, OP_CTL_GET, OP_HSL_GET]) },
+    });
+    await connectManager(h.manager, h.clock);
+
+    await runWhileAdvancing(h.controller.onConnectionStateChange('connected'), h.clock, SILENT_QUEUE.timeoutMs);
+
+    expect(runs).toHaveLength(0);
+    expect(h.store.getState().nodes[0]?.probe).toBeUndefined();
+    expect(h.device.availabilityCalls.at(-1)?.available).toBe(false);
+  });
+
+  test('a node that already has a measurement is not probed when it connects', async () => {
+    const { runner, runs } = recordingProbeRunner();
+    const h = setUp({
+      declaredModels: DECLARES_EVERYTHING,
+      responderOptions: ANSWERS_EVERYTHING,
+      probeRunner: runner,
+      probe: { models: { genericOnOff: 'supported' }, temperatureRange: null },
+    });
+    await connectManager(h.manager, h.clock);
+
+    await h.controller.onConnectionStateChange('connected');
+    await Promise.all(runs);
+
+    expect(runs).toHaveLength(0);
+  });
+});

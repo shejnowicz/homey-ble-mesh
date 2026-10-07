@@ -152,15 +152,12 @@ class LightDevice extends Homey.Device {
 
     this.wireCapabilityListeners(controller);
 
-    // MEASURE A BULB THAT PREDATES THE PROBE, in the background. Deliberately
-    // NOT awaited: this is a radio errand against a node that may simply be
-    // unreachable right now, and `onInit` must not wait out the queue's
-    // bounded retry before Homey considers this device started. It runs at
-    // most once per device per app run, does nothing at all for a node that
-    // already has a measurement, and leaves the record unmeasured (to be
-    // retried on a LATER start, never in a loop) if it learns nothing — see
-    // `meshLight.ts#backfillProbe`.
-    void controller.backfillProbe().catch((err) => this.error('background capability probe failed', err));
+    // NOTHING HERE STARTS THE BACKFILL PROBE, deliberately. Measuring a bulb
+    // that predates the probe is the controller's own job and its own
+    // trigger (`meshLight.ts#startBackfillProbe`): it runs from the first
+    // moment the node has actually ANSWERED, not from device init, which on
+    // a cold start happens while the proxy connection is still coming up.
+    // All this file supplies is the app's ONE shared probe runner, above.
   }
 
   async onUninit(): Promise<void> {

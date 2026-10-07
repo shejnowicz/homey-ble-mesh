@@ -215,10 +215,13 @@ import { isMeaningfulProbeResult, probeModels, type ProbeTransport } from './mod
  * `chooseTemperatureWriteModel`'s fallback happens to be the message it
  * obeys, which is luck rather than knowledge. This module therefore runs the
  * SAME probe over the ordinary traffic queue, once per such device per app
- * run, in the background: never awaited by `device.ts`, never retried in a
- * loop, never run at all for a node that already has a measurement, and
- * never STORED unless it actually learned something (a probe that merely
- * timed out leaves the record unmeasured so a later start can try again).
+ * run, in the background: never retried in a loop, never run at all for a
+ * node that already has a measurement, and never STORED unless it actually
+ * learned something (a probe that merely timed out leaves the record
+ * unmeasured so a later start can try again). It is started from the first
+ * `'connected'` transition in which this node ACTUALLY ANSWERED — not from
+ * device init, which would write its first message before the proxy
+ * connection exists; see `startBackfillProbe` for the full argument.
  * It reuses `modelProbe.ts` through that module's own transport port rather
  * than duplicating the probe plan, and it borrows this controller's own
  * transaction-identifier counter so a probe's no-op write can never collide
@@ -766,6 +769,14 @@ export class MeshLightController {
       this.nextReReadAtMs = 0;
       this.connected = true;
       await this.device.setAvailable();
+      // THE BACKFILL PROBE'S ONE TRIGGER — here, at the moment this node has
+      // actually ANSWERED, and nowhere else. See `startBackfillProbe` for
+      // why this is the only honest moment to start it, and
+      // `backfillProbe` for what it does. Deliberately not awaited: the
+      // `finally` below must clear `reReadInFlight` now, not in two
+      // minutes, or a probe against a slow bulb would block every re-read
+      // behind it.
+      this.startBackfillProbe();
     } catch (err) {
       this.connected = false;
       this.reReadFailureStreak = Math.min(this.reReadFailureStreak + 1, MAX_RE_READ_FAILURE_STREAK);
@@ -774,6 +785,59 @@ export class MeshLightController {
     } finally {
       this.reReadInFlight = false;
     }
+  }
+
+  /**
+   * Starts the backfill probe, fire-and-forget, the first time this node is
+   * actually reachable.
+   *
+   * WHY NOT AT DEVICE INIT, which is where this used to be. Homey runs the
+   * app's own `onInit` — which only STARTS the connection manager scanning —
+   * to completion before any device's `onInit`, so a probe started there
+   * writes its first message before the proxy connection exists. It
+   * survived only on `queue.ts`'s bounded retry happening to outlast a
+   * scan plus a connect, which is not a margin anyone designed: it shrinks
+   * the day a scan runs long, or a second bulb is in the mesh, or the
+   * connection backoff has already climbed because the lamp was off at the
+   * wall. The probe would then spend its whole budget against a link that
+   * was never up and leave the node unmeasured — exactly the state this
+   * mechanism exists to end, and on the owner's one paired lamp it is the
+   * path every app start would take. Hanging it off the first successful
+   * re-read instead means the node has provably just answered us.
+   *
+   * CALLED ON EVERY POLL TICK'S WORTH OF `'connected'`, AND THAT IS FINE.
+   * `app.ts` fans `onConnectionStateChange` out to every controller on
+   * every tick rather than only on change (a deliberate earlier fix — see
+   * that method's own comment). Two independent guards make this once per
+   * device per app run anyway: `onConnectionStateChange` returns early
+   * while `this.connected` is already true, so a tick storm never reaches
+   * here twice; and `backfillProbe` sets `backfillAttempted` before its own
+   * first `await`, so even a disconnect/reconnect cycle — which DOES clear
+   * `connected` and so does reach here again — starts nothing a second
+   * time, and neither does a tick arriving while a probe is still in
+   * flight.
+   *
+   * ONE DISCLOSED GAP. `applyDecodedStatus` can also set `connected` —
+   * hearing from a node is evidence it is reachable (see the module
+   * header) — and it does NOT start the probe. If an unsolicited status
+   * arrived in the narrow window before this controller's very first
+   * `'connected'` tick was processed, every later tick would return early
+   * and this run would never probe. That is left alone on purpose: adding a
+   * second trigger there would start probes off the back of a user's own
+   * command, which is the worst possible moment for the no-op write
+   * `backfillProbe` documents as its accepted risk. The node simply stays
+   * unmeasured until the next app start, which is this mechanism's own
+   * retry model.
+   */
+  private startBackfillProbe(): void {
+    // `backfillProbe` is written never to throw; this catch is the
+    // belt-and-braces for that promise, since there is no error-reporting
+    // channel reachable from here (the same stance `start()` takes for its
+    // own fire-and-forget listener, and for the same reason).
+    void this.backfillProbe().catch(() => {
+      // Nothing productive to do: the record simply stays unmeasured and a
+      // later app start tries again.
+    });
   }
 
   // --- Commands ----------------------------------------------------------
@@ -933,19 +997,13 @@ export class MeshLightController {
    * fresh on every command) and what the user's own colour-mode setting was
    * seeded from, which is where capability changes belong.
    *
-   * IT STARTS BEFORE THE MESH IS NECESSARILY CONNECTED, and survives that
-   * on the queue's own bounded retry rather than on a wait of its own.
-   * Homey runs this app's `onInit` (which starts the connection manager
-   * scanning) to completion before any device's `onInit`, so a cold start
-   * reaches here with the proxy connection still coming up and the first
-   * probe message's `write` rejecting outright. `queue.ts#attempt` treats
-   * that as a reason to WAIT, not to fail: the attempt's own timer paces a
-   * retry, and three attempts at `DEFAULT_TIMEOUT_MS` give roughly
-   * twenty-four seconds for a scan (`SCAN_DURATION_MS`, four) plus connect,
-   * discover and subscribe to finish — comfortable, but it IS the margin
-   * this depends on. A bulb that is genuinely out of range instead costs
-   * that same budget once and then stays unmeasured until a later start,
-   * which is the intended outcome.
+   * IT RUNS ONLY WHEN THE NODE HAS JUST ANSWERED. `startBackfillProbe` is
+   * its one trigger and fires from the successful branch of
+   * `onConnectionStateChange`, so by the time this method sends anything,
+   * the proxy connection is up and this specific node has replied to a
+   * full state re-read. A bulb that is genuinely out of range is never
+   * probed at all rather than probed into its own timeout, and stays
+   * unmeasured until a later start — the intended outcome.
    *
    * ONE DISCLOSED RISK, stated rather than glossed. Every probe message is a
    * no-op write - the value is READ and the same value written straight
@@ -990,7 +1048,13 @@ export class MeshLightController {
         return;
       }
       if (!isMeaningfulProbeResult(result)) return;
-      this.storeProbeResult(result);
+      try {
+        this.storeProbeResult(result);
+      } catch {
+        // `NetworkStore.setState` validates every field before writing, so
+        // it can refuse. Losing the measurement is the right cost; failing
+        // the device's connection handling for it is not.
+      }
     });
   }
 
