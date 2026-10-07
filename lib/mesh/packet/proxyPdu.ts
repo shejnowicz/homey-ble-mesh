@@ -433,7 +433,7 @@ export function acceptProxyPdu(state: ProxyReassemblyState | undefined, pdu: Buf
   }
 
   switch (sar) {
-    case PROXY_SAR_COMPLETE:
+    case PROXY_SAR_COMPLETE: {
       if (state !== undefined) {
         return {
           kind: 'disconnect',
@@ -441,11 +441,10 @@ export function acceptProxyPdu(state: ProxyReassemblyState | undefined, pdu: Buf
           reason: 'unexpected SAR value 0b00 (a complete message) while a segmented message was still being reassembled',
         };
       }
-      {
-        const tooLong = tooLongReason(messageType, data.length);
-        if (tooLong !== null) return { kind: 'disconnect', state: undefined, reason: tooLong };
-      }
+      const tooLong = tooLongReason(messageType, data.length);
+      if (tooLong !== null) return { kind: 'disconnect', state: undefined, reason: tooLong };
       return { kind: 'complete', state: undefined, messageType, message: Buffer.from(data) };
+    }
 
     case PROXY_SAR_FIRST: {
       if (state !== undefined) {
