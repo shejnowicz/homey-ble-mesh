@@ -48,6 +48,7 @@ import {
   PROVISIONING_CRYPTO_SAMPLE,
 } from '../../../lib/mesh/provisioning/__tests__/vectors';
 import { PROVISIONING_SAMPLE } from '../../../lib/mesh/crypto/__tests__/vectors';
+import { PROXY_SAR_TIMEOUT_MS } from '../../../lib/mesh/packet/proxyPdu';
 import { COMPOSITION_DATA_PAGE0_SAMPLE } from '../../../lib/mesh/config/__tests__/vectors';
 
 /**
@@ -1532,5 +1533,122 @@ describe('filterKnownCharacteristics', () => {
 
   test('an empty input produces an empty result, not an error', () => {
     expect(filterKnownCharacteristics([])).toEqual([]);
+  });
+});
+
+/**
+ * FINAL RE-REVIEW, FINDING 2 (MEDIUM). This session used to have no SAR
+ * timer of its own, and the comment defending that was arithmetically
+ * backwards: it argued "20 seconds is longer than any `timeoutMs` this
+ * project passes, so the stage timeout always fires first", when
+ * DEFAULT_PAIRING_STEP_TIMEOUT_MS is 30 000 and PROXY_SAR_TIMEOUT_MS is
+ * 20 000 — the project's timeout is the LONGER one. The consequence was
+ * real, not merely rhetorical: a node that sent a first segment and then
+ * went quiet held the radio for the full 30 s and the disconnect Section
+ * 6.3.2.2 requires at 20 s never happened at all.
+ *
+ * This session is unambiguously bound by that rule. Section 5.2.2
+ * "PB-GATT": "When PB-GATT is used, the Provisioner shall use the PB-GATT
+ * Client role and the unprovisioned device shall use the PB-GATT Server
+ * role." and "The PB-GATT Server shall use the Provisioning Server role
+ * (see Section 6.2.2) and the PB-GATT Client shall use the Provisioning
+ * Client role (see Section 6.2.2)."; Section 6.2.2 "Provisioning PB-GATT
+ * bearer roles": "The Provisioning Client is a node that supports the Proxy
+ * PDU Client and supports transporting Provisioning PDUs using the Proxy
+ * protocol." So the Proxy PDU Client rules of Section 6.3.2.2 are this
+ * session's rules, on both of its characteristic pairs.
+ */
+describe('the Proxy PDU Client rules apply to this session too (final re-review, finding 2)', () => {
+  /** The relationship the old comment asserted backwards, pinned so the
+   *  argument can never be made from memory again. */
+  test('the SAR timeout is SHORTER than the pairing step timeout, not longer', () => {
+    expect(PROXY_SAR_TIMEOUT_MS).toBeLessThan(DEFAULT_PAIRING_STEP_TIMEOUT_MS);
+  });
+
+  test('a reply that stops arriving mid-message disconnects at 20 seconds and fails the wait, naming why', async () => {
+    const { bluetooth, clock } = setUp();
+    addUnprovisionedNode(bluetooth, 'stalls', -50);
+    const session = await connectForProvisioning(bluetooth, 'stalls', clock, DEFAULT_PAIRING_STEP_TIMEOUT_MS);
+
+    const pending = session.next();
+    const rejection = expect(pending).rejects.toThrow(/SAR transfer timed out/);
+    // 0b01_000011: a FIRST segment of a Provisioning PDU (Table 6.2 SAR
+    // 0b01, Table 6.3 MessageType 0x03), and then silence.
+    bluetooth.simulateRawNotification('stalls', Buffer.from([0x43, 0x11]));
+
+    await clock.advance(PROXY_SAR_TIMEOUT_MS - 1);
+    expect(() => bluetooth.simulateDisconnect('stalls')).not.toThrow(); // still connected, correctly...
+    // ...so put the link back and let the deadline actually arrive.
+    const second = await connectForProvisioning(bluetooth, 'stalls', clock, DEFAULT_PAIRING_STEP_TIMEOUT_MS);
+    const secondPending = second.next();
+    const secondRejection = expect(secondPending).rejects.toThrow(/SAR transfer timed out/);
+    bluetooth.simulateRawNotification('stalls', Buffer.from([0x43, 0x11]));
+
+    await clock.advance(PROXY_SAR_TIMEOUT_MS);
+    // The link is gone — Section 6.3.2.2's "shall disconnect", performed at
+    // the deadline rather than ten seconds after it.
+    expect(() => bluetooth.simulateDisconnect('stalls')).toThrow('is not currently connected');
+    await secondRejection;
+
+    // The first session's own stalled wait is still bounded by its stage
+    // timeout, as it always was.
+    await clock.advance(DEFAULT_PAIRING_STEP_TIMEOUT_MS);
+    await rejection.catch(() => {});
+    await expect(pending).rejects.toThrow();
+  });
+
+  test('an unexpected SAR value disconnects and fails the wait, rather than being ignored until the stage timeout', async () => {
+    const { bluetooth, clock } = setUp();
+    addUnprovisionedNode(bluetooth, 'bad-sar', -50);
+    const session = await connectForProvisioning(bluetooth, 'bad-sar', clock, DEFAULT_PAIRING_STEP_TIMEOUT_MS);
+
+    const pending = session.next();
+    const rejection = expect(pending).rejects.toThrow(/unexpected SAR value 0b10/);
+    // 0b10_000011: a continuation segment with nothing being reassembled.
+    bluetooth.simulateRawNotification('bad-sar', Buffer.from([0x83, 0x11]));
+
+    // No clock advance at all: the violation is acted on when it arrives,
+    // not when some unrelated deadline expires.
+    expect(() => bluetooth.simulateDisconnect('bad-sar')).toThrow('is not currently connected');
+    await rejection;
+  });
+
+  /**
+   * Note on what this has to assert, and why the obvious version is not
+   * enough. "The link is never dropped" does NOT discriminate: the timer
+   * callback re-checks `reassembly` and returns harmlessly when a message
+   * has completed, so DELETING `clearSarTimer()` from the complete case
+   * leaves behaviour identical — I verified that by mutation, and the first
+   * version of this test passed unchanged. What the mutation really breaks
+   * is the CLOCK: a stranded timer per completed message keeps a real event
+   * loop alive and holds this session's closure reachable until it fires,
+   * which is exactly the argument `queue.test.ts` already makes about its
+   * own `clearTimer`. So this counts timers, as that test does.
+   */
+  test('a message that completes cancels the SAR timer rather than leaving it to fire later', async () => {
+    const { bluetooth, clock } = setUp();
+    addUnprovisionedNode(bluetooth, 'fine', -50);
+    const session = await connectForProvisioning(bluetooth, 'fine', clock, DEFAULT_PAIRING_STEP_TIMEOUT_MS);
+
+    bluetooth.simulateRawNotification('fine', Buffer.from([0x43, 0x11])); // first segment...
+    expect(clock.pendingCount()).toBe(1); // ...armed a SAR timer...
+    bluetooth.simulateRawNotification('fine', Buffer.from([0xc3, 0x22])); // ...and its last
+    await expect(session.next()).resolves.toEqual(Buffer.from([0x11, 0x22]));
+
+    expect(clock.pendingCount()).toBe(0); // the timer was actually cancelled, not merely made harmless
+    await clock.advance(PROXY_SAR_TIMEOUT_MS * 2);
+    expect(() => bluetooth.simulateDisconnect('fine')).not.toThrow(); // never dropped
+  });
+
+  test('a session the caller disconnects leaves no SAR timer pending', async () => {
+    const { bluetooth, clock } = setUp();
+    addUnprovisionedNode(bluetooth, 'tidy', -50);
+    const session = await connectForProvisioning(bluetooth, 'tidy', clock, DEFAULT_PAIRING_STEP_TIMEOUT_MS);
+
+    bluetooth.simulateRawNotification('tidy', Buffer.from([0x43, 0x11])); // a reassembly is now in progress
+    expect(clock.pendingCount()).toBe(1); // its SAR timer
+
+    await session.disconnect();
+    expect(clock.pendingCount()).toBe(0);
   });
 });

@@ -445,11 +445,14 @@ export async function scanForUnprovisionedNodes(
  *  that provoked it. */
 class NotificationChannel {
   private readonly queue: Buffer[] = [];
-  private waiting: ((data: Buffer) => void) | null = null;
+  private waiting: { readonly resolve: (data: Buffer) => void; readonly reject: (err: Error) => void } | null = null;
+  /** Set once by `fail` and never cleared — see that method. */
+  private failure: Error | null = null;
 
   push(data: Buffer): void {
+    if (this.failure !== null) return; // the channel is over; nothing more arrives on it
     if (this.waiting !== null) {
-      const resolve = this.waiting;
+      const { resolve } = this.waiting;
       this.waiting = null;
       resolve(data);
       return;
@@ -457,7 +460,29 @@ class NotificationChannel {
     this.queue.push(data);
   }
 
+  /**
+   * Ends this channel permanently, rejecting whoever is waiting now and
+   * everyone who asks later (final re-review, finding 2). The one caller is
+   * `openSession`'s Section 6.3.2.2 handling: once this session has
+   * disconnected the link because the specification said to, there is no
+   * link left for a reply to arrive over, and anything still queued belongs
+   * to a conversation that is already over — so "once failed, always
+   * failed" is the only honest state, and a waiter learning the real reason
+   * beats it learning the stage timeout ten seconds later.
+   *
+   * Idempotent: the first failure is the one that is reported, since it is
+   * the one that caused everything after it.
+   */
+  fail(err: Error): void {
+    if (this.failure !== null) return;
+    this.failure = err;
+    const waiting = this.waiting;
+    this.waiting = null;
+    if (waiting !== null) waiting.reject(err);
+  }
+
   next(): Promise<Buffer> {
+    if (this.failure !== null) return Promise.reject(this.failure);
     const queued = this.queue.shift();
     if (queued !== undefined) return Promise.resolve(queued);
     if (this.waiting !== null) {
@@ -470,8 +495,8 @@ class NotificationChannel {
       // loudly, as a programming error, rather than silently losing data.
       throw new Error('NotificationChannel.next: called again while a previous call is still pending');
     }
-    return new Promise<Buffer>((resolve) => {
-      this.waiting = resolve;
+    return new Promise<Buffer>((resolve, reject) => {
+      this.waiting = { resolve, reject };
     });
   }
 }
@@ -535,20 +560,99 @@ async function openSession(
   // life of the connection and dies with it, because `openSession` is
   // called once per connection and nothing here outlives that.
   let reassembly: ProxyReassemblyState | undefined;
+
+  // ---------------------------------------------------------------------
+  // SECTION 6.3.2.2 IS THIS SESSION'S RULE TOO, and it is enforced here
+  // rather than left to the stage timeout (final re-review, finding 2 —
+  // MEDIUM). The comment that used to stand in this spot argued the
+  // opposite and had its arithmetic backwards: "20 seconds is longer than
+  // any `timeoutMs` this project passes, so the stage timeout always fires
+  // first". DEFAULT_PAIRING_STEP_TIMEOUT_MS is 30_000 and
+  // PROXY_SAR_TIMEOUT_MS is 20_000, and `driver.ts` passes no override, so
+  // the project's timeout is the LONGER one — the stage timeout fires ten
+  // seconds LATE, and the disconnect the specification requires never
+  // happened at all.
+  //
+  // That this session is bound by the Proxy PDU CLIENT rules is not an
+  // inference. Section 5.2.2 "PB-GATT": "When PB-GATT is used, the
+  // Provisioner shall use the PB-GATT Client role and the unprovisioned
+  // device shall use the PB-GATT Server role." and "The PB-GATT Server
+  // shall use the Provisioning Server role (see Section 6.2.2) and the
+  // PB-GATT Client shall use the Provisioning Client role (see Section
+  // 6.2.2)."; Section 6.2.2 "Provisioning PB-GATT bearer roles": "The
+  // Provisioning Client is a node that supports the Proxy PDU Client and
+  // supports transporting Provisioning PDUs using the Proxy protocol." We
+  // are the Provisioner on the provisioning pair and the Proxy Client on
+  // the proxy pair, so both of this session's channels are Proxy PDU
+  // Client channels.
+  //
+  // WHAT IS ENFORCED, both from Section 6.3.2.2: "Upon receiving a message
+  // with an unexpected value of the SAR field, the Proxy PDU Client shall
+  // disconnect." and "The timeout for the SAR transfer is 20 seconds. When
+  // the timeout expires, the Proxy PDU Client shall disconnect." The first
+  // `acceptProxyPdu` already detects on arrival; the second it cannot,
+  // because a transfer that simply STOPS arriving produces no arrival to
+  // check — hence a timer, armed exactly as `lib/adapter/connection.ts`
+  // arms its own, from the current segment rather than the first (the
+  // on-arrival check in `acceptProxyPdu` measures the real deadline from
+  // `startedAtMs` regardless, so this timer only has to guarantee a
+  // stalled transfer is eventually noticed; it never shortens the window).
+  //
+  // 'ignored' (an unsupported MessageType, Section 6.3.2) still ends with
+  // nothing pushed and nothing dropped — that one the specification really
+  // does say to ignore, and any reassembly in progress survives it.
+  // ---------------------------------------------------------------------
+  let sarTimer: TimerHandle | null = null;
+  const clearSarTimer = (): void => {
+    if (sarTimer !== null) {
+      clock.clearTimeout(sarTimer);
+      sarTimer = null;
+    }
+  };
+  const disconnectOnProxyProtocolViolation = (reason: string): void => {
+    clearSarTimer();
+    reassembly = undefined;
+    // Whoever is waiting learns the real reason now, instead of the stage
+    // timeout's generic one later — and every later `next()` on this dead
+    // session learns it too (see `NotificationChannel.fail`).
+    channel.fail(new Error(`${stage}: ${reason}`));
+    bluetooth.disconnect(connection).catch(() => {
+      // The link is being abandoned either way; a close that itself fails
+      // changes nothing this session can act on, and there is no caller
+      // left to tell.
+    });
+  };
+  const armSarTimer = (): void => {
+    clearSarTimer();
+    sarTimer = clock.setTimeout(() => {
+      sarTimer = null;
+      if (reassembly === undefined) return;
+      disconnectOnProxyProtocolViolation(
+        'SAR transfer timed out (Section 6.3.2.2: the timeout for the SAR transfer is 20 seconds)',
+      );
+    }, PROXY_SAR_TIMEOUT_MS);
+  };
+
   await bounded(
     bluetooth.subscribe(dataOut.handle, (pdu) => {
       const result = acceptProxyPdu(reassembly, pdu, clock.now());
-      reassembly = result.kind === 'incomplete' || result.kind === 'ignored' ? result.state : undefined;
-      // 'ignored' (an unsupported MessageType) and 'disconnect' (Section
-      // 6.3.2.2) both end here with nothing pushed: this session has no
-      // link of its own to drop — every one of its operations is already
-      // bounded by `timeoutMs` (see this function's own doc comment), so a
-      // violation surfaces as the stage timeout the caller already handles,
-      // naming the phase, rather than as a silent hang. That is why this
-      // session needs no SAR timer of its own either: 20 seconds is longer
-      // than any `timeoutMs` this project passes, so the stage timeout
-      // always fires first.
-      if (result.kind === 'complete' && result.messageType === messageType) channel.push(result.message);
+      switch (result.kind) {
+        case 'ignored':
+          reassembly = result.state;
+          return;
+        case 'incomplete':
+          reassembly = result.state;
+          armSarTimer();
+          return;
+        case 'disconnect':
+          disconnectOnProxyProtocolViolation(result.reason);
+          return;
+        case 'complete':
+          reassembly = undefined;
+          clearSarTimer();
+          if (result.messageType === messageType) channel.push(result.message);
+          return;
+      }
     }),
     `${stage}: subscribing to notifications`,
   );
@@ -564,7 +668,13 @@ async function openSession(
       }
     },
     next: (): Promise<Buffer> => bounded(channel.next(), `${stage} stalled`),
-    disconnect: (): Promise<void> => bounded(bluetooth.disconnect(connection), `${stage}: disconnecting`),
+    disconnect: (): Promise<void> => {
+      // Nothing of this session's own may outlive it: an un-cleared SAR
+      // timer would keep a real event loop alive, and would fire against a
+      // connection the caller has already closed.
+      clearSarTimer();
+      return bounded(bluetooth.disconnect(connection), `${stage}: disconnecting`);
+    },
   };
 }
 
