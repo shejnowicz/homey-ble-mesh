@@ -31,19 +31,19 @@
     {
       "type": "group",
       "label": {
-        "en": "Colour temperature range"
+        "en": "Colour temperature values this app sends"
       },
       "children": [
         {
           "id": "temperature_min_kelvin",
           "type": "number",
           "label": {
-            "en": "Warmest (K)"
+            "en": "Lowest value sent"
           },
           "hint": {
-            "en": "The warmest colour temperature this bulb can produce, in kelvin. Filled in from the bulb itself when it reports its range (Light CTL Temperature Range Get); correct it by hand if the bulb does not report one — the value printed on the box or in the manufacturer's app is the one to use."
+            "en": "The lowest Light CTL Temperature value this app will send, at the warm end of the slider. A bulb that follows the specification reads it as kelvin; other bulbs ignore the numbers and simply stretch their whole output across whatever range they are given, which is why this starts at the full 800-20000 span the specification allows. Filled in from the bulb itself when it answers Light CTL Temperature Range Get. Narrow the range only if your bulb misbehaves at the extremes."
           },
-          "value": 3000,
+          "value": 800,
           "min": 800,
           "max": 20000,
           "units": {
@@ -54,12 +54,12 @@
           "id": "temperature_max_kelvin",
           "type": "number",
           "label": {
-            "en": "Coolest (K)"
+            "en": "Highest value sent"
           },
           "hint": {
-            "en": "The coolest colour temperature this bulb can produce, in kelvin. Must be above the warmest value. Filled in from the bulb itself when it reports its range; correct it by hand if it does not."
+            "en": "The highest Light CTL Temperature value this app will send, at the cold end of the slider. Must be above the lowest value. A bulb that follows the specification reads it as kelvin; other bulbs ignore the numbers and simply stretch their whole output across whatever range they are given, which is why this starts at the full 800-20000 span the specification allows. Filled in from the bulb itself when it answers Light CTL Temperature Range Get. Narrow the range only if your bulb misbehaves at the extremes."
           },
-          "value": 6000,
+          "value": 20000,
           "min": 800,
           "max": 20000,
           "units": {

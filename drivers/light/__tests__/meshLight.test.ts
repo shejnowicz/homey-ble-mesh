@@ -545,8 +545,14 @@ describe('unit conversions', () => {
   });
 
   test('kelvinToHomey clamps a value outside this bulb\'s range (but spec-legal) instead of leaving the 0..1 domain', () => {
-    expect(__testing.kelvinToHomey(800, DEFAULT_TEMPERATURE_RANGE)).toBe(1); // below the range min (but >= Table 6.6's 800 K floor) -> fully warm
-    expect(__testing.kelvinToHomey(20000, DEFAULT_TEMPERATURE_RANGE)).toBe(0); // above the range max (but <= Table 6.6's 20000 K ceiling) -> fully cold
+    // An EXPLICIT narrow range, not the module default: the default is now
+    // Table 6.6's full legal span (see temperatureRange.ts), so nothing
+    // spec-legal is outside it and this test would assert nothing at all if
+    // it used that. 3000-6000 K is the owner's own bulb's real output, kept
+    // here as the fixture it always was.
+    const narrow: TemperatureRange = { minKelvin: 3000, maxKelvin: 6000 };
+    expect(__testing.kelvinToHomey(800, narrow)).toBe(1); // below the range min (but >= Table 6.6's 800 K floor) -> fully warm
+    expect(__testing.kelvinToHomey(20000, narrow)).toBe(0); // above the range max (but <= Table 6.6's 20000 K ceiling) -> fully cold
   });
 
   test('THE RANGE IS THE ARGUMENT, not a constant: the same Homey value maps to a different kelvin on a different bulb', () => {

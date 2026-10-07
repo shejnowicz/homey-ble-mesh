@@ -44,11 +44,24 @@ describe('resolveTemperatureRange', () => {
     expect(resolveTemperatureRange(null, { minKelvin: 100, maxKelvin: 30000 })).toEqual(DEFAULT_TEMPERATURE_RANGE);
   });
 
-  test('the documented fallback is the owner\'s own measured bulb, 3000-6000 K', () => {
-    // Pinned as a value, because it is a measurement of a real bulb rather
-    // than a round number somebody liked — and because a silent change to
-    // it would move every unconfigured bulb's slider.
-    expect(DEFAULT_TEMPERATURE_RANGE).toEqual({ minKelvin: 3000, maxKelvin: 6000 });
+  test('the documented fallback is Table 6.6\'s own FULL legal span, 800-20000 K', () => {
+    // Pinned as a value, and changed from one bulb's measured 3000-6000 K
+    // after hardware showed why that was wrong: a bulb that stretches its
+    // whole output across whatever range it is given was driven through a
+    // sixth of itself. Only a default that makes no claim about what the
+    // numbers MEAN is safe for both kinds of bulb — see temperatureRange.ts's
+    // own header.
+    expect(DEFAULT_TEMPERATURE_RANGE).toEqual({ minKelvin: 800, maxKelvin: 20000 });
+    // ...and it is exactly the legal span, not a wide range that happens to
+    // look like one.
+    expect(DEFAULT_TEMPERATURE_RANGE).toEqual({ minKelvin: MIN_LEGAL_KELVIN, maxKelvin: MAX_LEGAL_KELVIN });
+  });
+
+  test('a user who HAS narrowed the range still wins over the new, wider default', () => {
+    // The owner's deliberate 800/20000 is the case that prompted this, but
+    // the general rule is what matters: widening the fallback must never
+    // reach a device whose own setting says something else.
+    expect(resolveTemperatureRange({ minKelvin: 2700, maxKelvin: 4000 }, null)).toEqual({ minKelvin: 2700, maxKelvin: 4000 });
   });
 });
 

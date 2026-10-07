@@ -1998,7 +1998,10 @@ describe('the capability probe, through a real pairing', () => {
     expect(outcome.kind).toBe('paired');
     if (outcome.kind !== 'paired') return;
     expect(store.getState().nodes[0]?.probe?.temperatureRange).toBeNull();
-    expect(outcome.device.settings).toEqual({ temperature_min_kelvin: 3000, temperature_max_kelvin: 6000 });
+    // The full legal span, not any particular lamp's output — see
+    // temperatureRange.ts's own header for why a bulb that rescales makes a
+    // measured-from-one-bulb default the wrong choice.
+    expect(outcome.device.settings).toEqual({ temperature_min_kelvin: 800, temperature_max_kelvin: 20000 });
   });
 
   test("a node answering Table 6.8's own 0xFFFF \"unknown\" row is treated as having said nothing, not as a 65535 K bulb", async () => {
@@ -2014,7 +2017,7 @@ describe('the capability probe, through a real pairing', () => {
     expect(outcome.kind).toBe('paired');
     if (outcome.kind !== 'paired') return;
     expect(store.getState().nodes[0]?.probe?.temperatureRange).toBeNull();
-    expect(outcome.device.settings).toEqual({ temperature_min_kelvin: 3000, temperature_max_kelvin: 6000 });
+    expect(outcome.device.settings).toEqual({ temperature_min_kelvin: 800, temperature_max_kelvin: 20000 });
   });
 });
 

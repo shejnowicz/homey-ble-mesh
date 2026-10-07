@@ -112,6 +112,18 @@ describe('device.ts wires the per-device colour-temperature range (source-text)'
     expect(resolveBody).toMatch(/resolveTemperatureRange\(/);
   });
 
+  test('device.ts NEVER writes the two range settings back — a changed default must not reach a device that already has a value', () => {
+    // The owner has deliberately set 800/20000 on his own lamp, and other
+    // users may have narrowed theirs. Widening the manifest default is safe
+    // only because nothing ever rewrites a stored value, and the way that
+    // would quietly stop being true is somebody adding a "migrate old
+    // defaults" pass here. Every `setSettings` call in this file is checked,
+    // not merely the ones that exist today.
+    for (const match of source.matchAll(/setSettings\(([^;]*)/g)) {
+      expect(match[1] ?? '').not.toMatch(/temperature_/);
+    }
+  });
+
   test('onSettings pushes an edited range into the live controller, and throws on one it refuses', () => {
     // Without the push, a user correcting the range would see no change
     // until the device was reloaded; without the throw, Homey would save a
