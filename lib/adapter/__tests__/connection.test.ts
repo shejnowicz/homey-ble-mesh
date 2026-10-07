@@ -19,6 +19,23 @@ import { FakeBluetoothPort } from './fakeBluetooth';
 import { createFakeClock } from './fakeClock';
 import { PROXY_SAR_TIMEOUT_MS } from '../../mesh/packet/proxyPdu';
 import { DEFAULT_TIMEOUT_MS } from '../queue';
+import {
+  encodeProxyPdus,
+  MAX_NETWORK_PDU_LENGTH,
+  PROXY_MESSAGE_TYPE_NETWORK_PDU,
+} from '../../mesh/packet/proxyPdu';
+import { encodeMeshMessage, RELAYED_TTL } from '../../mesh/packet/message';
+import {
+  encodeGenericOnOffGet,
+  encodeGenericOnOffSet,
+  encodeLightCtlGet,
+  encodeLightCtlSet,
+  encodeLightHslGet,
+  encodeLightHslSet,
+  encodeLightLightnessGet,
+  encodeLightLightnessSet,
+} from '../../models/lighting';
+import { encodeConfigNodeReset } from '../../mesh/config/client';
 import { NETWORK_ID_ADVERTISING_SAMPLE, hex } from './vectors';
 
 /**
@@ -1529,5 +1546,78 @@ describe('a specification-mandated disconnect is visible and backs off (final re
     expect(manager.getLastProxyProtocolDisconnect()).toMatch(/unexpected SAR value 0b10/);
     await clock.advance(1000);
     expect(manager.getState().status).toBe('connected');
+  });
+});
+
+/**
+ * THE PREMISE `write()`'s OWN COMMENT RESTS ON, made mechanical. That
+ * comment used to claim the opposite ("Single-PDU writes — every command
+ * this app sends when the link's ATT_MTU is generous — never set the flag,
+ * so this path costs nothing in the ordinary case"), which is how a latch on
+ * the segmented path came to be treated as a rare corner when it is in fact
+ * on every message. Nothing checked either version. This does, against the
+ * REAL encoders rather than against arithmetic repeated in a comment.
+ *
+ * Two properties, and both matter for different reasons. That every message
+ * SEGMENTS is why `segmentedWriteInFlight` is on the hot path and why its
+ * correctness is a High finding rather than a nicety. That every message
+ * fits inside MAX_NETWORK_PDU_LENGTH is Section 6.3.2.2's own requirement on
+ * the receiving node — a message past it is one the bulb must disconnect
+ * over.
+ */
+describe('every message this app sends takes the segmented path, and none is illegal', () => {
+  const NET_KEY = Buffer.alloc(16, 0x11);
+  const APP_KEY = Buffer.alloc(16, 0x22);
+
+  function networkPdusFor(accessPayload: Buffer): Buffer[] {
+    let seq = 0;
+    return encodeMeshMessage({
+      accessPayload,
+      key: APP_KEY,
+      keyKind: 'application',
+      aid: 0,
+      netKey: NET_KEY,
+      ivIndex: 0,
+      src: 0x0001,
+      dst: 0x0002,
+      ttl: RELAYED_TTL,
+      allocateSeq: () => seq++,
+    });
+  }
+
+  // Every access message `drivers/light/meshLight.ts` can produce, plus the
+  // Config Node Reset `pairing.ts` sends on the proxy pair.
+  const MESSAGES: ReadonlyArray<readonly [string, Buffer]> = [
+    ['Generic OnOff Get', encodeGenericOnOffGet()],
+    ['Light Lightness Get', encodeLightLightnessGet()],
+    ['Light CTL Get', encodeLightCtlGet()],
+    ['Light HSL Get', encodeLightHslGet()],
+    ['Generic OnOff Set', encodeGenericOnOffSet({ onOff: 1, tid: 0 })],
+    ['Light Lightness Set', encodeLightLightnessSet({ lightness: 0x8000, tid: 0 })],
+    ['Light CTL Set', encodeLightCtlSet({ lightness: 0x8000, temperature: 5000, deltaUv: 0, tid: 0 })],
+    ['Light HSL Set', encodeLightHslSet({ lightness: 0x8000, hue: 1000, saturation: 2000, tid: 0 })],
+    ['Config Node Reset', encodeConfigNodeReset()],
+  ];
+
+  test.each(MESSAGES.map(([name, payload]) => [name, payload]))(
+    '%s is two Proxy PDUs at the default, and within the maximal Network PDU',
+    (_name, accessPayload) => {
+      for (const networkPdu of networkPdusFor(accessPayload as Buffer)) {
+        // 20 octets at the smallest (a Get: Table 3.10's 9 fixed octets, a
+        // 7-octet Unsegmented Access message, a 4-octet NetMIC) and 27 at
+        // the largest (a Light CTL/HSL Set) — so never the 19 that one
+        // Proxy PDU can carry, and never past 29.
+        expect(networkPdu.length).toBeGreaterThanOrEqual(20);
+        expect(networkPdu.length).toBeLessThanOrEqual(MAX_NETWORK_PDU_LENGTH);
+        expect(encodeProxyPdus(PROXY_MESSAGE_TYPE_NETWORK_PDU, networkPdu, MAX_PROXY_PDU_LENGTH)).toHaveLength(2);
+      }
+    },
+  );
+
+  test('the single-PDU branch of write() is therefore reachable only from an injected maxProxyPduLength', () => {
+    // One Proxy PDU carries maxPduLength - 1 octets of Data, and the
+    // smallest message above is 20 — exactly one more than the default
+    // allows. This is the arithmetic `write()`'s comment states.
+    expect(MAX_PROXY_PDU_LENGTH - 1).toBeLessThan(20);
   });
 });
