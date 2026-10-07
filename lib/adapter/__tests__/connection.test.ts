@@ -677,8 +677,11 @@ describe('the Proxy PDU envelope (Section 6.3 "Proxy PDU")', () => {
     expect(manager.getLastProxyProtocolDisconnect()).toMatch(/unexpected SAR value 0b10/);
     expect(received).toEqual([]);
 
-    // Recoverable, not terminal: the ordinary rescan brings the link back.
-    await clock.advance(0);
+    // Recoverable, not terminal: the rescan brings the link back — after
+    // this path's OWN backoff, which is no longer zero (final re-review,
+    // finding 4: a protocol violation repeats on every reconnection, so it
+    // escalates rather than looping at scan speed).
+    await clock.advance(1000);
     expect(manager.getState()).toEqual({ status: 'connected', peripheralId: 'A' });
   });
 
@@ -696,9 +699,12 @@ describe('the Proxy PDU envelope (Section 6.3 "Proxy PDU")', () => {
 
     await clock.advance(1);
     expect(manager.getLastProxyProtocolDisconnect()).toMatch(/SAR transfer timed out/);
-    // The rescan this schedules reconnects on the same tick, so the
-    // observable proof the link was dropped is the recorded reason above
-    // plus the second connect attempt below.
+    expect(manager.getState().status).toBe('unavailable'); // the link really was dropped
+    // The rescan it schedules waits out this path's own backoff first
+    // (finding 4), so the second connect attempt is one delay away rather
+    // than on the same tick.
+    expect(bluetooth.connectCalls).toEqual(['A']);
+    await clock.advance(1000);
     expect(bluetooth.connectCalls).toEqual(['A', 'A']);
   });
 
@@ -1398,5 +1404,130 @@ describe('findServiceData', () => {
 
   test('returns null for an empty serviceData array', () => {
     expect(findServiceData({ peripheralId: 'A', rssi: -50, serviceData: [] }, MESH_PROXY_SERVICE_UUID)).toBeNull();
+  });
+});
+
+/**
+ * FINAL RE-REVIEW, FINDING 4 (LOW). A disconnect this module performs
+ * because the specification requires it (Section 6.3.2.2) was invisible and
+ * instant: `getLastProxyProtocolDisconnect()` was read by nothing outside
+ * this test file, and the reschedule used `backoffDelayMs(this.failureStreak)`
+ * with a streak a successful connection had just reset to 0 — which is 0 ms.
+ * A bulb whose proxy behaviour this module's (strict, defensible) reading of
+ * "unexpected" rejects therefore produced an endless connect → violate →
+ * disconnect → immediate rescan loop, paced only by SCAN_DURATION_MS, with
+ * no growing delay and no line anywhere saying why.
+ *
+ * A protocol violation is not a transient. It will repeat on every
+ * reconnection to the same node, which is exactly why it gets a streak of
+ * its OWN rather than sharing `failureStreak`: that one is reset by a
+ * successful CONNECTION, and connecting is precisely the part that keeps
+ * working here. This one is reset by a message that actually completes —
+ * the link demonstrably behaving — so a single odd PDU on an otherwise
+ * healthy link decays, while a node that always violates escalates.
+ */
+describe('a specification-mandated disconnect is visible and backs off (final re-review, finding 4)', () => {
+  function setUpLogging(netKey: Buffer): {
+    bluetooth: FakeBluetoothPort;
+    clock: ReturnType<typeof createFakeClock>;
+    manager: ProxyConnectionManager;
+    lines: string[];
+  } {
+    const bluetooth = new FakeBluetoothPort();
+    const clock = createFakeClock();
+    const lines: string[] = [];
+    const manager = new ProxyConnectionManager(bluetooth, clock, netKey, { log: (message) => lines.push(message) });
+    return { bluetooth, clock, manager, lines };
+  }
+
+  /** 0b10_000000: a continuation segment with nothing being reassembled. */
+  function violate(bluetooth: FakeBluetoothPort, id: string): void {
+    bluetooth.simulateRawNotification(id, Buffer.from([0x80, 0x01]));
+  }
+
+  test('is reported through the injected log, naming the node and the reason', async () => {
+    const netKey = randomBytes(16);
+    const { bluetooth, clock, manager, lines } = setUpLogging(netKey);
+    bluetooth.addNode({ id: 'A', rssi: -50, networkKey: netKey });
+    manager.start();
+    await clock.advance(0);
+
+    violate(bluetooth, 'A');
+
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toMatch(/unexpected SAR value 0b10/);
+    expect(lines[0]).toMatch(/A/);
+    expect(lines[0]).toMatch(/1000/); // and when it will try again
+  });
+
+  test('nothing is logged on an ordinary, well-behaved link', async () => {
+    const netKey = randomBytes(16);
+    const { bluetooth, clock, manager, lines } = setUpLogging(netKey);
+    bluetooth.addNode({ id: 'A', rssi: -50, networkKey: netKey });
+    manager.start();
+    await clock.advance(0);
+
+    bluetooth.simulateNotification('A', Buffer.from([0x11, 0x22]));
+    bluetooth.simulateDisconnect('A'); // an ordinary drop is not a violation
+    await clock.advance(0);
+
+    expect(lines).toEqual([]);
+  });
+
+  test('repeated violations back off with increasing delay rather than rescanning instantly', async () => {
+    const netKey = randomBytes(16);
+    const { bluetooth, clock, manager } = setUpLogging(netKey);
+    bluetooth.addNode({ id: 'A', rssi: -50, networkKey: netKey });
+    manager.start();
+    await clock.advance(0);
+
+    violate(bluetooth, 'A');
+    await clock.advance(999);
+    expect(manager.getState().status).toBe('unavailable'); // not yet
+    await clock.advance(1);
+    expect(manager.getState().status).toBe('connected');
+
+    violate(bluetooth, 'A');
+    await clock.advance(1999);
+    expect(manager.getState().status).toBe('unavailable'); // the SECOND one waits twice as long
+    await clock.advance(1);
+    expect(manager.getState().status).toBe('connected');
+  });
+
+  test('a message that actually completes resets the escalation', async () => {
+    const netKey = randomBytes(16);
+    const { bluetooth, clock, manager } = setUpLogging(netKey);
+    bluetooth.addNode({ id: 'A', rssi: -50, networkKey: netKey });
+    manager.start();
+    await clock.advance(0);
+
+    violate(bluetooth, 'A');
+    await clock.advance(1000);
+    expect(manager.getState().status).toBe('connected');
+
+    // The link works: a whole message arrives and is delivered.
+    const received: Buffer[] = [];
+    manager.onNotification((data) => received.push(data));
+    bluetooth.simulateNotification('A', Buffer.from([0x11, 0x22]));
+    expect(received).toHaveLength(1);
+
+    violate(bluetooth, 'A');
+    await clock.advance(999);
+    expect(manager.getState().status).toBe('unavailable');
+    await clock.advance(1);
+    expect(manager.getState().status).toBe('connected'); // back to the FIRST delay, not the second
+  });
+
+  test('a manager given no log port at all works exactly the same, silently', async () => {
+    const netKey = randomBytes(16);
+    const { bluetooth, clock, manager } = setUp(netKey); // no `log` option
+    bluetooth.addNode({ id: 'A', rssi: -50, networkKey: netKey });
+    manager.start();
+    await clock.advance(0);
+
+    expect(() => violate(bluetooth, 'A')).not.toThrow();
+    expect(manager.getLastProxyProtocolDisconnect()).toMatch(/unexpected SAR value 0b10/);
+    await clock.advance(1000);
+    expect(manager.getState().status).toBe('connected');
   });
 });

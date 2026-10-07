@@ -323,7 +323,26 @@ export interface ProxyConnectionOptions {
    *  the same reason `maxProxyPduLength` is — a test that wants to observe
    *  the bound says which bound rather than depending on the default. */
   readonly proxyWriteTimeoutMs?: number;
+  /** Where this module reports a specification-mandated disconnect (see
+   *  `LogPort`). Omitted, those disconnects are silent — which is what the
+   *  final re-review's finding 4 was about, so `app.ts` passes one. */
+  readonly log?: LogPort;
 }
+
+/**
+ * The narrow log port this module reports through, the same shape and for
+ * the same reason as `BluetoothPort`/`ClockPort`: `Homey.App`'s own `log` is
+ * `(...args: unknown[]) => void` on a class this module must never import,
+ * and a one-line function is all that needs crossing the boundary. `app.ts`
+ * supplies `this.log`; a test supplies an array push; the default is a
+ * no-op, so nothing is forced to care.
+ *
+ * ONLY SPECIFICATION-MANDATED DISCONNECTS GO THROUGH IT, deliberately. This
+ * module's ordinary business — scanning, connecting, migrating, backing off
+ * — is normal and frequent, and a log line per scan window would bury the
+ * one event that actually means something is wrong with a node.
+ */
+export type LogPort = (message: string) => void;
 
 // --- Backoff schedule -------------------------------------------------
 //
@@ -492,6 +511,7 @@ export class ProxyConnectionManager {
   /** How long one `BluetoothPort.write` may take — see
    *  PROXY_WRITE_TIMEOUT_MS. */
   private readonly proxyWriteTimeoutMs: number;
+  private readonly log: LogPort;
   /** The reassembly in progress on the Mesh Proxy Data Out characteristic,
    *  if any (`proxyPdu.ts`'s own `undefined` convention). Reset whenever a
    *  connection is established or torn down — a reassembly cannot survive
@@ -508,8 +528,31 @@ export class ProxyConnectionManager {
   /** The reason for the most recent specification-mandated disconnect
    *  (Section 6.3.2.2), or `null` if none has happened. Diagnostic only;
    *  exposed so a test can assert WHY the link was dropped rather than
-   *  merely that it was. */
+   *  merely that it was — and reported through `log` as it happens, which
+   *  is what the final re-review's finding 4 added. */
   private lastProxyProtocolDisconnect: string | null = null;
+  /**
+   * How many specification-mandated disconnects have happened in a row
+   * without a message completing in between — the backoff
+   * `disconnectOnProxyProtocolViolation` paces itself with, and the reason
+   * it does not simply reuse `failureStreak` (final re-review, finding 4).
+   *
+   * `failureStreak` counts failures to ESTABLISH a connection and is reset
+   * by a successful one. A protocol violation happens AFTER a connection
+   * succeeds, so it would always be computing its delay from a streak of 0
+   * — which is 0 ms, i.e. no backoff at all — and a node whose proxy
+   * behaviour this module rejects would be rescanned, reconnected and
+   * rejected again forever at scan speed. A violation is also not a
+   * transient the way a failed connect is: it will repeat on every
+   * reconnection to the same node.
+   *
+   * Reset by a COMPLETED incoming message rather than by a successful
+   * connection, because connecting is the part that keeps working in this
+   * failure mode; a message completing is the link actually behaving. So an
+   * isolated odd PDU on a healthy link decays to no penalty, while a node
+   * that violates every time escalates to BACKOFF_MAX_MS.
+   */
+  private proxyProtocolViolationStreak = 0;
 
   constructor(bluetooth: BluetoothPort, clock: ClockPort, netKey: Buffer, options: ProxyConnectionOptions = {}) {
     if (netKey.length !== NET_KEY_LENGTH) {
@@ -529,6 +572,7 @@ export class ProxyConnectionManager {
       );
     }
     this.proxyWriteTimeoutMs = proxyWriteTimeoutMs;
+    this.log = options.log ?? ((): void => {});
     this.bluetooth = bluetooth;
     this.clock = clock;
     // Copy before deriving: this module never retains a view into a buffer
@@ -720,6 +764,10 @@ export class ProxyConnectionManager {
       case 'complete':
         this.reassembly = undefined;
         this.clearSarTimer();
+        // The link demonstrably works — see `proxyProtocolViolationStreak`.
+        // Reset before the MessageType check below: a complete mesh beacon
+        // we drop is still proof the proxy's own SAR behaviour is sound.
+        this.proxyProtocolViolationStreak = 0;
         if (result.messageType !== PROXY_MESSAGE_TYPE_NETWORK_PDU) return;
         for (const listener of this.notificationListeners) {
           listener(Buffer.from(result.message));
@@ -787,13 +835,26 @@ export class ProxyConnectionManager {
     this.reassembly = undefined;
     this.clearSarTimer();
     this.releaseSegmentedWrite();
+    this.proxyProtocolViolationStreak = Math.min(this.proxyProtocolViolationStreak + 1, MAX_FAILURE_STREAK);
     const active = this.active;
-    if (active === null) return;
+    if (active === null) {
+      // Not reachable through this module's own call paths (a notification
+      // can only arrive on a subscription an active connection owns), but
+      // if it ever were, a violation with nothing to drop is still worth
+      // saying out loud rather than recording where nothing reads it.
+      this.log(`mesh proxy protocol violation with no active connection: ${reason}`);
+      return;
+    }
+    const peripheralId = this.state.peripheralId;
     this.active = null;
     active.subscription.unsubscribe();
     void this.bluetooth.disconnect(active.connection);
     this.state = { status: 'unavailable', peripheralId: null };
-    this.scheduleNext(backoffDelayMs(this.failureStreak));
+    const delayMs = backoffDelayMs(this.proxyProtocolViolationStreak);
+    this.log(
+      `mesh proxy protocol violation on ${peripheralId ?? 'the active node'} (${this.proxyProtocolViolationStreak} in a row): ${reason} — dropped the link, rescanning in ${delayMs}ms`,
+    );
+    this.scheduleNext(delayMs);
   }
 
   private scheduleNext(delayMs: number): void {

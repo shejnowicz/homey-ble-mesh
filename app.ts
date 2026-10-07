@@ -170,7 +170,15 @@ class BleMeshApp extends Homey.App {
 
     const bluetooth = new HomeyBluetoothPort(this.homey.ble);
     const clock = createRealClock();
-    const manager = new ProxyConnectionManager(bluetooth, clock, netKey);
+    // The log port (final re-review, finding 4). A disconnect this app
+    // performs because Section 6.3.2.2 requires it used to be recorded in a
+    // field nothing on a production path ever read, so a bulb whose proxy
+    // behaviour we reject presented as "the mesh keeps flapping" with the
+    // actual reason invisible. It now says so, here, through the same
+    // `this.log` every other event in this file uses.
+    const manager = new ProxyConnectionManager(bluetooth, clock, netKey, {
+      log: (message: string) => this.log(message),
+    });
     const queue = new TrafficQueue(manager, clock);
     this.manager = manager;
     this.queue = queue;
