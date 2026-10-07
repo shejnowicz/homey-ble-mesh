@@ -85,8 +85,18 @@ class LightDevice extends Homey.Device {
       address,
     });
     this.controller = controller;
-    this.unregister = host.registerDeviceController(controller);
+    // ORDER MATTERS (review finding): `start()` subscribes the controller's
+    // unsolicited-notification listener; `registerDeviceController` can
+    // deliver an IMMEDIATE `onConnectionStateChange('connected')` call if
+    // the mesh is already up (app.ts's own doc comment on that method), which
+    // runs `reReadState()` and therefore sends Gets whose replies the
+    // controller must already be listening for. The two previously ran in
+    // the other order and only worked because `registerDeviceController`'s
+    // delivery happens after an `await` inside an async call this file never
+    // awaited — correct by accident of scheduling, not by this file's own
+    // guarantee. `start()` first removes the accident.
     controller.start();
+    this.unregister = host.registerDeviceController(controller);
 
     if (this.hasCapability('onoff')) {
       this.registerCapabilityListener('onoff', async (value: boolean) => controller.setOnOff(value));
@@ -138,6 +148,17 @@ class LightDevice extends Homey.Device {
       this.error('device deleted with no controller ever constructed — nothing to reset');
       return;
     }
+    // Review finding: without this, a deleted device's controller stayed
+    // registered and subscribed — it kept being handed every future
+    // `onConnectionStateChange` call (re-reading a node that no longer
+    // exists on every reconnection) and kept listening for unsolicited
+    // status from an address nothing will ever use again. Unregister/stop
+    // BEFORE attempting the reset below, not after: a reset attempt can
+    // take the queue's full bounded-retry time, and this cleanup does not
+    // depend on its outcome either way.
+    this.unregister?.();
+    this.unregister = null;
+    this.controller.stop();
     try {
       await this.controller.remove();
     } catch (err) {

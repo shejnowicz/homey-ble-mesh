@@ -206,6 +206,14 @@ interface MeshBootstrapHost {
    *  key exists; a no-op on every later call (including every call before
    *  the first network key exists). */
   ensureMeshStarted(): void;
+  /** See app.ts's own "PAIRING PAUSES THE SHARED CONNECTION" note — stops
+   *  the shared proxy connection for the duration of one pairing attempt so
+   *  this app never holds two simultaneous GATT connections. Returns
+   *  whether anything was actually running (and so actually paused). */
+  pauseMeshForPairing(): boolean;
+  /** The inverse of `pauseMeshForPairing` — call only when that call
+   *  returned `true`. */
+  resumeMeshAfterPairing(): void;
 }
 
 class LightDriver extends Homey.Driver {
@@ -227,15 +235,28 @@ class LightDriver extends Homey.Driver {
     });
 
     session.setHandler('pair_node', async (data: { peripheralId: string }): Promise<PairingOutcome> => {
-      const outcome = await pairNode(deps, data.peripheralId);
-      if (outcome.kind === 'paired') {
-        // First-ever pairing is what creates the network (ensureNetworkInitialized,
-        // pairing.ts) — this is the one place that tells app.ts to start the
-        // shared connection manager once that has happened. A no-op on every
-        // later pairing (the mesh is already running by then).
-        host.ensureMeshStarted();
+      // See app.ts's own "PAIRING PAUSES THE SHARED CONNECTION" note: from
+      // the second bulb onward this app would otherwise hold two
+      // simultaneous GATT connections (the proxy, plus this attempt's own)
+      // from the same Homey radio. A no-op, returning `false`, on the
+      // FIRST-ever pairing (nothing running yet to pause) — `wasRunning`
+      // below is what tells this handler not to call `resumeMeshAfterPairing`
+      // in that case, leaving `ensureMeshStarted` as the only thing that
+      // starts the connection the very first time.
+      const wasRunning = host.pauseMeshForPairing();
+      try {
+        const outcome = await pairNode(deps, data.peripheralId);
+        if (outcome.kind === 'paired') {
+          // First-ever pairing is what creates the network (ensureNetworkInitialized,
+          // pairing.ts) — this is the one place that tells app.ts to start the
+          // shared connection manager once that has happened. A no-op on every
+          // later pairing (the mesh is already running by then).
+          host.ensureMeshStarted();
+        }
+        return outcome;
+      } finally {
+        if (wasRunning) host.resumeMeshAfterPairing();
       }
-      return outcome;
     });
   }
 }

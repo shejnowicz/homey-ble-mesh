@@ -33,11 +33,30 @@
 // (`pairing.ts#ensureNetworkInitialized`) — `driver.ts`'s `onPair` calls
 // `ensureMeshStarted()` right after that first success, which is what
 // actually starts the connection the very first time.
+//
+// PAIRING PAUSES THE SHARED CONNECTION (review finding). From the second
+// bulb onward, pairing a new node happens WHILE the proxy connection to an
+// already-paired bulb is held — the design's own "held permanently" — so
+// provisioning a second peripheral means this app briefly needs TWO
+// simultaneous GATT connections from the one Homey radio. The design's own
+// accepted risk only covers coexisting with another app that mostly
+// listens (SwitchBot), not two connections from THIS app at once, and nothing
+// in this project has verified Homey's radio supports that. `driver.ts`'s
+// `pair_node` handler therefore calls `pauseMeshForPairing()` before
+// provisioning and `resumeMeshAfterPairing()` afterward (in a `finally`),
+// trading a brief, whole-mesh "unavailable" for every ALREADY-paired bulb
+// during the new bulb's own pairing attempt against the alternative — two
+// live connections whose actual coexistence on real hardware is unverified.
+// UNVERIFIED ON HARDWARE, same disclosure driver.ts's own module header
+// already makes for its real-Bluetooth wiring: whether this is even
+// necessary (maybe two connections work fine) or sufficient (maybe pairing
+// and the proxy connection contend for the radio in some OTHER way this
+// does not address) is something only the owner's three bulbs can confirm.
 import Homey from 'homey';
 import { NetworkStore, type SettingsPort } from './lib/adapter/store';
 import { ProxyConnectionManager, type ProxyConnectionState } from './lib/adapter/connection';
 import { TrafficQueue } from './lib/adapter/queue';
-import { MeshLightController, type MeshTrafficPort } from './drivers/light/meshLight';
+import { type MeshLightController, type MeshTrafficPort } from './drivers/light/meshLight';
 import { createRealClock } from './drivers/light/pairing';
 import { HomeyBluetoothPort } from './drivers/light/driver';
 
@@ -156,11 +175,53 @@ class BleMeshApp extends Homey.App {
     this.log('mesh connection manager started');
   }
 
+  /**
+   * `driver.ts#MeshBootstrapHost`'s own requirement — see this file's own
+   * module header's "PAIRING PAUSES THE SHARED CONNECTION" note. Returns
+   * whether the manager was actually running (and so actually paused), so
+   * the caller knows whether to resume it afterward rather than starting
+   * one that was never running (which `ensureMeshStarted` — the FIRST-ever-
+   * pairing path — is already responsible for). A no-op, returning `false`,
+   * when the mesh has not been started yet.
+   */
+  pauseMeshForPairing(): boolean {
+    if (this.manager === null) return false;
+    this.manager.stop();
+    return true;
+  }
+
+  /** The inverse of `pauseMeshForPairing` — only ever called by
+   *  `driver.ts` when THAT call's own `pauseMeshForPairing` returned `true`. */
+  resumeMeshAfterPairing(): void {
+    this.manager?.start();
+  }
+
+  /**
+   * Fans `onConnectionStateChange` out to every registered controller on
+   * EVERY tick, not only when `getState().status` changes (review finding).
+   * The earlier, change-gated version left a controller whose OWN re-read
+   * had failed latched unavailable forever: `meshLight.ts`'s own
+   * `onConnectionStateChange('connected')` can mark itself unavailable
+   * AGAIN if `reReadState()` throws (a node that does not answer even
+   * though the shared connection itself is up), but the SHARED status
+   * never changes again to tell it to try once more — nothing was polling
+   * on ITS behalf specifically. Calling every controller on every tick
+   * gives it that retry for free: `onConnectionStateChange` is idempotent
+   * against a repeated identical call (a `'connected'` call while already
+   * connected is a cheap no-op), so notifying a controller that has nothing
+   * to do costs nothing, while one whose own `connected` flag is still
+   * `false` gets a genuine new attempt every `CONNECTION_POLL_MS`.
+   * `lastConnectionStatus` is kept only for `registerDeviceController`'s own
+   * "deliver immediately" check and for the log line below, never to gate
+   * this loop.
+   */
   private pollConnectionState(): void {
     if (this.manager === null) return;
     const status = this.manager.getState().status;
-    if (status === this.lastConnectionStatus) return;
-    this.lastConnectionStatus = status;
+    if (status !== this.lastConnectionStatus) {
+      this.lastConnectionStatus = status;
+      this.log('mesh connection state changed', status);
+    }
     for (const controller of this.controllers) {
       controller.onConnectionStateChange(status).catch((err) => this.error('onConnectionStateChange failed', err));
     }

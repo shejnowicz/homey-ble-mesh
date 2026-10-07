@@ -141,15 +141,27 @@ import type { HomeyCapability } from '../../lib/models/capabilities';
  * CTL's PRACTICAL KELVIN RANGE is an engineering choice, not a specification
  * value — see `MIN_PRACTICAL_KELVIN`/`MAX_PRACTICAL_KELVIN` below for why.
  *
- * `light_mode` CARRIES NO WIRE TRAFFIC. It only tells Homey which of the two
- * pickers (colour wheel vs. temperature slider) to show — the Light CTL and
- * Light HSL models this project drives are each independently addressable
- * at all times (the bulb's own underlying Lightness state is bound to both,
- * per the Mesh Model specification, but nothing about "mode" needs to be
- * sent to the node for either model's own Set/Get/Status to keep working).
- * `device.ts` sets this capability directly with no call into this module
- * at all — the only capability handled that way, because it is the only one
- * with no decode/encode/availability logic worth gating.
+ * `light_mode` CARRIES NO WIRE TRAFFIC OF ITS OWN. It only tells Homey which
+ * of the two pickers (colour wheel vs. temperature slider) to show — the
+ * Light CTL and Light HSL models this project drives are each independently
+ * addressable at all times (the bulb's own underlying Lightness state is
+ * bound to both, per the Mesh Model specification, but nothing about "mode"
+ * needs to be sent to the node for either model's own Set/Get/Status to keep
+ * working), so there is no `setLightMode` command method here and
+ * `device.ts` wires the user's own mode-picker taps directly, with no call
+ * into this module. Its VALUE, however, DOES follow incoming status
+ * (`CTL_MODEL`/`HSL_MODEL`'s own `applyStatus`, review finding — see each
+ * one's own comment): whichever of the two models' Status a node reports
+ * — its own ack, an unsolicited change by other means, or a reconnection
+ * Get — sets `light_mode` to match, so the picker never shows the wrong one
+ * after an external change. `light_mode` only ever exists alongside both
+ * `light_temperature` and `light_hue` (`capabilities.ts`'s own rule), so
+ * either status is always a meaningful signal for it. One disclosed,
+ * order-dependent consequence: `reReadState()` queries CTL before HSL, so a
+ * BRAND NEW device's very first successful read always lands on `'color'`
+ * regardless of which the bulb was actually last set to — the mesh has no
+ * "current mode" concept to read instead (this comment's own earlier
+ * paragraph), so this is the best available proxy, not a true initial read.
  *
  * NULLISH CONVENTION: `null` throughout (matching every other lib/adapter
  * module) — a decode that cannot resolve to a specific status is `null`,
@@ -308,6 +320,17 @@ const CTL_MODEL: LightingModel<LightCtlStatus> = {
     if (device.hasCapability('dim')) {
       await device.setCapabilityValue('dim', wireToFraction(status.presentLightness));
     }
+    // Review finding: `light_mode` was never updated by an incoming status,
+    // so a colour-temperature change made by some OTHER means (the official
+    // app, a flow, another controller) left Homey showing the wrong picker —
+    // one of the design's own hardware acceptance items ("changing a light
+    // by any other means produces an unsolicited status that updates
+    // Homey"). `light_mode` only ever exists alongside both `light_temperature`
+    // and `light_hue` (capabilities.ts's own rule), so this status is exactly
+    // the signal that CTL is the model currently driving the lamp.
+    if (device.hasCapability('light_mode')) {
+      await device.setCapabilityValue('light_mode', 'temperature');
+    }
   },
 };
 
@@ -323,6 +346,10 @@ const HSL_MODEL: LightingModel<LightHslStatus> = {
     }
     if (device.hasCapability('dim')) {
       await device.setCapabilityValue('dim', wireToFraction(status.lightness));
+    }
+    // See CTL_MODEL's own identical note — this is the HSL half of the same fix.
+    if (device.hasCapability('light_mode')) {
+      await device.setCapabilityValue('light_mode', 'color');
     }
   },
 };
@@ -414,7 +441,7 @@ export class MeshLightController {
   async setOnOff(value: boolean): Promise<void> {
     const tid = this.allocateTid();
     const data = this.buildApplicationPdu(encodeGenericOnOffSet({ onOff: value ? 1 : 0, tid }));
-    await this.device.setCapabilityValue('onoff', value); // optimistic — design: "sets the capability immediately"
+    await this.setOptimistic('onoff', value); // design: "sets the capability immediately"
     const reply = await this.queue.send({
       data,
       isStatus: (pdu) => this.tryDecodeModel(ONOFF_MODEL, pdu) !== null,
@@ -427,7 +454,7 @@ export class MeshLightController {
   async setDim(value: number): Promise<void> {
     const tid = this.allocateTid();
     const data = this.buildApplicationPdu(encodeLightLightnessSet({ lightness: fractionToWire(value), tid }));
-    await this.device.setCapabilityValue('dim', clamp01(value)); // optimistic
+    await this.setOptimistic('dim', clamp01(value));
     const reply = await this.queue.send({
       data,
       isStatus: (pdu) => this.tryDecodeModel(LIGHTNESS_MODEL, pdu) !== null,
@@ -447,7 +474,7 @@ export class MeshLightController {
         tid,
       }),
     );
-    await this.device.setCapabilityValue('light_temperature', clamp01(value)); // optimistic
+    await this.setOptimistic('light_temperature', clamp01(value));
     const reply = await this.queue.send({
       data,
       isStatus: (pdu) => this.tryDecodeModel(CTL_MODEL, pdu) !== null,
@@ -471,8 +498,8 @@ export class MeshLightController {
         tid,
       }),
     );
-    await this.device.setCapabilityValue('light_hue', clamp01(hue)); // optimistic
-    await this.device.setCapabilityValue('light_saturation', clamp01(saturation)); // optimistic
+    await this.setOptimistic('light_hue', clamp01(hue));
+    await this.setOptimistic('light_saturation', clamp01(saturation));
     const reply = await this.queue.send({
       data,
       isStatus: (pdu) => this.tryDecodeModel(HSL_MODEL, pdu) !== null,
@@ -514,6 +541,20 @@ export class MeshLightController {
     const tid = this.nextTid;
     this.nextTid = (this.nextTid + 1) & 0xff;
     return tid;
+  }
+
+  /** Sets a capability's value ONLY if the device actually has it — review
+   *  finding: every STATUS application already checked `hasCapability`
+   *  before writing (each `LightingModel#applyStatus` above), but the
+   *  OPTIMISTIC write a command makes up front did not, an inconsistency
+   *  between two call sites writing the same capabilities. Harmless with
+   *  this project's own wiring (`device.ts` only ever calls a `set*` method
+   *  when the matching capability was registered), but defensive
+   *  consistency is cheap and this module should not rely on a caller
+   *  getting that right. */
+  private async setOptimistic(capability: HomeyCapability, value: unknown): Promise<void> {
+    if (!this.device.hasCapability(capability)) return;
+    await this.device.setCapabilityValue(capability, value);
   }
 
   private currentDimFraction(): number {

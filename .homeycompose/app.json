@@ -12,7 +12,9 @@
   "category": [
     "lights"
   ],
-  "permissions": [],
+  "permissions": [
+    "homey:wireless:ble"
+  ],
   "author": {
     "name": "Seweryn Hejnowicz"
   },

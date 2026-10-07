@@ -16,6 +16,25 @@ import { k4 } from '../../../lib/mesh/crypto/derive';
 import type { CompositionData } from '../../../lib/mesh/config/composition';
 import type { HomeyCapability } from '../../../lib/models/capabilities';
 
+/** Waits a full macrotask turn — same technique, and same reason, as
+ *  `fakeClock.ts`'s own private `flushMicrotasks` (queue.test.ts's own
+ *  module header explains it in full): the unsolicited handler below is
+ *  fire-and-forget from `simulateNotification`'s own perspective (queued as
+ *  a `.catch()`ed promise, never awaited by the caller), and its own
+ *  `applyStatus` chain is a SEQUENCE of several awaited
+ *  `setCapabilityValue` calls — the Light HSL case alone awaits FOUR in a
+ *  row. A fixed, small number of bare `await Promise.resolve()` calls is not
+ *  reliably enough to drain a chain that long (review finding — the first
+ *  version of this file used exactly that, and it was tall enough to hide
+ *  a genuine, reachable failure this file's own git history can show): a
+ *  `setImmediate` macrotask only fires once Node's entire microtask queue
+ *  — however many `await`s deep — has already drained. */
+function flushMicrotasks(): Promise<void> {
+  return new Promise((resolve) => {
+    setImmediate(resolve);
+  });
+}
+
 /**
  * Drives the REAL `ProxyConnectionManager` + `TrafficQueue` (over the
  * shared `FakeBluetoothPort`/`FakeClock` fixtures every earlier task's own
@@ -175,6 +194,12 @@ interface LightingResponderOptions {
    *  disagreeing VALUE alone, since that still answers with the right
    *  message TYPE). */
   readonly onOffSetRepliesWithWrongType?: boolean;
+  /** Opcodes this node stays silent on for their FIRST occurrence only —
+   *  every later write of the SAME opcode is answered normally. Models a
+   *  node that didn't hear the first attempt (so the queue's own bounded
+   *  retry fires) without simulating a dropped write at the GATT layer —
+   *  used to observe that the retry resends byte-identical bytes. */
+  readonly silentOnFirstAttemptForOpcodes?: ReadonlySet<number>;
   /** Called synchronously, inside `write()`, the instant a Config Node
    *  Reset request arrives — BEFORE this responder builds or sends any
    *  reply — so a test can observe exactly what else is true at that
@@ -185,6 +210,15 @@ interface LightingResponderOptions {
 function installLightingResponder(bluetooth: FakeBluetoothPort, peripheralId: string, opts: LightingResponderOptions): void {
   let nodeSeq = 0;
   const allocateNodeSeq = (): number => nodeSeq++;
+  const opcodeSeenCount = new Map<number, number>();
+  /** Returns true the FIRST time it is called for `opcode` when `opcode` is
+   *  one of `silentOnFirstAttemptForOpcodes` — see that option's own doc
+   *  comment. */
+  const shouldStaySilent = (opcode: number): boolean => {
+    const seenBefore = opcodeSeenCount.get(opcode) ?? 0;
+    opcodeSeenCount.set(opcode, seenBefore + 1);
+    return seenBefore === 0 && (opts.silentOnFirstAttemptForOpcodes?.has(opcode) ?? false);
+  };
   const sendAsNode = (accessPayload: Buffer, key: Buffer, keyKind: 'application' | 'device'): Buffer[] =>
     encodeMeshMessage({
       accessPayload,
@@ -218,6 +252,12 @@ function installLightingResponder(bluetooth: FakeBluetoothPort, peripheralId: st
     if (appResult.kind === 'complete') {
       const { opcode, parameters } = appResult.message;
       if (opts.silentOpcodes?.has(opcode)) return undefined;
+      // Checked (and counted) for EVERY opcode, including ones with no
+      // silence configured at all — shouldStaySilent's own counting must
+      // run unconditionally so a LATER write of the same opcode is
+      // correctly recognised as "not the first" even when this test never
+      // asked for silence on it.
+      if (shouldStaySilent(opcode)) return undefined;
       switch (opcode) {
         case OP_ONOFF_GET:
           return sendAsNode(onOffStatusPayload(opts.state.onOff), opts.appKey, 'application');
@@ -476,6 +516,56 @@ describe('setOnOff', () => {
 });
 
 // ===========================================================================
+// The transaction identifier — review finding: nothing in the suite ever
+// looked at one. A constant TID would make a node's own deduplication
+// (Section 3.3.1.2.2 et al. — same SRC/DST/TID within 6 s is treated as a
+// retransmission, not applied) silently drop the second of two genuinely
+// different commands: "I pressed it twice and the second did nothing",
+// undiagnosable from outside. The retry half is the opposite risk: if a
+// RETRY ever allocated a NEW TID, the node would see it as a brand new
+// command rather than recognise the retransmission, defeating the dedup
+// the TID exists for in the other direction.
+// ===========================================================================
+
+describe('transaction identifier', () => {
+  test('three successive NEW commands each get a DIFFERENT transaction identifier', async () => {
+    const h = setUp();
+    await connectManager(h.manager, h.clock);
+
+    // Three, not two — an allocator that advances once and then sticks
+    // (0, 1, 1, 1, ...) would still pass a two-command check; it fails a
+    // third one exactly where it stops advancing.
+    await h.controller.setOnOff(true);
+    await h.controller.setOnOff(false);
+    await h.controller.setOnOff(true);
+
+    expect(h.bluetooth.writesReceived).toHaveLength(3);
+    // Table 3.37: Opcode(2) || OnOff(1) || TID(1) — the TID is parameters[1].
+    const tids = h.bluetooth.writesReceived.map((w) => decodeOurCommand(w.data, h.netKey, h.appKey)?.parameters[1]);
+    expect(new Set(tids).size).toBe(3);
+  });
+
+  test('a RETRY of the same command resends byte-identical bytes, TID included', async () => {
+    const h = setUp({
+      queueOptions: { timeoutMs: 50, maxAttempts: 2 },
+      responderOptions: { silentOnFirstAttemptForOpcodes: new Set([OP_ONOFF_SET]) },
+    });
+    await connectManager(h.manager, h.clock);
+
+    const promise = h.controller.setOnOff(true);
+    // Let setOnOff's own first await (the optimistic setCapabilityValue
+    // call) resolve before the queue's write()/timer-arm chain runs — same
+    // reasoning as the wrong-type-reply test above.
+    await flushMicrotasks();await h.clock.advance(50); // attempt 1 times out (silent); attempt 2 fires and is answered
+    await promise;
+
+    expect(h.bluetooth.writesReceived).toHaveLength(2);
+    const [first, second] = h.bluetooth.writesReceived;
+    expect(first!.data.equals(second!.data)).toBe(true);
+  });
+});
+
+// ===========================================================================
 // Unsolicited status
 // ===========================================================================
 
@@ -487,9 +577,7 @@ describe('unsolicited status', () => {
 
     const pdu = buildNodeNotification(h.netKey, h.appKey, onOffStatusPayload(1));
     h.bluetooth.simulateNotification(NODE_PERIPHERAL_ID, pdu);
-    await Promise.resolve();
-    await Promise.resolve(); // let the fire-and-forget handler's internal awaits settle
-
+    await flushMicrotasks();
     expect(h.device.getCapabilityValue('onoff')).toBe(true);
     expect(h.bluetooth.writesReceived).toHaveLength(0); // genuinely unsolicited: nothing was sent
     expect(h.device.availabilityCalls.at(-1)).toEqual({ available: true });
@@ -502,10 +590,7 @@ describe('unsolicited status', () => {
 
     const pdu = buildNodeNotification(h.netKey, h.appKey, statusPayload(OP_CTL_STATUS, [32768, 4000]));
     h.bluetooth.simulateNotification(NODE_PERIPHERAL_ID, pdu);
-    await Promise.resolve();
-    await Promise.resolve();
-
-    expect(h.device.getCapabilityValue('light_temperature')).toBeCloseTo(__testing.kelvinToHomey(4000), 6);
+    await flushMicrotasks();expect(h.device.getCapabilityValue('light_temperature')).toBeCloseTo(__testing.kelvinToHomey(4000), 6);
     expect(h.device.getCapabilityValue('dim')).toBeCloseTo(__testing.wireToFraction(32768), 6);
     expect(h.bluetooth.writesReceived).toHaveLength(0);
   });
@@ -518,13 +603,7 @@ describe('unsolicited status', () => {
     const otherNodeAddress = NODE_ADDRESS + 1;
     const pdu = buildNodeNotification(h.netKey, h.appKey, onOffStatusPayload(1), otherNodeAddress);
     h.bluetooth.simulateNotification(NODE_PERIPHERAL_ID, pdu);
-    await Promise.resolve();
-    await Promise.resolve();
-
-    // This controller owns NODE_ADDRESS, not otherNodeAddress — a message
-    // from a different node must never be mistaken for one of its own,
-    // even though both travel over the SAME shared connection/queue.
-    expect(h.device.getCapabilityValue('onoff')).toBeNull();
+    await flushMicrotasks();expect(h.device.getCapabilityValue('onoff')).toBeNull();
     expect(h.device.availabilityCalls).toEqual([{ available: false, message: CONNECTION_UNAVAILABLE_MESSAGE }]);
   });
 
@@ -537,10 +616,7 @@ describe('unsolicited status', () => {
 
     const pdu = buildNodeNotification(h.netKey, h.appKey, onOffStatusPayload(1));
     h.bluetooth.simulateNotification(NODE_PERIPHERAL_ID, pdu);
-    await Promise.resolve();
-    await Promise.resolve();
-
-    expect(h.device.availabilityCalls.at(-1)).toEqual({ available: true });
+    await flushMicrotasks();expect(h.device.availabilityCalls.at(-1)).toEqual({ available: true });
   });
 
   test('a command\'s own isStatus rejects a WRONG-TYPE reply from the same node; the unsolicited listener catches it instead', async () => {
@@ -563,9 +639,7 @@ describe('unsolicited status', () => {
     // must resolve before the queue's write()/timer-arm chain even runs —
     // flush that one microtask turn before advancing virtual time, or the
     // timer this test needs to fire is armed too late to be seen.
-    await Promise.resolve();
-    await Promise.resolve();
-    await h.clock.advance(50);
+    await flushMicrotasks();await h.clock.advance(50);
     await rejection;
 
     // The wrong-type reply was not silently lost — it fell through to the
@@ -584,10 +658,7 @@ describe('unsolicited status', () => {
 
     const pdu = buildNodeNotification(h.netKey, h.appKey, onOffStatusPayload(1));
     h.bluetooth.simulateNotification(NODE_PERIPHERAL_ID, pdu);
-    await Promise.resolve();
-    await Promise.resolve();
-
-    expect(h.device.getCapabilityValue('onoff')).toBeNull();
+    await flushMicrotasks();expect(h.device.getCapabilityValue('onoff')).toBeNull();
   });
 });
 
@@ -703,6 +774,53 @@ describe('availability', () => {
     expect(h.device.availabilityCalls.some((c) => c.available)).toBe(false);
   });
 
+  // Review finding: having introduced PER-NODE unavailability (the design's
+  // own availability clause is connection-level), this module owes that a
+  // retry. app.ts now calls onConnectionStateChange('connected') on EVERY
+  // poll tick rather than only when the SHARED status changes (see its own
+  // module header) precisely so a node whose own re-read failed once gets
+  // tried again — this test pins the controller-side half of that fix: a
+  // repeated 'connected' call, with the shared status never having dipped
+  // to 'unavailable' in between, must still attempt a fresh re-read rather
+  // than treating the earlier failure as final.
+  test('a failed re-read is retried on the NEXT onConnectionStateChange("connected") call, not treated as final', async () => {
+    const h = setUp({
+      capabilities: new Set(['onoff']),
+      queueOptions: { timeoutMs: 50, maxAttempts: 1 },
+      // Silent only for the Get's FIRST occurrence — the second is answered.
+      responderOptions: { silentOnFirstAttemptForOpcodes: new Set([OP_ONOFF_GET]) },
+    });
+    await connectManager(h.manager, h.clock);
+
+    const firstAttempt = h.controller.onConnectionStateChange('connected');
+    await h.clock.advance(50);
+    await firstAttempt;
+    expect(h.device.availabilityCalls.at(-1)?.available).toBe(false);
+
+    // queue.ts's own documented, deliberate "late status" guard: once an
+    // attempt is abandoned, its predicate is kept for EXACTLY the next
+    // inbound notification, so a stray late reply of the SAME shape is not
+    // mistaken for the answer to whatever is active now. Retrying the exact
+    // same Get immediately would otherwise have ITS OWN legitimate reply
+    // caught by that one-shot guard (it still matches "is this an OnOff
+    // status", which is all the abandoned predicate checks) — a genuine
+    // interaction this test must account for, not a bug in this module.
+    // One harmless, unrelated notification consumes that one-shot guard
+    // first (matching nothing active, since nothing is active right now).
+    h.bluetooth.simulateNotification(
+      NODE_PERIPHERAL_ID,
+      buildNodeNotification(h.netKey, h.appKey, statusPayload(OP_LIGHTNESS_STATUS, [0])),
+    );
+    await flushMicrotasks();
+
+    // SAME status, called again — nothing told this controller the shared
+    // connection ever went down and came back; it still must not assume.
+    await h.controller.onConnectionStateChange('connected');
+
+    expect(h.bluetooth.writesReceived).toHaveLength(2); // the retry's own Get, not skipped
+    expect(h.device.availabilityCalls.at(-1)).toEqual({ available: true });
+  });
+
   test('calling onConnectionStateChange("connected") twice in a row only re-reads once', async () => {
     const h = setUp({ capabilities: new Set(['onoff']) });
     await connectManager(h.manager, h.clock);
@@ -790,5 +908,112 @@ describe('start/stop', () => {
       h.controller.stop();
       h.controller.stop();
     }).not.toThrow();
+  });
+});
+
+// ===========================================================================
+// Review finding: a lost-then-restored connection. Nothing previously drove
+// connected -> unavailable -> connected TWICE, so an implementation that
+// left its own "connected" flag set across the unavailable transition (the
+// flag only ever meant to be read, not also written there) would still have
+// passed the entire suite — the second "connected" call would then see
+// itself as already connected and skip the re-read silently.
+// ===========================================================================
+
+describe('a lost-then-restored connection', () => {
+  test('the SECOND reconnection re-reads again, not just the first', async () => {
+    const h = setUp({ capabilities: new Set(['onoff']) });
+    await connectManager(h.manager, h.clock);
+
+    await h.controller.onConnectionStateChange('connected');
+    expect(h.bluetooth.writesReceived).toHaveLength(1); // first re-read
+    expect(h.device.availabilityCalls.at(-1)).toEqual({ available: true });
+
+    await h.controller.onConnectionStateChange('unavailable');
+    expect(h.device.availabilityCalls.at(-1)).toEqual({ available: false, message: CONNECTION_UNAVAILABLE_MESSAGE });
+
+    await h.controller.onConnectionStateChange('connected'); // restored
+    expect(h.bluetooth.writesReceived).toHaveLength(2); // re-read AGAIN — not skipped as "already connected"
+    expect(h.device.availabilityCalls.at(-1)).toEqual({ available: true });
+  });
+});
+
+// ===========================================================================
+// Review finding: light_mode is never initialised and never follows an
+// incoming status, so a colour change made by some other means left Homey
+// showing the wrong picker — one of the design's own hardware acceptance
+// items. CTL_MODEL/HSL_MODEL's own applyStatus now set it; these tests pin
+// that directly (device.ts's own user-driven listener is untestable here —
+// it is wired in the untested file, see its own module header).
+// ===========================================================================
+
+describe('light_mode follows incoming status', () => {
+  test('a Light CTL status sets light_mode to "temperature"', async () => {
+    const h = setUp();
+    h.controller.start();
+    await connectManager(h.manager, h.clock);
+
+    const pdu = buildNodeNotification(h.netKey, h.appKey, statusPayload(OP_CTL_STATUS, [32768, 4000]));
+    h.bluetooth.simulateNotification(NODE_PERIPHERAL_ID, pdu);
+    await flushMicrotasks();expect(h.device.getCapabilityValue('light_mode')).toBe('temperature');
+  });
+
+  test('a Light HSL status sets light_mode to "color"', async () => {
+    const h = setUp();
+    h.controller.start();
+    await connectManager(h.manager, h.clock);
+
+    const pdu = buildNodeNotification(h.netKey, h.appKey, statusPayload(OP_HSL_STATUS, [1000, 2000, 3000]));
+    h.bluetooth.simulateNotification(NODE_PERIPHERAL_ID, pdu);
+    await flushMicrotasks();expect(h.device.getCapabilityValue('light_mode')).toBe('color');
+  });
+
+  test('a device without the light_mode capability is never written to', async () => {
+    const h = setUp({ capabilities: new Set(['light_temperature', 'dim']) }); // no light_mode
+    h.controller.start();
+    await connectManager(h.manager, h.clock);
+
+    const pdu = buildNodeNotification(h.netKey, h.appKey, statusPayload(OP_CTL_STATUS, [32768, 4000]));
+    h.bluetooth.simulateNotification(NODE_PERIPHERAL_ID, pdu);
+    await flushMicrotasks();expect(h.device.setCalls.some((c) => c.capability === 'light_mode')).toBe(false);
+  });
+});
+
+// ===========================================================================
+// Review finding: every STATUS application checks hasCapability before
+// writing, but the OPTIMISTIC write a command makes up front did not — an
+// inconsistency between two call sites writing the same capabilities.
+// Exercised directly (not reachable through this project's own device.ts
+// wiring, which never calls a set* method for a capability it did not
+// register) so the guard itself is pinned, not merely assumed consistent.
+// ===========================================================================
+
+describe('optimistic writes respect capability presence', () => {
+  test('setOnOff writes nothing at all when the device has no onoff capability', async () => {
+    const h = setUp({ capabilities: new Set() });
+    await connectManager(h.manager, h.clock);
+    await h.controller.setOnOff(true);
+    expect(h.device.setCalls.filter((c) => c.capability === 'onoff')).toEqual([]);
+  });
+
+  test('setDim writes nothing at all when the device has no dim capability', async () => {
+    const h = setUp({ capabilities: new Set() });
+    await connectManager(h.manager, h.clock);
+    await h.controller.setDim(0.5);
+    expect(h.device.setCalls.filter((c) => c.capability === 'dim')).toEqual([]);
+  });
+
+  test('setLightTemperature writes nothing at all when the device has no light_temperature capability', async () => {
+    const h = setUp({ capabilities: new Set() });
+    await connectManager(h.manager, h.clock);
+    await h.controller.setLightTemperature(0.5);
+    expect(h.device.setCalls.filter((c) => c.capability === 'light_temperature')).toEqual([]);
+  });
+
+  test('setColor writes nothing at all when the device has no hue/saturation capabilities', async () => {
+    const h = setUp({ capabilities: new Set() });
+    await connectManager(h.manager, h.clock);
+    await h.controller.setColor(0.3, 0.6);
+    expect(h.device.setCalls.filter((c) => c.capability === 'light_hue' || c.capability === 'light_saturation')).toEqual([]);
   });
 });
