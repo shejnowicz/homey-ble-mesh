@@ -89,6 +89,35 @@ export interface NodeEntry {
    * halfway.
    */
   readonly probe?: NodeProbeResult;
+  /**
+   * THE NODE IS OURS, BUT WE NEVER FINISHED CONFIGURING IT. Set on an entry
+   * written by `drivers/light/pairing.ts` the moment provisioning has
+   * SUCCEEDED and the composition has been read — before the application
+   * key is added and before a single Config Model App Bind — and cleared
+   * (by writing the entry again without it) once the whole configuration
+   * exchange has completed. A node left carrying this flag holds our
+   * network key and occupies its unicast address, but has no application
+   * key bound to its models, so nothing in this app can drive it; what the
+   * entry buys is the DEVICE KEY, without which the node could never be
+   * reset or retried at all and would need a physical factory reset (see
+   * pairing.ts's own "A FAILURE AFTER PROVISIONING SUCCEEDS" note for the
+   * hardware incident this exists to prevent).
+   *
+   * WHY A FLAG AND NOT MERELY AN ABSENT `probe`. `probe` is already
+   * optional and already means something else entirely — "paired before the
+   * probe existed, believe the declaration"
+   * (`capabilities.ts#mapCompositionToCapabilities`). An incompletely
+   * configured node also has no probe, so without this flag the two would
+   * be indistinguishable and a half-configured node would read as a
+   * perfectly good pre-probe one.
+   *
+   * ABSENT MEANS COMPLETE, and that is what makes this a migration that
+   * cannot fail halfway: every entry written before this field existed was
+   * written on the success path only, so "no flag" is exactly right for all
+   * of them. There is no version bump and no rewrite pass, for the same
+   * reason `probe` needed neither.
+   */
+  readonly incomplete?: true;
 }
 
 /** Everything the design's "Persistence, sequence numbers and removal"
@@ -213,6 +242,9 @@ interface PersistedNode {
   composition: CompositionData;
   /** Absent for a node paired before the probe existed - see `NodeEntry.probe`. */
   probe?: PersistedProbe;
+  /** Absent for a fully configured node, and for every node written before
+   *  this field existed - see `NodeEntry.incomplete`. */
+  incomplete?: true;
 }
 
 /** `NodeProbeResult`'s own JSON shape. Plain data already (no Buffers), so this is a structural copy rather than a conversion - but it is still re-validated on the way back in, like every other field here, because a hand-edited settings value never went through `encodeNetworkState`. */
@@ -342,6 +374,13 @@ function encodeNetworkState(state: NetworkState): PersistedNetworkState {
     if (node.probe !== undefined) {
       encoded.probe = encodeProbe(`nodes[${i}].probe`, node.probe);
     }
+    // Written only when it is actually set, for the same reason `probe` is:
+    // "configured" must stay the exact shape every pre-existing entry
+    // already has, so an older reader and a newer one agree about every
+    // node either of them wrote. See `NodeEntry.incomplete`.
+    if (node.incomplete === true) {
+      encoded.incomplete = true;
+    }
     return encoded;
   });
 
@@ -405,8 +444,23 @@ function decodeNetworkState(value: unknown): NetworkState {
     };
     // Absent (a node paired before the probe existed) stays absent - see
     // `NodeEntry.probe`'s own note on why that IS the migration.
-    if (node.probe === undefined || node.probe === null) return entry;
-    return { ...entry, probe: decodeProbe(`nodes[${i}].probe`, node.probe) };
+    const probed =
+      node.probe === undefined || node.probe === null
+        ? entry
+        : { ...entry, probe: decodeProbe(`nodes[${i}].probe`, node.probe) };
+
+    // Absent, null, or an explicit `false` all mean "configuration
+    // completed" — the shape every entry written before this field existed
+    // already has (see `NodeEntry.incomplete`). Only a literal `true` marks
+    // one as incomplete; anything else is neither of this module's own two
+    // shapes and is corruption, rejected the same way a nonsense probe
+    // verdict is rather than being quietly read as one or the other.
+    const incomplete = node.incomplete;
+    if (incomplete === undefined || incomplete === null || incomplete === false) return probed;
+    if (incomplete !== true) {
+      throw new Error(`stored network state field "nodes[${i}].incomplete" is not a boolean`);
+    }
+    return { ...probed, incomplete: true };
   });
 
   const netKey = v.netKey === null || v.netKey === undefined ? null : hexToKeyBuffer(v.netKey as string, 'netKey');

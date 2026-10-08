@@ -139,10 +139,37 @@ import { COLOUR_MODE_SETTING, seedColourMode, type ColourMode } from './colourMo
  * below) are the SECOND thing that needs real randomness, and go through
  * the exact same injected source for the exact same reason.
  *
- * NODE ENTRIES ARE WRITTEN ONLY ON COMPLETE SUCCESS (`finishPairing`, the
- * ONE place this module writes to `store.nodes`). The allocated node
- * address, by contrast, is NEVER reclaimed on failure — once
- * `store.allocateUnicastAddress()` hands one out, this module simply
+ * A NODE ENTRY IS WRITTEN THE MOMENT THE NODE IS OURS, NOT WHEN
+ * CONFIGURATION FINISHES (hardware round, 2026-10-08 — three bulbs in one
+ * run, one of which never answered its Config Model App Bind). Entries used
+ * to be written only on complete success, which meant that a bulb which
+ * provisioned and then failed ANY later step left this app holding nothing:
+ * not its unicast address, not its device key. The bulb, meanwhile, was
+ * holding our network key and had left the Mesh Provisioning Service for
+ * the Mesh Proxy Service, so it could neither be found by a later scan nor
+ * addressed by this app — one unlucky radio moment turned into a bulb
+ * recoverable only by a physical factory reset. `recordProvisionedNode`
+ * below now writes the entry as soon as provisioning has SUCCEEDED and the
+ * composition has been read, before the application key is added and before
+ * the first bind, carrying `NodeEntry.incomplete` so nothing mistakes it
+ * for a finished one; `finishPairing` later REPLACES that entry (dropping
+ * the flag, adding the probe) instead of appending a second one. The user's
+ * outcome for such a run is still a failure, and no Homey device is created
+ * for it — what changes is only that the device key survives the failure.
+ *
+ * THE ONE ENTRY THAT IS DELIBERATELY REMOVED AGAIN: a configuration failure
+ * whose Config Node Reset was ANSWERED (see `failWithReset` below) means the
+ * node has returned to the unowned state and is no longer ours at all, so
+ * `pairNode` drops the entry it just wrote. That is the same fact this
+ * module already tells the user in the failure message ("the node has been
+ * reset and can be paired again"); keeping a store entry for a node we have
+ * just told the user is unowned would make the two disagree. Every OTHER
+ * failure keeps the entry, including a reset that was refused, answered
+ * with the wrong message type, or never answered at all — exactly the cases
+ * where the device key is the only way back.
+ *
+ * The allocated node address, by contrast, is NEVER reclaimed on failure —
+ * once `store.allocateUnicastAddress()` hands one out, this module simply
  * abandons it if anything later fails, the same way a real provisioner
  * cannot safely reuse an address a partially-provisioned node might
  * already have recorded. This is deliberate, not an oversight: see
@@ -165,28 +192,38 @@ import { COLOUR_MODE_SETTING, seedColourMode, type ColourMode } from './colourMo
  * Config Node Reset over the still-open session FIRST (the encoder/decoder
  * for this already existed, already tested, and had no caller before this
  * fix), and names whether that reset itself succeeded in the returned
- * message — never silently swallowed. The one case this cannot cover is a
- * configuration session that could never be opened at all (no session, no
- * way to send anything); `pairNode` says so plainly in that message instead
- * of pretending the node is still reachable.
+ * message — never silently swallowed. The hardware round then proved that
+ * fix INSUFFICIENT on its own: a reset is itself a message to a node that
+ * has just demonstrated it is not answering messages, so when it fails too
+ * the bulb was still stranded. The store entry described above is the
+ * second half of the same fix — the reset is the clean way out, the
+ * recorded device key is the way out when the clean one fails.
+ *
+ * The one case NEITHER half covers is a configuration session that could
+ * never be opened at all: no session means no reset, and this module then
+ * has a device key but no composition, so there is no entry it could write
+ * without inventing an element count the node never reported. `pairNode`
+ * says so plainly in that message instead of pretending the node is still
+ * reachable.
  *
  * THE INHERITED ADDRESS-ADVANCE HAZARD (plan 1, carried into this task's
  * brief). `store.allocateUnicastAddress()` hands out exactly ONE address,
  * but a node occupies as many CONSECUTIVE unicast addresses as it has
  * elements — and composition data, which reveals the element count, is only
  * read AFTER provisioning assigns the node's own (single) address.
- * `reserveElementAddresses` advances `nextUnicastAddress` past the extra
- * elements — called by `pairNode` as soon as the element count is known,
- * WIN OR LOSE (review finding, MEDIUM: the same root cause as the orphaning
- * finding above — a multi-element node that provisions and then fails
- * configuration still occupies several consecutive addresses, regardless of
- * whether this app ever finishes configuring it), from a FRESH
- * `store.getState()` read taken immediately before that single `setState`
- * call, never from a state snapshot read before `allocateUnicastAddress()`
- * ran, per that method's own loud CALLER HAZARD comment (reading-before-
- * allocating and writing after would silently rewind the pointer and
- * reissue an address already handed out — see `ensureNetworkInitialized`
- * below for the other call site with the exact same discipline).
+ * `recordProvisionedNode` advances `nextUnicastAddress` past the extra
+ * elements in the SAME write that records the node — run as soon as the
+ * element count is known, WIN OR LOSE (review finding, MEDIUM: the same
+ * root cause as the orphaning finding above — a multi-element node that
+ * provisions and then fails configuration still occupies several
+ * consecutive addresses, regardless of whether this app ever finishes
+ * configuring it), from a FRESH `store.getState()` read taken immediately
+ * before that single `setState` call, never from a state snapshot read
+ * before `allocateUnicastAddress()` ran, per that method's own loud CALLER
+ * HAZARD comment (reading-before-allocating and writing after would
+ * silently rewind the pointer and reissue an address already handed out —
+ * see `ensureNetworkInitialized` below for the other call site with the
+ * exact same discipline).
  *
  * COMPOSITION DATA THAT DOES NOT PARSE (plan 4's open question, this task's
  * brief). `parseCompositionData` returns a single `null` for four distinct
@@ -841,6 +878,22 @@ interface ConfigExchangeInput {
   readonly nodeAddress: number;
   readonly deviceKey: Buffer;
   readonly allocateSeq: () => number;
+  /**
+   * Called EXACTLY ONCE, the instant the node's composition data has been
+   * read and parsed and before anything else is asked of the node — see the
+   * module header's "A NODE ENTRY IS WRITTEN THE MOMENT THE NODE IS OURS"
+   * note. Injected rather than done inline because this module's
+   * configuration exchange knows nothing about the store (it takes keys and
+   * addresses, not a `NetworkStore`); `pairNode` supplies the one
+   * implementation, which records the node and reserves its extra elements'
+   * addresses in a single write.
+   *
+   * May throw, and a throw is NOT swallowed: failing to persist the node is
+   * precisely the stranding this hook exists to prevent, so it surfaces
+   * through `runConfigExchange`'s own catch as an ordinary configuration
+   * failure (with a reset attempt) rather than being hidden.
+   */
+  readonly onProvisioned: (composition: CompositionData) => void;
 }
 
 /**
@@ -855,7 +908,22 @@ interface ConfigExchangeInput {
  */
 export type ConfigExchangeResult =
   | { readonly kind: 'ok'; readonly composition: CompositionData; readonly probe: NodeProbeResult }
-  | { readonly kind: 'failed'; readonly message: string; readonly composition: CompositionData | null };
+  | {
+      readonly kind: 'failed';
+      readonly message: string;
+      readonly composition: CompositionData | null;
+      /**
+       * Whether the Config Node Reset this module sends on every
+       * configuration-phase failure (see `failWithReset`) was actually
+       * ANSWERED with a Node Reset Status — i.e. whether the node is back
+       * in the unowned state and no longer ours. Carried as a typed fact
+       * rather than left to be read out of `message`, because `pairNode`
+       * acts on it: it is what decides whether the store entry written
+       * when the node was provisioned is kept (the node is still ours, and
+       * its device key is the only way back) or dropped (the node is not).
+       */
+      readonly nodeWasReset: boolean;
+    };
 
 /** Sends one device-key-secured Config message and waits for the (possibly
  *  segmented) reply, decoded all the way to an `AccessMessage`.
@@ -942,7 +1010,7 @@ async function failWithReset(input: ConfigExchangeInput, composition: Compositio
   const suffix = reset.ok
     ? ' — the node has been reset and can be paired again'
     : ` — attempted to reset the node so it can be paired again, but that also failed (${reset.error}); it may need a manual factory reset`;
-  return { kind: 'failed', message: `${message}${suffix}`, composition };
+  return { kind: 'failed', message: `${message}${suffix}`, composition, nodeWasReset: reset.ok };
 }
 
 /**
@@ -1072,6 +1140,13 @@ export async function runConfigExchange(input: ConfigExchangeInput): Promise<Con
     }
     knownComposition = compositionReply.composition;
     const composition = knownComposition;
+
+    // THE NODE IS OURS FROM HERE ON, so it is recorded HERE — before the
+    // application key, before the first bind, before the probe. Everything
+    // below this line is configuration, and configuration failing must cost
+    // the user a working bulb, never the bulb itself. See the module
+    // header's "A NODE ENTRY IS WRITTEN THE MOMENT THE NODE IS OURS" note.
+    input.onProvisioned(composition);
 
     const appKeyReply = toConfigStatus(
       await sendConfigRequest(
@@ -1320,22 +1395,25 @@ export async function pairNode(deps: PairingDeps, peripheralId: string): Promise
         nodeAddress,
         deviceKey,
         allocateSeq: () => deps.store.allocateSequenceBlock(),
+        // Records the node AND reserves its extra elements' addresses in
+        // one write, the instant the composition is known — win or lose.
+        // See `recordProvisionedNode` and the module header's two notes on
+        // why both halves must not wait for configuration to succeed.
+        onProvisioned: (composition: CompositionData) =>
+          recordProvisionedNode(deps.store, nodeAddress, deviceKey, composition),
       });
       await disconnectQuietly(configSession);
 
-      // Review finding (MEDIUM): reserve the extra-element addresses as
-      // soon as the element count is known, regardless of whether
-      // configuration goes on to succeed — a node that provisions with N
-      // elements occupies N consecutive addresses the moment it is
-      // provisioned, independent of whether AppKey Add/Model App Bind ever
-      // complete. Done here, not inside `finishPairing`, which no longer
-      // touches `nextUnicastAddress` at all (see that function's own
-      // comment).
-      if (exchangeResult.composition !== null) {
-        reserveElementAddresses(deps.store, exchangeResult.composition);
-      }
-
       if (exchangeResult.kind === 'failed') {
+        if (exchangeResult.nodeWasReset) {
+          // The node answered the reset: it has given up our network key and
+          // its address, so the entry recorded a moment ago describes a node
+          // that is no longer ours. Dropping it is what keeps the store and
+          // the message the user is about to read ("the node has been reset
+          // and can be paired again") saying the same thing. Every other
+          // failure KEEPS the entry — see the module header.
+          forgetProvisionedNode(deps.store, nodeAddress);
+        }
         return { kind: 'failed', message: exchangeResult.message };
       }
       return finishPairing(deps.store, peripheralId, nodeAddress, deviceKey, exchangeResult.composition, exchangeResult.probe);
@@ -1467,25 +1545,69 @@ export async function pairNodes(
 }
 
 /**
- * Advances the store's next-free unicast address past a multi-element
- * node's EXTRA elements (the node's own primary address was already
- * allocated via `store.allocateUnicastAddress()` before provisioning — see
- * the module header's INHERITED ADDRESS-ADVANCE HAZARD note). Called as
- * soon as the element count is known, win or lose — see `pairNode`'s own
- * comment at its one call site for why this must not wait for success.
- * A no-op for a single-element node (nothing extra to reserve). Follows the
- * same "re-read immediately before the one `setState`" discipline as
- * `ensureNetworkInitialized`.
+ * Records a node that is now PROVISIONED but not yet configured, and
+ * advances the store's next-free unicast address past its EXTRA elements —
+ * both in one write, both as soon as the composition is known, win or lose.
+ *
+ * TWO SEPARATE HAZARDS, ONE WRITE, and that is deliberate rather than
+ * tidy-mindedness: the entry exists so a configuration failure cannot
+ * strand the bulb (module header, "A NODE ENTRY IS WRITTEN THE MOMENT THE
+ * NODE IS OURS"), and the address advance exists because a multi-element
+ * node occupies N consecutive addresses the moment it is provisioned
+ * (module header, INHERITED ADDRESS-ADVANCE HAZARD). Both become true at
+ * exactly the same instant — when the composition reveals the element count
+ * — and folding them into a single read-modify-write is what keeps the
+ * second from stomping the first.
+ *
+ * `incomplete: true` is what stops this entry from being mistaken for a
+ * finished one: see `store.ts#NodeEntry.incomplete`. `finishPairing` below
+ * replaces this entry rather than appending beside it.
+ *
+ * Follows the same "re-read immediately before the one `setState`"
+ * discipline as `ensureNetworkInitialized` — never a snapshot taken before
+ * `allocateUnicastAddress()` ran. A single-element node simply reserves
+ * nothing extra.
  */
-function reserveElementAddresses(store: NetworkStore, composition: CompositionData): void {
-  if (composition.elements.length <= 1) return;
+function recordProvisionedNode(
+  store: NetworkStore,
+  nodeAddress: number,
+  deviceKey: Buffer,
+  composition: CompositionData,
+): void {
+  const extraElements = Math.max(composition.elements.length - 1, 0);
   const fresh = store.getState();
-  store.setState({ ...fresh, nextUnicastAddress: fresh.nextUnicastAddress + (composition.elements.length - 1) });
+  store.setState({
+    ...fresh,
+    nextUnicastAddress: fresh.nextUnicastAddress + extraElements,
+    nodes: [...fresh.nodes, { address: nodeAddress, deviceKey, composition, incomplete: true }],
+  });
 }
 
-/** The ONE place this module writes a node entry. Does NOT touch
- *  `nextUnicastAddress` (see `reserveElementAddresses` above, which the
- *  caller runs separately and unconditionally once composition is known). */
+/** Removes the entry `recordProvisionedNode` wrote, for the one failure
+ *  path on which the node demonstrably stopped being ours (its Config Node
+ *  Reset was answered — see the module header). Never touches
+ *  `nextUnicastAddress`: the address that node consumed stays consumed,
+ *  per `store.ts`'s own never-reclaim rule. */
+function forgetProvisionedNode(store: NetworkStore, nodeAddress: number): void {
+  const fresh = store.getState();
+  store.setState({ ...fresh, nodes: fresh.nodes.filter((node) => node.address !== nodeAddress) });
+}
+
+/**
+ * Completes the node entry `recordProvisionedNode` already wrote: the same
+ * address and device key, now with the probe result and WITHOUT
+ * `incomplete`. Replaces that entry in place rather than appending, so one
+ * bulb can never end up as two rows. The replacement is built from scratch
+ * rather than spread over the old entry, which is what guarantees
+ * `incomplete` is actually gone rather than merely overwritten by a field
+ * someone later forgets to clear.
+ *
+ * Does NOT touch `nextUnicastAddress` (`recordProvisionedNode` already
+ * advanced it once, unconditionally). Appends if the entry is somehow
+ * missing — unreachable, since the exchange cannot reach here without
+ * having recorded one, but an append is the safe answer to an invariant
+ * that has been broken rather than a silently lost pairing.
+ */
 function finishPairing(
   store: NetworkStore,
   peripheralId: string,
@@ -1498,10 +1620,12 @@ function finishPairing(
   // The probe is stored ALONGSIDE the composition, not instead of it: the
   // declaration is still what says which models exist to probe at all, and
   // a later version of this app may measure differently. Both are kept.
-  store.setState({
-    ...fresh,
-    nodes: [...fresh.nodes, { address: nodeAddress, deviceKey, composition, probe }],
-  });
+  const completed = { address: nodeAddress, deviceKey, composition, probe };
+  const index = fresh.nodes.findIndex((node) => node.address === nodeAddress);
+  const nodes = [...fresh.nodes];
+  if (index === -1) nodes.push(completed);
+  else nodes[index] = completed;
+  store.setState({ ...fresh, nodes });
 
   // MEASUREMENT FIRST, DECLARATION WHERE THERE IS NONE - see
   // `capabilities.ts#mapCompositionToCapabilities`. This is the one line

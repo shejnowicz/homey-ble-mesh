@@ -101,6 +101,38 @@
       // PAUSES THE SHARED CONNECTION" note), and a view that fanned out
       // would quietly undo that.
       //
+      // THE RUN OUTLIVES THE CALL THAT STARTED IT (hardware round,
+      // 2026-10-08 — the defect this whole section exists to fix). A Homey
+      // pairing-session RPC gives up after 30 seconds. Three bulbs take
+      // longer than that, so `Homey.emit('pair_nodes', …)` rejected with
+      // "Timeout after 30000ms" while the driver carried on and paired two
+      // more bulbs perfectly well. The batch result — the only thing that
+      // carried the descriptors `Homey.createDevice` needs — was then
+      // handed back to a caller that no longer existed, and TWO PROVISIONED
+      // BULBS NEVER BECAME HOMEY DEVICES. (Their rows still turned green,
+      // because `pair_progress` arrives as its own event and kept coming.)
+      //
+      // So: EVERY DEVICE IS CREATED THE MOMENT ITS OWN BULB FINISHES, from
+      // the 'done' progress event, which already carries the whole
+      // `PairedDeviceDescriptor`. `createDeviceOnce` below is the ONE place
+      // in this page that ever calls `Homey.createDevice`, and it is
+      // idempotent per peripheral id — so the batch result, if it does
+      // arrive, can safely act as a BACKSTOP for a progress event that went
+      // missing without any risk of adding a bulb twice. Losing the batch
+      // call now costs at most the closing summary; it can no longer cost a
+      // provisioned bulb.
+      //
+      // AND THE RUN'S END IS WHAT THE RUN SAYS IT IS, not what the call
+      // says. The page stays locked (so a second run cannot start a second
+      // GATT session alongside the first) and keeps listening until either
+      // every bulb has reported 'done', or the driver has gone silent for
+      // RUN_SILENCE_TIMEOUT_MS, or the batch call itself failed before the
+      // run ever began. Only then is a closing status written — which is
+      // the other half of the same defect: the old code wrote "Select the
+      // bulbs to pair" at the 30-second mark and then watched the still-
+      // arriving progress events overwrite it, leaving a finished run
+      // claiming "Pairing dc2351a64076 (3/3)…" forever.
+      //
       // A PARTIAL RESULT IS A SUCCESS: if three of five bulbs paired, those
       // three are created and the run ends with a summary naming the two
       // that did not and why. The failures stay on screen, still selected,
@@ -112,11 +144,29 @@
       const pairButton = document.getElementById('pair');
       const selectAllButton = document.getElementById('select-all');
 
+      // How long a run that has already outlived its own batch call may go
+      // without reporting ANY progress before this page stops waiting for
+      // it. Not a protocol value: pairing one bulb is bounded by the
+      // driver's own 30-second-per-step timeout and several steps can stall
+      // in a row, so this is set well past the longest plausible single-bulb
+      // stall. It exists only so that a driver which has genuinely gone away
+      // (an app crash mid-run) cannot leave this page locked for ever.
+      const RUN_SILENCE_TIMEOUT_MS = 180000;
+
       let pairing = false;
       let candidates = [];
       const selected = new Set();
       /** peripheralId -> short text shown on its own row during/after a run. */
       const rowState = new Map();
+      /** The run currently in progress, or null between runs. Progress
+       *  events that arrive outside a run are ignored rather than allowed to
+       *  rewrite a finished run's own status line. */
+      let run = null;
+
+      function errorText(err) {
+        if (!err) return 'unknown error';
+        return err.message ? err.message : String(err);
+      }
 
       function describeOutcome(outcome) {
         if (!outcome) return { text: 'No result', ok: false };
@@ -190,82 +240,263 @@
 
       pairButton.addEventListener('click', () => {
         pairSelected().catch((err) => {
-          errorEl.textContent = `Pairing failed: ${err && err.message ? err.message : err}`;
+          errorEl.textContent = `Pairing failed: ${errorText(err)}`;
         });
       });
 
+      // ---------------------------------------------------------------------
+      // One run's own bookkeeping.
+      // ---------------------------------------------------------------------
+
+      function startRun(requested) {
+        const activeRun = {
+          /** How many bulbs this page asked for — the fallback count for the
+           *  summary when not a single progress event ever arrived. */
+          requested: requested,
+          /** How many the DRIVER says there are; 0 until it first says so. */
+          total: 0,
+          /** Whether any progress at all has been seen: the difference
+           *  between "the call failed before anything started" and "the call
+           *  gave up on a run that is still going". */
+          started: false,
+          done: 0,
+          finished: false,
+          /** Set the instant the closing status is written. Nothing may
+           *  touch the screen on this run's behalf afterwards — including a
+           *  batch reply that finally turns up, which is precisely the kind
+           *  of late arrival that left the old page contradicting itself. */
+          concluded: false,
+          lostContact: false,
+          created: [],
+          /** Peripheral ids this run has CLAIMED for creation. Claimed, not
+           *  created: an id is added before `Homey.createDevice` is even
+           *  called, which is what makes the guard hold against a second
+           *  caller arriving while the first is still in flight. */
+          claimed: new Set(),
+          /** Serialises the creations so they cannot interleave, and gives
+           *  the end of the run something to await. */
+          creating: Promise.resolve(),
+          silenceTimer: null,
+          resolveFinished: null,
+        };
+        activeRun.waitForFinish = new Promise((resolve) => {
+          activeRun.resolveFinished = resolve;
+        });
+        return activeRun;
+      }
+
+      function clearSilenceWatchdog(activeRun) {
+        if (activeRun.silenceTimer === null) return;
+        clearTimeout(activeRun.silenceTimer);
+        activeRun.silenceTimer = null;
+      }
+
+      function armSilenceWatchdog(activeRun) {
+        if (activeRun.finished) return;
+        clearSilenceWatchdog(activeRun);
+        activeRun.silenceTimer = setTimeout(() => {
+          activeRun.silenceTimer = null;
+          activeRun.lostContact = true;
+          markRunFinished(activeRun);
+        }, RUN_SILENCE_TIMEOUT_MS);
+      }
+
+      function markRunFinished(activeRun) {
+        if (activeRun.finished) return;
+        activeRun.finished = true;
+        clearSilenceWatchdog(activeRun);
+        activeRun.resolveFinished();
+      }
+
+      /** THE ONE PLACE THIS PAGE CALLS `Homey.createDevice`, and it runs at
+       *  most once per peripheral id per run — see this script's own header
+       *  for why both halves of that sentence matter. */
+      function createDeviceOnce(activeRun, peripheralId, device) {
+        if (!device) return;
+        if (activeRun.claimed.has(peripheralId)) return;
+        activeRun.claimed.add(peripheralId);
+        activeRun.creating = activeRun.creating.then(() =>
+          Homey.createDevice(device).then(
+            () => {
+              activeRun.created.push(device.name);
+              // A bulb that is now a Homey device must not stay selected for
+              // the retry the failures are left selected for.
+              selected.delete(peripheralId);
+              rowState.set(peripheralId, { text: 'Paired and added', ok: true });
+              render();
+            },
+            (err) => {
+              rowState.set(peripheralId, {
+                text: `Paired, but could not be added to Homey: ${errorText(err)}`,
+                ok: false,
+              });
+              render();
+            },
+          ),
+        );
+      }
+
       // Progress as it goes — emitted by the driver before and after each
-      // bulb, so a run of five does not look like a frozen screen.
+      // bulb. This is also where devices are created: see the header.
       Homey.on('pair_progress', (progress) => {
-        if (!progress) return;
-        const position = `${progress.index + 1}/${progress.total}`;
+        if (!progress || !run) return;
+        const activeRun = run;
+        activeRun.started = true;
+        activeRun.total = progress.total;
+        armSilenceWatchdog(activeRun);
+
         if (progress.phase === 'start') {
-          rowState.set(progress.peripheralId, { text: 'Pairing…', ok: true });
-          statusEl.textContent = `Pairing ${progress.peripheralId} (${position})…`;
-        } else {
-          rowState.set(progress.peripheralId, describeOutcome(progress.outcome));
+          rowState.set(progress.peripheralId, { text: 'Pairing…', ok: true, pending: true });
+          statusEl.textContent = `Pairing ${progress.peripheralId} (${progress.index + 1}/${progress.total})…`;
+          render();
+          return;
+        }
+
+        rowState.set(progress.peripheralId, describeOutcome(progress.outcome));
+        activeRun.done += 1;
+        if (progress.outcome && progress.outcome.kind === 'paired') {
+          createDeviceOnce(activeRun, progress.peripheralId, progress.outcome.device);
+        }
+        if (activeRun.done >= activeRun.total) {
+          statusEl.textContent = 'Adding the paired bulbs to Homey…';
+          markRunFinished(activeRun);
         }
         render();
       });
 
+      async function concludeRun(activeRun, batchError) {
+        const attempted = activeRun.total > 0 ? activeRun.total : activeRun.requested;
+
+        // A row still saying "Pairing…" belongs to a bulb whose result never
+        // arrived. Saying so is the whole point: a finished run must never
+        // leave anything on screen claiming to be in progress.
+        for (const [peripheralId, state] of rowState) {
+          if (state.pending) rowState.set(peripheralId, { text: 'No result — the run stopped reporting', ok: false });
+        }
+
+        const failures = [];
+        for (const [peripheralId, state] of rowState) {
+          if (!state.ok) failures.push(`${peripheralId}: ${state.text}`);
+        }
+
+        const notes = [];
+        if (batchError && activeRun.started) {
+          notes.push(
+            `Homey stopped waiting for the pairing call (${errorText(batchError)}), but the run itself carried on — the results above are its own.`,
+          );
+        }
+        if (activeRun.lostContact) {
+          notes.push('The pairing run stopped reporting progress. Scan again to see which bulbs are still unpaired.');
+        }
+
+        summaryEl.textContent = [
+          activeRun.created.length > 0
+            ? `Added ${activeRun.created.length} of ${attempted} to Homey: ${activeRun.created.join(', ')}`
+            : '',
+          failures.length > 0 ? `Not paired:\n${failures.map((f) => `  • ${f}`).join('\n')}` : '',
+          notes.join('\n'),
+        ]
+          .filter(Boolean)
+          .join('\n');
+
+        if (!activeRun.started && batchError) {
+          // The run never began: this really is a plain call failure, and
+          // the only honest thing on screen is the error itself.
+          errorEl.textContent = `Pairing failed: ${errorText(batchError)}`;
+          statusEl.textContent = 'Select the bulbs to pair';
+          return;
+        }
+
+        if (failures.length === 0 && attempted > 0 && activeRun.created.length === attempted) {
+          statusEl.textContent = 'Done';
+          await Homey.done();
+          return;
+        }
+        // Something did not work: stay on the page so the user can see
+        // what, and retry the ones still selected.
+        statusEl.textContent = activeRun.created.length > 0 ? 'Finished with some failures' : 'Nothing was paired';
+      }
+
+      /** The driver's own closing record of the run. Used for the summary,
+       *  and as a BACKSTOP for creations whose progress event went missing —
+       *  safe because `createDeviceOnce` claims each peripheral id once. */
+      function applyBatchResult(activeRun, batchResult) {
+        const entries = (batchResult && batchResult.entries) || [];
+        for (const entry of entries) {
+          if (entry.outcome && entry.outcome.kind === 'paired') {
+            createDeviceOnce(activeRun, entry.peripheralId, entry.outcome.device);
+          } else {
+            rowState.set(entry.peripheralId, describeOutcome(entry.outcome));
+          }
+        }
+        if (activeRun.total === 0) activeRun.total = entries.length;
+      }
+
       async function pairSelected() {
         if (pairing || selected.size === 0) return;
+        const peripheralIds = candidates.map((c) => c.peripheralId).filter((id) => selected.has(id));
         pairing = true;
         errorEl.textContent = '';
         summaryEl.textContent = '';
         rowState.clear();
+        const activeRun = startRun(peripheralIds.length);
+        run = activeRun;
         statusEl.textContent = 'Pairing…';
         render();
 
-        try {
-          const peripheralIds = candidates.map((c) => c.peripheralId).filter((id) => selected.has(id));
-          const result = await Homey.emit('pair_nodes', { peripheralIds });
-          const entries = (result && result.entries) || [];
-          const paired = (result && result.paired) || [];
-
-          for (const entry of entries) rowState.set(entry.peripheralId, describeOutcome(entry.outcome));
-
-          // Devices are created only once every bulb has been attempted, so
-          // a creation failure cannot interrupt a run that is still going.
-          const created = [];
-          const failures = entries
-            .filter((entry) => entry.outcome && entry.outcome.kind !== 'paired')
-            .map((entry) => `${entry.peripheralId}: ${describeOutcome(entry.outcome).text}`);
-          for (const device of paired) {
-            try {
-              await Homey.createDevice(device);
-              created.push(device.name);
-              selected.delete(device.store && device.store.peripheralId);
-            } catch (err) {
-              failures.push(`${device.name}: could not be added to Homey (${err && err.message ? err.message : err})`);
+        // THE RUN IS WAITED ON, NOT THE CALL. Whichever of the two ends
+        // first ends the run: the batch reply if it arrives, the last
+        // 'done' progress event if it does not, the silence watchdog if
+        // neither ever does. Awaiting the CALL instead — which is what this
+        // used to do — is the whole defect: its 30-second deadline is
+        // shorter than a three-bulb run.
+        let batchError = null;
+        Homey.emit('pair_nodes', { peripheralIds }).then(
+          (batchResult) => {
+            if (activeRun.concluded) return;
+            applyBatchResult(activeRun, batchResult);
+            markRunFinished(activeRun);
+          },
+          (err) => {
+            if (activeRun.concluded) return;
+            batchError = err;
+            if (!activeRun.started) {
+              // The call failed before a single bulb was attempted — there
+              // is no run in flight to keep waiting for.
+              markRunFinished(activeRun);
+              return;
             }
-          }
+            // Homey's pairing-RPC deadline, almost certainly. The driver is
+            // still pairing and its progress events are still arriving; keep
+            // listening, and keep the page locked so nothing starts a second
+            // GATT session beside it.
+            summaryEl.textContent =
+              'Homey stopped waiting for the pairing call, but the bulbs are still being paired — this page is following along.';
+            armSilenceWatchdog(activeRun);
+            render();
+          },
+        );
 
-          summaryEl.textContent = [
-            created.length > 0 ? `Paired ${created.length} of ${entries.length}: ${created.join(', ')}` : '',
-            failures.length > 0 ? `Not paired:\n${failures.map((f) => `  • ${f}`).join('\n')}` : '',
-          ]
-            .filter(Boolean)
-            .join('\n');
-
-          if (failures.length === 0 && created.length > 0) {
-            statusEl.textContent = 'Done';
-            await Homey.done();
-            return;
-          }
-          // Something did not work: stay on the page so the user can see
-          // what, and retry the ones still selected.
-          statusEl.textContent = created.length > 0 ? 'Finished with some failures' : 'Nothing was paired';
-        } catch (err) {
-          errorEl.textContent = `Pairing failed: ${err && err.message ? err.message : err}`;
-          statusEl.textContent = 'Select the bulbs to pair';
+        try {
+          await activeRun.waitForFinish;
+          // From here on this run owns the screen: neither a late progress
+          // event nor a late batch reply may reopen a status line that is
+          // about to be closed.
+          activeRun.concluded = true;
+          run = null;
+          clearSilenceWatchdog(activeRun);
+          await activeRun.creating;
+          await concludeRun(activeRun, batchError);
         } finally {
+          activeRun.concluded = true;
+          run = null;
           pairing = false;
           render();
         }
       }
 
       async function scan() {
+        if (pairing) return;
         statusEl.textContent = 'Scanning…';
         errorEl.textContent = '';
         try {
@@ -277,7 +508,7 @@
           render();
           statusEl.textContent = candidates.length > 0 ? 'Select the bulbs to pair' : 'No unpaired bulbs found nearby';
         } catch (err) {
-          errorEl.textContent = `Scan failed: ${err && err.message ? err.message : err}`;
+          errorEl.textContent = `Scan failed: ${errorText(err)}`;
           statusEl.textContent = '';
         }
       }
@@ -285,6 +516,7 @@
       Homey.on('list_devices_refresh', scan);
       Homey.ready();
       scan();
-    </script>
+
+</script>
   </body>
 </html>

@@ -17,6 +17,7 @@
     "drivers/light/__tests__/pairing.test.ts",
     "drivers/light/meshLight.ts",
     "drivers/light/__tests__/meshLight.test.ts",
-    "drivers/light/__tests__/device-wiring.test.ts"
+    "drivers/light/__tests__/device-wiring.test.ts",
+    "drivers/light/__tests__/pairView.test.ts"
   ]
 }

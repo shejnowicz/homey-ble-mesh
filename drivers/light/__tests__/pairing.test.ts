@@ -273,6 +273,12 @@ interface ConfigResponderOptions {
    *  Default 0x00 (Success); overridden to test the
    *  node-refuses-Model-App-Bind path. */
   readonly modelAppStatus?: number;
+  /** When true, a Config Model App Bind gets NO reply at all — the
+   *  owner's own hardware failure of 2026-10-08 ("node did not answer
+   *  Config Model App Bind"), which `modelAppStatus` cannot model: a
+   *  REFUSAL is an answer, and the bulb that was lost never answered at
+   *  all. Default false (answers with `modelAppStatus`). */
+  readonly silentModelAppBind?: boolean;
   /** When true, a Config Node Reset request gets NO reply at all (modelling
    *  a node that is unreachable for the reset too) — default false
    *  (replies with Node Reset Status and returns to the unowned state). */
@@ -491,6 +497,7 @@ function installConfigResponder(
     if (result.message.opcode === 0x803d) {
       // Config Model App Bind (Generic OnOff Server, element 0) -> Config
       // Model App Status.
+      if (options.silentModelAppBind) return undefined; // the owner's own lost bulb
       const status = options.modelAppStatus ?? 0x00;
       const elementAddressLe = Buffer.alloc(2);
       elementAddressLe.writeUInt16LE(nodeAddress, 0);
@@ -1063,7 +1070,19 @@ describe('the node refuses a configuration request', () => {
     expect(outcome.message).toContain('attempted to reset the node');
     expect(outcome.message).toContain('that also failed');
     expect(outcome.message).toContain('manual factory reset');
-    expect(store.getState().nodes).toHaveLength(0);
+    // DEFECT B (hardware round, 2026-10-08). The reset failed too, so this
+    // bulb is provisioned, holds our network key, has left the Mesh
+    // Provisioning Service for the Proxy Service — and a later scan can
+    // therefore never find it again. The ONE thing that keeps it
+    // recoverable rather than scrap is its own store entry: the address it
+    // took and the device key it answers to, recorded before the first bind
+    // precisely for this moment. It must NOT look like a finished node.
+    const stranded = store.getState().nodes;
+    expect(stranded).toHaveLength(1);
+    expect(stranded[0]?.address).toBe(2);
+    expect(stranded[0]?.deviceKey).toEqual(KAT_DEVICE_KEY);
+    expect(stranded[0]?.incomplete).toBe(true);
+    expect(stranded[0]?.probe).toBeUndefined();
   });
 
   test('when the reset is answered with the WRONG status message type, that is reported as a failure too, never treated as a successful reset', async () => {
@@ -1080,7 +1099,19 @@ describe('the node refuses a configuration request', () => {
     expect(outcome.message).toContain('that also failed');
     expect(outcome.message).toContain('node did not answer Config Node Reset with a Node Reset Status message');
     expect(outcome.message).toContain('manual factory reset');
-    expect(store.getState().nodes).toHaveLength(0);
+    // DEFECT B (hardware round, 2026-10-08). The reset failed too, so this
+    // bulb is provisioned, holds our network key, has left the Mesh
+    // Provisioning Service for the Proxy Service — and a later scan can
+    // therefore never find it again. The ONE thing that keeps it
+    // recoverable rather than scrap is its own store entry: the address it
+    // took and the device key it answers to, recorded before the first bind
+    // precisely for this moment. It must NOT look like a finished node.
+    const stranded = store.getState().nodes;
+    expect(stranded).toHaveLength(1);
+    expect(stranded[0]?.address).toBe(2);
+    expect(stranded[0]?.deviceKey).toEqual(KAT_DEVICE_KEY);
+    expect(stranded[0]?.incomplete).toBe(true);
+    expect(stranded[0]?.probe).toBeUndefined();
     // THE DISCRIMINATING ASSERTION: a silent-node reset failure
     // (the test above) and a wrong-reply-type reset failure both produce
     // "that also failed", so wording alone cannot tell them apart from a
@@ -1092,6 +1123,184 @@ describe('the node refuses a configuration request', () => {
     // would make this fail while the message assertions above would not.
     const candidates = await scanForUnprovisionedNodes(bluetooth);
     expect(candidates.map((c) => c.peripheralId)).not.toContain('reset-wrong-reply');
+  });
+});
+
+
+// ===========================================================================
+// DEFECT B (hardware round, 2026-10-08): a configuration failure after
+// successful provisioning must not STRAND the bulb.
+//
+// What happened: three bulbs in one run, and `dc2351a643d7` never answered
+// its Config Model App Bind. Node entries were written only on complete
+// success, so the app kept nothing — not the unicast address, not the
+// device key. The bulb, meanwhile, had accepted our network key and moved
+// from the Mesh Provisioning Service to the Mesh Proxy Service, so no later
+// scan could find it and no message could reach it: recoverable only by a
+// physical factory reset. The entry is now written the moment the node is
+// ours (`pairing.ts#recordProvisionedNode`), carrying
+// `store.ts#NodeEntry.incomplete` so nothing mistakes it for a finished
+// pairing, and the outcome the user sees is still a failure with no Homey
+// device created.
+// ===========================================================================
+
+describe('a configuration failure after provisioning succeeded', () => {
+  test('THE HARDWARE CASE: a bulb that never answers Config Model App Bind, and never answers the reset either, is left RECORDED rather than stranded', async () => {
+    const { bluetooth, store, clock, deps } = setUp();
+    addUnprovisionedNode(bluetooth, 'dc2351a643d7', -58);
+    installSuccessfulNodeBehaviour(bluetooth, 'dc2351a643d7', 1, 2, { silentModelAppBind: true, failReset: true });
+
+    const outcomePromise = pairNode(deps, 'dc2351a643d7');
+    let settled = false;
+    void outcomePromise.then(
+      () => {
+        settled = true;
+      },
+      () => {
+        settled = true;
+      },
+    );
+    // Two stalls in a row — the bind's own reply wait, then the Node Reset
+    // wait that `failWithReset` starts — so advance once per pending timer
+    // rather than assuming a fixed number (the same loop the silent-node
+    // tests above use, and for the same reason).
+    for (let i = 0; i < 5 && !settled; i++) {
+      await waitUntil(() => clock.pendingCount() >= 1 || settled);
+      if (settled) break;
+      await clock.advance(DEFAULT_PAIRING_STEP_TIMEOUT_MS);
+    }
+    const outcome = await outcomePromise;
+
+    // The user's outcome is unchanged, and must stay unchanged:
+    // configuration genuinely did not complete.
+    expect(outcome.kind).toBe('failed');
+    if (outcome.kind !== 'failed') return;
+    expect(outcome.message).toContain('manual factory reset');
+
+    // THE DISCRIMINATING ASSERTION, and the whole point of the fix: the
+    // bulb is still reachable in principle, because this app kept the two
+    // things it takes to reach it.
+    const nodes = store.getState().nodes;
+    expect(nodes).toHaveLength(1);
+    expect(nodes[0]?.address).toBe(2);
+    expect(nodes[0]?.deviceKey).toEqual(KAT_DEVICE_KEY);
+    // ...and it is honestly marked as what it is, so nothing downstream
+    // treats it as a node paired before the probe existed.
+    expect(nodes[0]?.incomplete).toBe(true);
+    expect(nodes[0]?.probe).toBeUndefined();
+    // The scan can no longer see it (it left the Provisioning Service when
+    // it was provisioned), which is exactly why the entry has to exist.
+    const candidates = await scanForUnprovisionedNodes(bluetooth);
+    expect(candidates.map((c) => c.peripheralId)).not.toContain('dc2351a643d7');
+  });
+
+  test('THE ENTRY IS WRITTEN BEFORE THE APPLICATION KEY, not merely before the binds — a node that refuses AppKey Add is recorded too', async () => {
+    const { bluetooth, store, deps } = setUp();
+    addUnprovisionedNode(bluetooth, 'refuses-appkey-no-reset', -50);
+    // Refused AppKey Add, and a reset that is answered with the WRONG
+    // message type — so the node never returns to the unowned state and the
+    // entry must survive. Written this way rather than with `failReset` so
+    // the test needs no clock advancing at all.
+    installSuccessfulNodeBehaviour(bluetooth, 'refuses-appkey-no-reset', 1, 2, {
+      appKeyStatus: 0x05,
+      nodeResetWrongReply: true,
+    });
+
+    const outcome = await pairNode(deps, 'refuses-appkey-no-reset');
+
+    expect(outcome.kind).toBe('failed');
+    const nodes = store.getState().nodes;
+    expect(nodes).toHaveLength(1);
+    expect(nodes[0]?.address).toBe(2);
+    expect(nodes[0]?.deviceKey).toEqual(KAT_DEVICE_KEY);
+    expect(nodes[0]?.incomplete).toBe(true);
+    // The composition the node DID report is kept with it: it is what a
+    // later retry or a reset needs in order to know what it is talking to.
+    expect(nodes[0]?.composition.elements).toHaveLength(1);
+  });
+
+  test('A NODE WHOSE RESET WAS ANSWERED IS FORGOTTEN AGAIN — the store never claims a node the user has just been told is unowned', async () => {
+    const { bluetooth, store, deps } = setUp();
+    addUnprovisionedNode(bluetooth, 'refuses-and-resets', -50);
+    installSuccessfulNodeBehaviour(bluetooth, 'refuses-and-resets', 1, 2, { modelAppStatus: 0x0d });
+
+    const outcome = await pairNode(deps, 'refuses-and-resets');
+
+    expect(outcome.kind).toBe('failed');
+    if (outcome.kind !== 'failed') return;
+    expect(outcome.message).toContain('the node has been reset and can be paired again');
+    // THE DISCRIMINATING ASSERTION: the message and the store agree. The
+    // node answered its reset, so it is genuinely unowned again — provably,
+    // since it is scannable — and keeping an entry for it would make this
+    // app claim a bulb it does not have.
+    expect(store.getState().nodes).toHaveLength(0);
+    const candidates = await scanForUnprovisionedNodes(bluetooth);
+    expect(candidates.map((c) => c.peripheralId)).toContain('refuses-and-resets');
+    // The address it burned is still gone, per store.ts's never-reclaim
+    // rule — forgetting the node must not rewind the allocator.
+    expect(store.getState().nextUnicastAddress).toBe(3);
+  });
+
+  test('NOTHING IS RECORDED BEFORE THE COMPOSITION IS KNOWN: a node whose composition does not parse leaves no entry', async () => {
+    const { bluetooth, store, deps } = setUp();
+    addUnprovisionedNode(bluetooth, 'bad-composition-no-reset', -50);
+    installSuccessfulNodeBehaviour(bluetooth, 'bad-composition-no-reset', 1, 2, {
+      compositionAccessPayload: Buffer.from([0x02, 0x00, 0xaa, 0xbb]),
+      nodeResetWrongReply: true, // so a kept entry would survive and be visible here
+    });
+
+    const outcome = await pairNode(deps, 'bad-composition-no-reset');
+
+    expect(outcome.kind).toBe('failed');
+    // An entry needs an element count to be worth anything (and a composition
+    // to store at all), and this node never gave one. Disclosed as a residual
+    // gap rather than papered over with an invented composition.
+    expect(store.getState().nodes).toHaveLength(0);
+  });
+
+  test('A SUCCESSFUL PAIRING LEAVES ONE ROW, NOT TWO: the provisional entry is replaced, flag gone, probe present', async () => {
+    const { bluetooth, store, deps } = setUp();
+    addUnprovisionedNode(bluetooth, 'bulb-1', -55);
+    installSuccessfulNodeBehaviour(bluetooth, 'bulb-1', 1, 2);
+
+    const outcome = await pairNode(deps, 'bulb-1');
+
+    expect(outcome.kind).toBe('paired');
+    const nodes = store.getState().nodes;
+    // THE DISCRIMINATING ASSERTION: an implementation that APPENDED the
+    // finished entry beside the provisional one would leave two rows for
+    // one bulb here, while every other assertion in this file (which looks
+    // at `nodes[0]`) would still pass.
+    expect(nodes).toHaveLength(1);
+    expect(nodes[0]?.address).toBe(2);
+    expect(nodes[0]?.incomplete).toBeUndefined();
+    expect(nodes[0]?.probe).toBeDefined();
+  });
+
+  test('ONE FAILURE AMONG SEVERAL: a multi-bulb run records the stranded bulb and still creates devices only for the others', async () => {
+    const { bluetooth, store, deps } = setUp([
+      TEST_NET_KEY,
+      TEST_APP_KEY,
+      KAT_RANDOM_PROVISIONER,
+      KAT_RANDOM_PROVISIONER,
+      KAT_RANDOM_PROVISIONER,
+    ]);
+    addUnprovisionedNode(bluetooth, 'good-1', -50);
+    addUnprovisionedNode(bluetooth, 'stranded', -51);
+    addUnprovisionedNode(bluetooth, 'good-2', -52);
+    installSuccessfulNodeBehaviour(bluetooth, 'good-1', 1, 2);
+    installSuccessfulNodeBehaviour(bluetooth, 'stranded', 1, 3, { modelAppStatus: 0x0d, nodeResetWrongReply: true });
+    installSuccessfulNodeBehaviour(bluetooth, 'good-2', 1, 4);
+
+    const result = await pairNodes(deps, ['good-1', 'stranded', 'good-2']);
+
+    expect(result.entries.map((e) => e.outcome.kind)).toEqual(['paired', 'failed', 'paired']);
+    // Only the two that finished are offered to Homey as devices...
+    expect(result.paired.map((d) => d.data.id)).toEqual(['2', '4']);
+    // ...but all three are recorded, and only the middle one is flagged.
+    const nodes = store.getState().nodes;
+    expect(nodes.map((n) => n.address)).toEqual([2, 3, 4]);
+    expect(nodes.map((n) => n.incomplete)).toEqual([undefined, true, undefined]);
   });
 });
 
