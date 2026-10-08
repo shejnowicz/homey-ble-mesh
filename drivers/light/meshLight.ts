@@ -1022,7 +1022,18 @@ export class MeshLightController {
     if (this.backfillAttempted) return;
     this.backfillAttempted = true;
     const node = this.store.getState().nodes.find((n) => n.address === this.address);
-    if (node === undefined || node.probe !== undefined) return;
+    // `incomplete` is checked alongside "already measured" because the two
+    // are the same question asked twice: is there anything here worth
+    // measuring? A node whose configuration never completed
+    // (`store.ts#NodeEntry.incomplete`) has no application key bound to its
+    // models, so every probe message would go unanswered and the
+    // measurement would record "this bulb runs nothing" — a confident,
+    // wrong verdict that would then outlive the pairing failure that caused
+    // it. DEFENCE IN DEPTH, not a reachable path today: `pairing.ts` creates
+    // no Homey device for such a node, so no controller is ever constructed
+    // over one; this is here so that stays true by construction rather than
+    // by the two files agreeing about it.
+    if (node === undefined || node.probe !== undefined || node.incomplete === true) return;
     const composition = node.composition;
 
     await this.probeRunner.run(async () => {

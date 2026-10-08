@@ -653,3 +653,111 @@ describe('NodeEntry.probe persistence', () => {
     expect(reloaded?.temperatureRange).toEqual({ minKelvin: 3000, maxKelvin: 6000 });
   });
 });
+
+// ===========================================================================
+// THE INCOMPLETE FLAG, persisted beside the composition and the probe
+// (hardware round, 2026-10-08). `drivers/light/pairing.ts` now writes a node
+// entry the moment provisioning succeeds, BEFORE the application key is
+// added and before a single Config Model App Bind, so a configuration
+// failure leaves the device key behind instead of a bulb nobody can reach.
+// That entry has no probe — which is also what a node paired before the
+// probe existed looks like — so the two must stay distinguishable across a
+// restart, in both directions. A reader that lost the flag would treat a
+// half-configured node as a perfectly good pre-probe one; a reader that
+// rejected a legacy entry for lacking it would brick every node paired
+// before this version.
+// ===========================================================================
+
+describe('NodeEntry.incomplete persistence', () => {
+  test('BOTH SHAPES ROUND-TRIP: an entry with a probe and no flag, and one with the flag and no probe', () => {
+    const settings = new FakeSettingsPort();
+    const state: NetworkState = {
+      ...sampleNetworkState(),
+      nodes: [
+        { ...sampleNode(2), probe: SAMPLE_PROBE },
+        { ...sampleNode(3), incomplete: true },
+      ],
+    };
+
+    new NetworkStore(settings).setState(state);
+
+    const reloaded = new NetworkStore(settings).getState();
+    expect(reloaded).toEqual(state);
+    // Spelled out field by field as well as compared whole, because
+    // `toEqual` treats an absent key and an `undefined` one as the same
+    // thing — and the WHOLE point of this field is telling two
+    // probe-less entries apart.
+    expect(reloaded.nodes[0]?.incomplete).toBeUndefined();
+    expect(reloaded.nodes[0]?.probe).toEqual(SAMPLE_PROBE);
+    expect(reloaded.nodes[1]?.incomplete).toBe(true);
+    expect(reloaded.nodes[1]?.probe).toBeUndefined();
+    expect(reloaded.nodes[1]?.deviceKey).toEqual(state.nodes[1]?.deviceKey);
+    expect(reloaded.nodes[1]?.composition).toEqual(state.nodes[1]?.composition);
+  });
+
+  test('a completed entry stores NO flag at all, so an older build of this app reads it exactly as it always did', () => {
+    const settings = new FakeSettingsPort();
+    new NetworkStore(settings).setState({ ...sampleNetworkState(), nodes: [sampleNode(2)] });
+
+    const stored = settings.get('network') as { nodes: Array<Record<string, unknown>> };
+    expect(stored.nodes[0]).not.toHaveProperty('incomplete');
+  });
+
+  test('THE MIGRATION: a node stored before this field existed reads back as COMPLETE, not as incomplete and not as a crash', () => {
+    const settings = new FakeSettingsPort();
+    new NetworkStore(settings).setState({ ...sampleNetworkState(), nodes: [{ ...sampleNode(2), probe: SAMPLE_PROBE }] });
+    const stored = settings.get('network') as { nodes: Array<Record<string, unknown>> };
+    expect(stored.nodes[0]).not.toHaveProperty('incomplete');
+
+    const reloaded = new NetworkStore(settings).getState();
+    expect(reloaded.nodes[0]?.incomplete).toBeUndefined();
+    expect(reloaded.nodes[0]?.probe).toEqual(SAMPLE_PROBE);
+  });
+
+  test('an explicit stored `false` reads back as an ABSENT flag, never as a node half-configured', () => {
+    const settings = new FakeSettingsPort();
+    new NetworkStore(settings).setState({ ...sampleNetworkState(), nodes: [{ ...sampleNode(2), incomplete: true }] });
+    const stored = settings.get('network') as { nodes: Array<Record<string, unknown>> };
+    stored.nodes[0]!.incomplete = false;
+    settings.set('network', stored);
+
+    const reloaded = new NetworkStore(settings).getState();
+    expect(reloaded.nodes[0]?.incomplete).toBeUndefined();
+    // ...and the rest of the entry is untouched by that reading.
+    expect(reloaded.nodes[0]?.address).toBe(2);
+  });
+
+  test('a stored flag that is neither of this module\'s own two shapes is corruption, like every other field', () => {
+    const settings = new FakeSettingsPort();
+    new NetworkStore(settings).setState({ ...sampleNetworkState(), nodes: [{ ...sampleNode(2), incomplete: true }] });
+    const stored = settings.get('network') as { nodes: Array<Record<string, unknown>> };
+    stored.nodes[0]!.incomplete = 'maybe';
+    settings.set('network', stored);
+
+    expect(new NetworkStore(settings).getState()).toEqual(EXPECTED_EMPTY_STATE);
+  });
+
+  test('the flag survives being written, read, completed and written again — the real pairing lifecycle', () => {
+    const settings = new FakeSettingsPort();
+    const store = new NetworkStore(settings);
+    store.setState({ ...sampleNetworkState(), nodes: [{ ...sampleNode(2), incomplete: true }] });
+
+    // What `pairing.ts#finishPairing` does once configuration completes:
+    // re-read, replace the entry in place, write.
+    const fresh = store.getState();
+    const node = fresh.nodes[0]!;
+    store.setState({
+      ...fresh,
+      nodes: [{ address: node.address, deviceKey: node.deviceKey, composition: node.composition, probe: SAMPLE_PROBE }],
+    });
+
+    const reloaded = new NetworkStore(settings).getState();
+    expect(reloaded.nodes).toHaveLength(1);
+    expect(reloaded.nodes[0]?.incomplete).toBeUndefined();
+    expect(reloaded.nodes[0]?.probe).toEqual(SAMPLE_PROBE);
+    // And the stored JSON really lost the key, rather than keeping a
+    // `false` an older reader would have to understand.
+    const stored = settings.get('network') as { nodes: Array<Record<string, unknown>> };
+    expect(stored.nodes[0]).not.toHaveProperty('incomplete');
+  });
+});

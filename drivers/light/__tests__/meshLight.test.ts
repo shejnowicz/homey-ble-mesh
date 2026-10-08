@@ -450,6 +450,11 @@ function setUp(
     /** What this node was measured to do at pairing time, as the store would
      *  hold it. Omitted = a node paired before the probe existed. */
     probe?: NodeProbeResult;
+    /** Marks the stored entry as one whose configuration never completed
+     *  (`store.ts#NodeEntry.incomplete`) — a state no Homey device should
+     *  ever be built over, which is exactly why a test needs to be able to
+     *  build one. */
+    incomplete?: true;
     /** This device's own resolved colour-temperature range — omitted means
      *  the documented fallback, exactly as a device with no setting and no
      *  reported range gets. */
@@ -496,7 +501,15 @@ function setUp(
     ivIndex: 0,
     ourUnicastAddress: OUR_ADDRESS,
     nextUnicastAddress: NODE_ADDRESS + 1,
-    nodes: [{ address: NODE_ADDRESS, deviceKey, composition, ...(options.probe === undefined ? {} : { probe: options.probe }) }],
+    nodes: [
+      {
+        address: NODE_ADDRESS,
+        deviceKey,
+        composition,
+        ...(options.probe === undefined ? {} : { probe: options.probe }),
+        ...(options.incomplete === undefined ? {} : { incomplete: options.incomplete }),
+      },
+    ],
   });
 
   const device = new FakeDevicePort(options.capabilities ?? ALL_CAPABILITIES);
@@ -1766,6 +1779,25 @@ describe('backfillProbe', () => {
     expect(h.bluetooth.writesReceived).toHaveLength(0);
     // ...and the stored measurement is left exactly as it was.
     expect(h.store.getState().nodes[0]?.probe?.models).toEqual({ genericOnOff: 'supported' });
+  });
+
+  test('a node whose CONFIGURATION never completed is not probed — not one message, and no measurement invented for it', async () => {
+    // `store.ts#NodeEntry.incomplete`: provisioned, recorded so its device
+    // key survives, but no application key bound to any of its models. Every
+    // probe message would therefore go unanswered, and recording that
+    // silence as a measurement would turn one failed pairing into a
+    // permanent "this bulb runs nothing" verdict.
+    const h = setUp({ declaredModels: DECLARES_EVERYTHING, responderOptions: ANSWERS_EVERYTHING, incomplete: true });
+    await connectManager(h.manager, h.clock);
+
+    await h.controller.backfillProbe();
+
+    expect(h.queueSends()).toBe(0);
+    expect(h.bluetooth.writesReceived).toHaveLength(0);
+    expect(h.store.getState().nodes[0]?.probe).toBeUndefined();
+    // ...and the flag itself is left exactly as it was, not cleared as a
+    // side effect of looking at it.
+    expect(h.store.getState().nodes[0]?.incomplete).toBe(true);
   });
 
   test('AT MOST ONCE PER APP RUN: a second call sends nothing, even though a measurement is now present', async () => {
