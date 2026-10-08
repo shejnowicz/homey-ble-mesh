@@ -286,11 +286,41 @@ interface ConfigResponderOptions {
   /** When true, a Config Node Reset request is answered with the WRONG
    *  status message type (an AppKey Status) instead of silence or a
    *  correct Node Reset Status — a node that is reachable but misbehaves,
-   *  as opposed to one that is merely unreachable (`failReset`). Exercises
-   *  `attemptNodeReset`'s `status.type !== 'nodeReset'` branch, which
-   *  silence alone cannot reach (that path throws/times out before ever
-   *  decoding a reply to check its type). */
+   *  as opposed to one that is merely unreachable (`failReset`). Since the
+   *  hardware round of 2026-10-08 this no longer settles the wait: a reply
+   *  that is not the status the request asked for is discarded and the
+   *  request waits out its own deadline (see `sendConfigRequest`), so a
+   *  test using this must advance the clock. Use `nodeResetMalformedReply`
+   *  instead where the point is only that the reset was not confirmed. */
   readonly nodeResetWrongReply?: boolean;
+  /** When true, a Config Node Reset request is answered with a Node Reset
+   *  Status carrying PARAMETERS, where Table 4.136 defines none — the right
+   *  message, malformed. It satisfies the opcode match and then fails to
+   *  decode, so the reset is reported as unconfirmed WITHOUT any waiting:
+   *  the no-clock-advancing way to leave a node recorded rather than
+   *  forgotten. */
+  readonly nodeResetMalformedReply?: boolean;
+  /**
+   * When true, every Config reply this node sends is preceded by an exact
+   * repeat of the PREVIOUS Config reply — the same bytes, the same sequence
+   * number, delivered again.
+   *
+   * THE HARDWARE ROUND OF 2026-10-08, in a fixture. Every notification was
+   * reaching the app more than once (leaked GATT subscriptions), so the
+   * duplicate of the previous request's reply arrived where the next
+   * request's reply was being waited for, and was consumed as it. A mesh
+   * node is also entitled to retransmit on its own account, so this is not
+   * only a model of this project's own bug.
+   */
+  readonly repeatPreviousReplyFirst?: boolean;
+  /**
+   * An Access message (Opcode||Parameters) this node sends, unprompted,
+   * immediately before every Config reply — a status nobody asked for,
+   * which a mesh model may publish at any time. Distinct from
+   * `repeatPreviousReplyFirst` in that it is never an answer to ANY request
+   * in this exchange.
+   */
+  readonly unsolicitedBeforeEachReply?: Buffer;
   /**
    * WHICH LIGHTING MODELS THIS FAKE NODE ACTUALLY RUNS, as opposed to which
    * ones its composition declares - the whole point of the capability probe
@@ -352,6 +382,11 @@ function installConfigResponder(
   // correct regardless of which step failed or how many writes preceded it
   // — and for free, correctly reassembles AppKey Add's two segments before
   // ever looking at its opcode.
+  /** The exact PDUs of the last Config reply this node sent — kept so
+   *  `repeatPreviousReplyFirst` can send THOSE BYTES again (same sequence
+   *  number and all), which is what a retransmission, and what a
+   *  twice-delivered notification, actually looks like. */
+  let previousConfigReply: Buffer[] | null = null;
   let driverRequestState: MeshReceiveState | undefined;
   const driverRequestContext: MeshReceiveContext = {
     key: KAT_DEVICE_KEY,
@@ -483,45 +518,66 @@ function installConfigResponder(
       return undefined; // mid-segmented-request (AppKey Add's first segment) — no reply yet
     }
 
-    if (result.message.opcode === 0x8008) {
-      // Config Composition Data Get -> Config Composition Data Status.
-      return sendAsNode(compositionAccessPayload);
-    }
-    if (result.message.opcode === 0x00) {
-      // Config AppKey Add -> Config AppKey Status. NetKeyIndex=AppKeyIndex=0
-      // (packed bytes are all-zero regardless of packing scheme when both
-      // indexes are zero).
-      const status = options.appKeyStatus ?? 0x00;
-      return sendAsNode(Buffer.from([0x80, 0x03, status, 0x00, 0x00, 0x00]));
-    }
-    if (result.message.opcode === 0x803d) {
-      // Config Model App Bind (Generic OnOff Server, element 0) -> Config
-      // Model App Status.
-      if (options.silentModelAppBind) return undefined; // the owner's own lost bulb
-      const status = options.modelAppStatus ?? 0x00;
-      const elementAddressLe = Buffer.alloc(2);
-      elementAddressLe.writeUInt16LE(nodeAddress, 0);
-      const modelIdLe = Buffer.alloc(2);
-      modelIdLe.writeUInt16LE(0x1000, 0);
-      return sendAsNode(Buffer.concat([Buffer.from([0x80, 0x3e, status]), elementAddressLe, Buffer.from([0x00, 0x00]), modelIdLe]));
-    }
-    if (result.message.opcode === 0x8049) {
-      // Config Node Reset — review finding (HIGH): pairing.ts now sends one
-      // on every configuration-phase failure, over this same still-open
-      // session, so a test exercising one of those failures must answer it
-      // (or `sendConfigRequest`'s own wait for Node Reset Status hangs) and
-      // model the node's real response: it returns to the unowned state
-      // and is scannable again.
-      if (options.failReset) return undefined; // modelling a node unreachable for the reset too
-      if (options.nodeResetWrongReply) {
-        // Reachable, but answers with the WRONG status type (an AppKey
-        // Status) — never silently treated as a successful reset.
-        return sendAsNode(Buffer.from([0x80, 0x03, 0x00, 0x00, 0x00, 0x00]));
+    const configReply = (): Buffer[] | undefined => {
+      if (result.kind !== 'complete') return undefined; // narrowing only; checked above
+      if (result.message.opcode === 0x8008) {
+        // Config Composition Data Get -> Config Composition Data Status.
+        return sendAsNode(compositionAccessPayload);
       }
-      bluetooth.reconfigureAsUnprovisioned(peripheralId, UNPROVISIONED_SERVICE_DATA);
-      return sendAsNode(Buffer.from([0x80, 0x4a])); // Config Node Reset Status — no parameters.
-    }
-    return undefined;
+      if (result.message.opcode === 0x00) {
+        // Config AppKey Add -> Config AppKey Status. NetKeyIndex=AppKeyIndex=0
+        // (packed bytes are all-zero regardless of packing scheme when both
+        // indexes are zero).
+        const status = options.appKeyStatus ?? 0x00;
+        return sendAsNode(Buffer.from([0x80, 0x03, status, 0x00, 0x00, 0x00]));
+      }
+      if (result.message.opcode === 0x803d) {
+        // Config Model App Bind (Generic OnOff Server, element 0) -> Config
+        // Model App Status.
+        if (options.silentModelAppBind) return undefined; // the owner's own lost bulb
+        const status = options.modelAppStatus ?? 0x00;
+        const elementAddressLe = Buffer.alloc(2);
+        elementAddressLe.writeUInt16LE(nodeAddress, 0);
+        const modelIdLe = Buffer.alloc(2);
+        modelIdLe.writeUInt16LE(0x1000, 0);
+        return sendAsNode(Buffer.concat([Buffer.from([0x80, 0x3e, status]), elementAddressLe, Buffer.from([0x00, 0x00]), modelIdLe]));
+      }
+      if (result.message.opcode === 0x8049) {
+        // Config Node Reset — review finding (HIGH): pairing.ts now sends one
+        // on every configuration-phase failure, over this same still-open
+        // session, so a test exercising one of those failures must answer it
+        // (or `sendConfigRequest`'s own wait for Node Reset Status hangs) and
+        // model the node's real response: it returns to the unowned state
+        // and is scannable again.
+        if (options.failReset) return undefined; // modelling a node unreachable for the reset too
+        if (options.nodeResetWrongReply) {
+          // Reachable, but answers with the WRONG status type (an AppKey
+          // Status) — never silently treated as a successful reset.
+          return sendAsNode(Buffer.from([0x80, 0x03, 0x00, 0x00, 0x00, 0x00]));
+        }
+        if (options.nodeResetMalformedReply) {
+          // The RIGHT message, malformed: Table 4.136 gives Config Node Reset
+          // Status no parameters at all, and this one carries two.
+          return sendAsNode(Buffer.from([0x80, 0x4a, 0xde, 0xad]));
+        }
+        bluetooth.reconfigureAsUnprovisioned(peripheralId, UNPROVISIONED_SERVICE_DATA);
+        return sendAsNode(Buffer.from([0x80, 0x4a])); // Config Node Reset Status — no parameters.
+      }
+      return undefined;
+    };
+
+    const reply = configReply();
+    if (reply === undefined) return undefined;
+    // NOISE ON THE WIRE, ahead of the real answer — see
+    // `repeatPreviousReplyFirst`/`unsolicitedBeforeEachReply`. Both are
+    // prepended rather than appended on purpose: a reply-matching rule that
+    // takes the first decodable message is wrong precisely when the wrong
+    // message arrives FIRST.
+    const prefix: Buffer[] = [];
+    if (options.unsolicitedBeforeEachReply) prefix.push(...sendAsNode(options.unsolicitedBeforeEachReply));
+    if (options.repeatPreviousReplyFirst && previousConfigReply !== null) prefix.push(...previousConfigReply);
+    previousConfigReply = reply;
+    return [...prefix, ...reply];
   };
   bluetooth.setAutoResponder(peripheralId, responder);
 }
@@ -1086,18 +1142,42 @@ describe('the node refuses a configuration request', () => {
   });
 
   test('when the reset is answered with the WRONG status message type, that is reported as a failure too, never treated as a successful reset', async () => {
-    const { bluetooth, store, deps } = setUp();
+    const { bluetooth, store, clock, deps } = setUp();
     addUnprovisionedNode(bluetooth, 'reset-wrong-reply', -50);
     installSuccessfulNodeBehaviour(bluetooth, 'reset-wrong-reply', 1, 2, { modelAppStatus: 0x0d, nodeResetWrongReply: true });
 
-    const outcome = await pairNode(deps, 'reset-wrong-reply');
+    // Since 2026-10-08 a reply that is not the status the request asked for
+    // does not settle the wait at all — it is discarded and the request
+    // waits out its own deadline, exactly as it would for silence — so this
+    // advances the clock the same way the silent-node tests do.
+    const outcomePromise = pairNode(deps, 'reset-wrong-reply');
+    let settled = false;
+    void outcomePromise.then(
+      () => {
+        settled = true;
+      },
+      () => {
+        settled = true;
+      },
+    );
+    for (let i = 0; i < 5 && !settled; i++) {
+      await waitUntil(() => clock.pendingCount() >= 1 || settled);
+      if (settled) break;
+      await clock.advance(DEFAULT_PAIRING_STEP_TIMEOUT_MS);
+    }
+    const outcome = await outcomePromise;
 
     expect(outcome.kind).toBe('failed');
     if (outcome.kind !== 'failed') return;
     expect(outcome.message).toContain('Model App Bind was refused');
     expect(outcome.message).toContain('attempted to reset the node');
     expect(outcome.message).toContain('that also failed');
-    expect(outcome.message).toContain('node did not answer Config Node Reset with a Node Reset Status message');
+    // IT SAYS WHAT ARRIVED, and does not claim silence: the node DID answer,
+    // with the wrong message. "Did not answer" is reserved for a node that
+    // said nothing at all (the test above this one).
+    expect(outcome.message).toContain('node answered Config Node Reset with Config AppKey Status');
+    expect(outcome.message).toContain('instead of a Config Node Reset Status message');
+    expect(outcome.message).not.toContain('did not answer Config Node Reset');
     expect(outcome.message).toContain('manual factory reset');
     // DEFECT B (hardware round, 2026-10-08). The reset failed too, so this
     // bulb is provisioned, holds our network key, has left the Mesh
@@ -1197,13 +1277,15 @@ describe('a configuration failure after provisioning succeeded', () => {
   test('THE ENTRY IS WRITTEN BEFORE THE APPLICATION KEY, not merely before the binds — a node that refuses AppKey Add is recorded too', async () => {
     const { bluetooth, store, deps } = setUp();
     addUnprovisionedNode(bluetooth, 'refuses-appkey-no-reset', -50);
-    // Refused AppKey Add, and a reset that is answered with the WRONG
-    // message type — so the node never returns to the unowned state and the
+    // Refused AppKey Add, and a reset whose reply is the right message
+    // MALFORMED — so the node never returns to the unowned state and the
     // entry must survive. Written this way rather than with `failReset` so
-    // the test needs no clock advancing at all.
+    // the test needs no clock advancing at all (and no longer with
+    // `nodeResetWrongReply`, which since 2026-10-08 is discarded as not
+    // being an answer to the request at all, and therefore waits).
     installSuccessfulNodeBehaviour(bluetooth, 'refuses-appkey-no-reset', 1, 2, {
       appKeyStatus: 0x05,
-      nodeResetWrongReply: true,
+      nodeResetMalformedReply: true,
     });
 
     const outcome = await pairNode(deps, 'refuses-appkey-no-reset');
@@ -1246,7 +1328,7 @@ describe('a configuration failure after provisioning succeeded', () => {
     addUnprovisionedNode(bluetooth, 'bad-composition-no-reset', -50);
     installSuccessfulNodeBehaviour(bluetooth, 'bad-composition-no-reset', 1, 2, {
       compositionAccessPayload: Buffer.from([0x02, 0x00, 0xaa, 0xbb]),
-      nodeResetWrongReply: true, // so a kept entry would survive and be visible here
+      nodeResetMalformedReply: true, // so a kept entry would survive and be visible here
     });
 
     const outcome = await pairNode(deps, 'bad-composition-no-reset');
@@ -1289,7 +1371,7 @@ describe('a configuration failure after provisioning succeeded', () => {
     addUnprovisionedNode(bluetooth, 'stranded', -51);
     addUnprovisionedNode(bluetooth, 'good-2', -52);
     installSuccessfulNodeBehaviour(bluetooth, 'good-1', 1, 2);
-    installSuccessfulNodeBehaviour(bluetooth, 'stranded', 1, 3, { modelAppStatus: 0x0d, nodeResetWrongReply: true });
+    installSuccessfulNodeBehaviour(bluetooth, 'stranded', 1, 3, { modelAppStatus: 0x0d, nodeResetMalformedReply: true });
     installSuccessfulNodeBehaviour(bluetooth, 'good-2', 1, 4);
 
     const result = await pairNodes(deps, ['good-1', 'stranded', 'good-2']);
@@ -1419,8 +1501,8 @@ describe('element attribution', () => {
 // ===========================================================================
 
 describe('a node that answers a Config request with the wrong status message type', () => {
-  test('a Config AppKey Status in reply to Composition Data Get produces a clear failure, not a crash or a false success', async () => {
-    const { bluetooth, store, deps } = setUp();
+  test('a Config AppKey Status in reply to Composition Data Get produces a clear failure that NAMES what arrived, not a crash or a false success', async () => {
+    const { bluetooth, store, clock, deps } = setUp();
     addUnprovisionedNode(bluetooth, 'wrong-status-type', -50);
     installProvisioningResponder(bluetooth, 'wrong-status-type', {
       onComplete: () => {
@@ -1445,12 +1527,266 @@ describe('a node that answers a Config request with the wrong status message typ
       },
     });
 
-    const outcome = await pairNode(deps, 'wrong-status-type');
+    const outcomePromise = pairNode(deps, 'wrong-status-type');
+    let settled = false;
+    void outcomePromise.then(
+      () => {
+        settled = true;
+      },
+      () => {
+        settled = true;
+      },
+    );
+    // The wrong message no longer settles the wait (hardware round,
+    // 2026-10-08): it is discarded and the request goes on waiting for its
+    // own reply, so the deadline is what ends this — for the request AND for
+    // the Config Node Reset that `failWithReset` sends afterwards, which
+    // this node answers with the same wrong message.
+    for (let i = 0; i < 5 && !settled; i++) {
+      await waitUntil(() => clock.pendingCount() >= 1 || settled);
+      if (settled) break;
+      await clock.advance(DEFAULT_PAIRING_STEP_TIMEOUT_MS);
+    }
+    const outcome = await outcomePromise;
 
     expect(outcome.kind).toBe('failed');
     if (outcome.kind !== 'failed') return;
-    expect(outcome.message).toContain('did not answer Config Composition Data Get with a Composition Data Status message');
+    // THE POINT OF THIS TEST SINCE 2026-10-08: the message distinguishes a
+    // node that said the wrong thing from one that said nothing. The old
+    // wording claimed the node "did not answer", which is what sent a human
+    // looking for a dead bulb that was in fact talking.
+    expect(outcome.message).toContain('node answered Config Composition Data Get with Config AppKey Status');
+    expect(outcome.message).toContain('instead of a Config Composition Data Status message');
+    expect(outcome.message).not.toContain('did not answer Config Composition Data Get');
     expect(store.getState().nodes).toHaveLength(0);
+  });
+});
+
+// ===========================================================================
+// DEFECT A (hardware round, 2026-10-08): A REPLY MUST ANSWER THE REQUEST
+// THAT IS WAITING FOR IT.
+//
+// What happened: three bulbs, one run, all three reported as never having
+// answered Config Model App Bind. They had answered. Every notification was
+// reaching the app more than once — twice for the first two nodes, three
+// times for the third — because each GATT session subscribed to the Data Out
+// characteristic and never released the subscription, so the duplicate of the
+// PREVIOUS request's Config AppKey Status was waiting in the channel when the
+// bind's reply was asked for, and `sendConfigRequest` returned the first
+// thing that decoded. The caller saw a message that was not a Model App
+// Status and reported silence; the real Model App Status was still in flight.
+//
+// Both halves are pinned here: the matching (these tests) and the release
+// (the describe block after this one). The matching is the one that holds
+// even if duplicates ever come back — a mesh node may publish an unsolicited
+// status or retransmit one at any time, so "the first decodable message" was
+// never a safe rule.
+// ===========================================================================
+
+describe('a reply must answer the request that is waiting for it', () => {
+  test('A DUPLICATE OF THE PREVIOUS REPLY does not satisfy the next request — the real reply is still awaited, and the pairing finishes', async () => {
+    const { bluetooth, store, clock, deps } = setUp();
+    addUnprovisionedNode(bluetooth, 'echoes', -55);
+    // Every Config reply is preceded by an exact repeat of the previous one:
+    // the AppKey Add's own reply arrives behind a second copy of the
+    // Composition Data Status, the bind's behind a second copy of the AppKey
+    // Status. Precisely the owner's capture.
+    installSuccessfulNodeBehaviour(bluetooth, 'echoes', 1, 2, { repeatPreviousReplyFirst: true });
+
+    const outcome = await pairNode(deps, 'echoes');
+
+    // THE DISCRIMINATING ASSERTION: this is a complete, successful pairing.
+    // Returning the first decodable message instead of the right one fails
+    // it at the Config AppKey Add — whose "reply" would be the duplicated
+    // Composition Data Status — long before the bind the hardware died on.
+    expect(outcome.kind).toBe('paired');
+    if (outcome.kind !== 'paired') return;
+    expect(outcome.device.capabilities).toEqual(['onoff']);
+    expect(store.getState().nodes[0]?.incomplete).toBeUndefined();
+    // Nothing was left waiting: no stage timer survived the run.
+    expect(clock.pendingCount()).toBe(0);
+  });
+
+  test('AN UNSOLICITED STATUS nobody asked for is discarded, not returned as the reply', async () => {
+    const { bluetooth, store, deps } = setUp();
+    addUnprovisionedNode(bluetooth, 'chatty', -55);
+    // Opcode 0x804A carrying twelve octets of parameters ahead of every
+    // reply: a well-formed, decodable Access message that is not an answer
+    // to any request this exchange makes — the shape of an unsolicited
+    // publication.
+    //
+    // DELIBERATELY LONG ENOUGH TO SEGMENT (an Access payload over 11 octets
+    // does not fit one Unsegmented Access message), and the reply it
+    // precedes — Composition Data Status, 30 octets — is segmented too. A
+    // discarded message must END its own reassembly as surely as an accepted
+    // one does: carrying its state into the reply behind it would merge two
+    // messages' segments and the real reply would never assemble.
+    installSuccessfulNodeBehaviour(bluetooth, 'chatty', 1, 2, {
+      unsolicitedBeforeEachReply: Buffer.concat([Buffer.from([0x80, 0x4a]), Buffer.alloc(12, 0x5a)]),
+    });
+
+    const outcome = await pairNode(deps, 'chatty');
+
+    expect(outcome.kind).toBe('paired');
+    if (outcome.kind !== 'paired') return;
+    expect(outcome.device.capabilities).toEqual(['onoff']);
+    expect(store.getState().nodes).toHaveLength(1);
+  });
+
+  test('GENUINE SILENCE still times out, and the message says silence rather than naming a message that never came', async () => {
+    const { bluetooth, clock, deps } = setUp();
+    addUnprovisionedNode(bluetooth, 'mute-bind', -55);
+    installSuccessfulNodeBehaviour(bluetooth, 'mute-bind', 1, 2, { silentModelAppBind: true, failReset: true });
+
+    const outcomePromise = pairNode(deps, 'mute-bind');
+    let settled = false;
+    void outcomePromise.then(
+      () => {
+        settled = true;
+      },
+      () => {
+        settled = true;
+      },
+    );
+    for (let i = 0; i < 5 && !settled; i++) {
+      await waitUntil(() => clock.pendingCount() >= 1 || settled);
+      if (settled) break;
+      await clock.advance(DEFAULT_PAIRING_STEP_TIMEOUT_MS);
+    }
+    const outcome = await outcomePromise;
+
+    expect(outcome.kind).toBe('failed');
+    if (outcome.kind !== 'failed') return;
+    // "Did not answer" means the node said NOTHING — and names which request
+    // went unanswered, down to the element and the model.
+    expect(outcome.message).toContain(
+      'node did not answer Config Model App Bind (element 0, model 0x1000) with a Config Model App Status message',
+    );
+    // ...and does not describe something as having arrived, because nothing did.
+    expect(outcome.message).not.toContain('node answered Config Model App Bind');
+    expect(outcome.message).not.toContain('instead of a Config Model App Status');
+    // The underlying reason the wait ended is carried too, never swallowed:
+    // "the node said nothing" and "the link died" are not the same problem.
+    expect(outcome.message).toContain('configuration exchange stalled');
+  });
+});
+
+// ===========================================================================
+// DEFECT A's CAUSE: the subscriptions themselves. `pairing.ts` called
+// `bluetooth.subscribe` once per GATT session and never once called
+// `unsubscribe` — the word did not appear in the file. Two sessions per node
+// and several nodes per run is how one notification came to be delivered
+// three times.
+//
+// The fake counts LIVE subscriptions (handed out, minus released) and
+// deliberately does not count a dropped link as a release — see
+// `FakeBluetoothPort#liveSubscriptionCount`.
+// ===========================================================================
+
+describe('a GATT session releases the notification subscription it took', () => {
+  test('on the SUCCESS path: a completed pairing leaves none of its two sessions subscribed', async () => {
+    const { bluetooth, deps } = setUp();
+    addUnprovisionedNode(bluetooth, 'bulb-1', -55);
+    installSuccessfulNodeBehaviour(bluetooth, 'bulb-1', 1, 2);
+
+    const outcome = await pairNode(deps, 'bulb-1');
+
+    expect(outcome.kind).toBe('paired');
+    // Guards the guard: a run that never subscribed would satisfy the
+    // assertion below for the wrong reason. Two sessions, two subscriptions
+    // (provisioning, then configuration — see pairing.ts's own "TWO GATT
+    // SESSIONS" note).
+    expect(bluetooth.subscriptionCount()).toBe(2);
+    expect(bluetooth.liveSubscriptionCount()).toBe(0);
+  });
+
+  test('on the FAILURE path: a configuration that fails leaves nothing subscribed either', async () => {
+    const { bluetooth, deps } = setUp();
+    addUnprovisionedNode(bluetooth, 'refuses-bind', -50);
+    installSuccessfulNodeBehaviour(bluetooth, 'refuses-bind', 1, 2, { modelAppStatus: 0x0d });
+
+    const outcome = await pairNode(deps, 'refuses-bind');
+
+    expect(outcome.kind).toBe('failed');
+    expect(bluetooth.subscriptionCount()).toBe(2);
+    expect(bluetooth.liveSubscriptionCount()).toBe(0);
+  });
+
+  test('ACROSS A WHOLE RUN of three bulbs — the shape of the owner\'s own failed run — nothing accumulates', async () => {
+    const { bluetooth, deps } = setUp([
+      TEST_NET_KEY,
+      TEST_APP_KEY,
+      KAT_RANDOM_PROVISIONER,
+      KAT_RANDOM_PROVISIONER,
+      KAT_RANDOM_PROVISIONER,
+    ]);
+    addUnprovisionedNode(bluetooth, 'bulb-a', -50);
+    addUnprovisionedNode(bluetooth, 'bulb-b', -51);
+    addUnprovisionedNode(bluetooth, 'bulb-c', -52);
+    installSuccessfulNodeBehaviour(bluetooth, 'bulb-a', 1, 2);
+    installSuccessfulNodeBehaviour(bluetooth, 'bulb-b', 1, 3);
+    installSuccessfulNodeBehaviour(bluetooth, 'bulb-c', 1, 4);
+
+    const result = await pairNodes(deps, ['bulb-a', 'bulb-b', 'bulb-c']);
+
+    expect(result.paired.map((d) => d.data.id)).toEqual(['2', '3', '4']);
+    // THE DISCRIMINATING ASSERTION, and the measured defect: six sessions,
+    // six subscriptions, none of them still live. Before the fix this was 6
+    // — which is why the third bulb saw every notification three times.
+    expect(bluetooth.subscriptionCount()).toBe(6);
+    expect(bluetooth.liveSubscriptionCount()).toBe(0);
+  });
+
+  test('the disconnect this session performs ITSELF, on a Proxy protocol violation, releases the subscription with the link', async () => {
+    // Section 6.3.2.2's "shall disconnect" is performed by the session, not
+    // asked of its caller — so it is a session ending without anyone ever
+    // calling `disconnect()` on it, and the only exit path a release wired
+    // solely into `disconnect()` would miss.
+    const { bluetooth, clock } = setUp();
+    addUnprovisionedNode(bluetooth, 'violates', -50);
+    const session = await connectForProvisioning(bluetooth, 'violates', clock, DEFAULT_PAIRING_STEP_TIMEOUT_MS);
+    expect(bluetooth.liveSubscriptionCount()).toBe(1);
+
+    const pending = session.next();
+    const rejection = expect(pending).rejects.toThrow(/unexpected SAR value/);
+    // 0b10_000011: a continuation segment with nothing being reassembled.
+    bluetooth.simulateRawNotification('violates', Buffer.from([0x83, 0x11]));
+    await rejection;
+
+    expect(bluetooth.liveSubscriptionCount()).toBe(0);
+  });
+
+  test('a subscription that ARRIVES AFTER the session gave up waiting for it is released, never orphaned', async () => {
+    // The path no caller can clean up, because no caller ever gets a
+    // session: `withTimeout` "cannot cancel the underlying operation" (its
+    // own words), so a subscribe this session stopped waiting on can still
+    // succeed afterwards — and a platform that then starts notifying an
+    // abandoned callback is exactly how the duplicates got in.
+    const clock = createFakeClock();
+    let deliverSubscription: ((subscription: Subscription) => void) | null = null;
+    let unsubscribed = 0;
+    const port = fastProvisioningPort({
+      subscribe: (): Promise<Subscription> =>
+        new Promise<Subscription>((resolve) => {
+          deliverSubscription = resolve;
+        }),
+    });
+
+    const promise = connectForProvisioning(port, 'peripheral-x', clock, 50);
+    promise.catch(() => {});
+    await waitUntil(() => deliverSubscription !== null && clock.pendingCount() >= 1);
+    await clock.advance(50);
+    await expect(promise).rejects.toThrow('provisioning: subscribing to notifications');
+
+    // ...and only NOW does the platform answer.
+    (deliverSubscription as unknown as (subscription: Subscription) => void)({
+      unsubscribe: (): void => {
+        unsubscribed += 1;
+      },
+    });
+    await waitUntil(() => unsubscribed > 0);
+
+    expect(unsubscribed).toBe(1);
   });
 });
 
