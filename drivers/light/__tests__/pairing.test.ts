@@ -1730,25 +1730,37 @@ describe('a GATT session releases the notification subscription it took', () => 
     expect(bluetooth.liveSubscriptionCount()).toBe(0);
   });
 
-  test('a session abandoned BEFORE it was ever handed to a caller releases its subscription too', async () => {
-    // discover() fails on the reconnect for configuration: provisioning
-    // succeeded (one subscription, released with that session), and the
-    // configuration session dies inside openSession, where no caller ever
-    // receives a GattSession to disconnect.
-    const { bluetooth, deps } = setUp();
-    addUnprovisionedNode(bluetooth, 'discover-fails-later', -50);
-    installProvisioningResponder(bluetooth, 'discover-fails-later', {
-      onComplete: () => {
-        bluetooth.reconfigureAsProvisioned('discover-fails-later', TEST_NET_KEY);
-        bluetooth.setDiscoverBehavior('discover-fails-later', 'fail');
-      },
+  test('a subscription that ARRIVES AFTER the session gave up waiting for it is released, never orphaned', async () => {
+    // The path no caller can clean up, because no caller ever gets a
+    // session: `withTimeout` "cannot cancel the underlying operation" (its
+    // own words), so a subscribe this session stopped waiting on can still
+    // succeed afterwards — and a platform that then starts notifying an
+    // abandoned callback is exactly how the duplicates got in.
+    const clock = createFakeClock();
+    let deliverSubscription: ((subscription: Subscription) => void) | null = null;
+    let unsubscribed = 0;
+    const port = fastProvisioningPort({
+      subscribe: (): Promise<Subscription> =>
+        new Promise<Subscription>((resolve) => {
+          deliverSubscription = resolve;
+        }),
     });
 
-    const outcome = await pairNode(deps, 'discover-fails-later');
+    const promise = connectForProvisioning(port, 'peripheral-x', clock, 50);
+    promise.catch(() => {});
+    await waitUntil(() => deliverSubscription !== null && clock.pendingCount() >= 1);
+    await clock.advance(50);
+    await expect(promise).rejects.toThrow('provisioning: subscribing to notifications');
 
-    expect(outcome.kind).toBe('failed');
-    expect(bluetooth.subscriptionCount()).toBe(1); // only the provisioning session ever subscribed
-    expect(bluetooth.liveSubscriptionCount()).toBe(0);
+    // ...and only NOW does the platform answer.
+    (deliverSubscription as unknown as (subscription: Subscription) => void)({
+      unsubscribe: (): void => {
+        unsubscribed += 1;
+      },
+    });
+    await waitUntil(() => unsubscribed > 0);
+
+    expect(unsubscribed).toBe(1);
   });
 });
 
