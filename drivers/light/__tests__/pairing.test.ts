@@ -1610,12 +1610,19 @@ describe('a reply must answer the request that is waiting for it', () => {
   test('AN UNSOLICITED STATUS nobody asked for is discarded, not returned as the reply', async () => {
     const { bluetooth, store, deps } = setUp();
     addUnprovisionedNode(bluetooth, 'chatty', -55);
-    // A Config Node Reset Status (opcode 0x804A, no parameters) ahead of
-    // every reply: a perfectly well-formed Config status, decodable by this
-    // project, and never an answer to any request this exchange sends until
-    // the very end — the shape of an unsolicited publication.
+    // Opcode 0x804A carrying twelve octets of parameters ahead of every
+    // reply: a well-formed, decodable Access message that is not an answer
+    // to any request this exchange makes — the shape of an unsolicited
+    // publication.
+    //
+    // DELIBERATELY LONG ENOUGH TO SEGMENT (an Access payload over 11 octets
+    // does not fit one Unsegmented Access message), and the reply it
+    // precedes — Composition Data Status, 30 octets — is segmented too. A
+    // discarded message must END its own reassembly as surely as an accepted
+    // one does: carrying its state into the reply behind it would merge two
+    // messages' segments and the real reply would never assemble.
     installSuccessfulNodeBehaviour(bluetooth, 'chatty', 1, 2, {
-      unsolicitedBeforeEachReply: Buffer.from([0x80, 0x4a]),
+      unsolicitedBeforeEachReply: Buffer.concat([Buffer.from([0x80, 0x4a]), Buffer.alloc(12, 0x5a)]),
     });
 
     const outcome = await pairNode(deps, 'chatty');
@@ -1727,6 +1734,25 @@ describe('a GATT session releases the notification subscription it took', () => 
     // six subscriptions, none of them still live. Before the fix this was 6
     // — which is why the third bulb saw every notification three times.
     expect(bluetooth.subscriptionCount()).toBe(6);
+    expect(bluetooth.liveSubscriptionCount()).toBe(0);
+  });
+
+  test('the disconnect this session performs ITSELF, on a Proxy protocol violation, releases the subscription with the link', async () => {
+    // Section 6.3.2.2's "shall disconnect" is performed by the session, not
+    // asked of its caller — so it is a session ending without anyone ever
+    // calling `disconnect()` on it, and the only exit path a release wired
+    // solely into `disconnect()` would miss.
+    const { bluetooth, clock } = setUp();
+    addUnprovisionedNode(bluetooth, 'violates', -50);
+    const session = await connectForProvisioning(bluetooth, 'violates', clock, DEFAULT_PAIRING_STEP_TIMEOUT_MS);
+    expect(bluetooth.liveSubscriptionCount()).toBe(1);
+
+    const pending = session.next();
+    const rejection = expect(pending).rejects.toThrow(/unexpected SAR value/);
+    // 0b10_000011: a continuation segment with nothing being reassembled.
+    bluetooth.simulateRawNotification('violates', Buffer.from([0x83, 0x11]));
+    await rejection;
+
     expect(bluetooth.liveSubscriptionCount()).toBe(0);
   });
 
