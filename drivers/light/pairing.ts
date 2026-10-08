@@ -23,6 +23,7 @@ import {
   type ConnectionHandle,
   type DiscoveredCharacteristic,
   type ServiceDataEntry,
+  type Subscription,
   type TimerHandle,
 } from '../../lib/adapter/connection';
 import { NetworkStore } from '../../lib/adapter/store';
@@ -47,6 +48,8 @@ import {
   encodeConfigModelAppBind,
   encodeConfigNodeReset,
   decodeConfigStatus,
+  describeConfigExchange,
+  describeConfigOpcode,
 } from '../../lib/mesh/config/client';
 import { encodeAccessMessage, type AccessMessage } from '../../lib/mesh/packet/access';
 import { k4 } from '../../lib/mesh/crypto/derive';
@@ -617,6 +620,22 @@ interface GattSession {
  * exchange stalled" keep seeing exactly that wording — see the module
  * header's "The clock" note for why every one of these needed bounding,
  * not only the reply wait.
+ *
+ * WHAT IT SUBSCRIBES, IT RELEASES (hardware round, 2026-10-08). The
+ * `Subscription` `BluetoothPort.subscribe` hands back was simply dropped on
+ * the floor here, on every path: this module did not contain the word
+ * `unsubscribe` at all. One pairing run opens a session PER NODE, and two
+ * per node at that (provisioning, then configuration — see the module
+ * header's "TWO GATT SESSIONS" note), so the abandoned notification
+ * callbacks piled up and the platform delivered every incoming PDU once per
+ * surviving subscription: the owner's own capture shows node `dst=10` and
+ * `dst=11` seeing each notification twice and `dst=12`, later in the same
+ * run, three times. Those duplicates are what `sendConfigRequest` then
+ * mistook for replies. So every exit path from here on releases the
+ * subscription — the session's own `disconnect()`, the Section 6.3.2.2
+ * disconnect this session performs on a Proxy protocol violation, and a
+ * failure between `connect` and the returned session (which also drops the
+ * connection it would otherwise have leaked alongside it).
  */
 async function openSession(
   bluetooth: BluetoothPort,
@@ -643,96 +662,142 @@ async function openSession(
     }),
     `${stage}: connecting`,
   );
-  const characteristics = await bounded(bluetooth.discover(connection), `${stage}: discovering services`);
-  const dataIn = characteristics.find((c) => c.serviceUuid === serviceUuid && c.characteristicUuid === dataInUuid);
-  const dataOut = characteristics.find((c) => c.serviceUuid === serviceUuid && c.characteristicUuid === dataOutUuid);
-  if (!dataIn || !dataOut) {
-    throw new Error(
-      `peripheral "${peripheralId}" does not expose both required characteristics for service 0x${serviceUuid.toString(16)} (0x${dataInUuid.toString(16)}/0x${dataOutUuid.toString(16)})`,
-    );
-  }
-  const channel = new NotificationChannel();
-  // THE PROXY PDU ENVELOPE, on both characteristic pairs — see the module
-  // header's own note. `reassembly` is this session's single in-flight
-  // reassembly (`proxyPdu.ts`'s `undefined` convention); it lives for the
-  // life of the connection and dies with it, because `openSession` is
-  // called once per connection and nothing here outlives that.
-  let reassembly: ProxyReassemblyState | undefined;
 
-  // ---------------------------------------------------------------------
-  // SECTION 6.3.2.2 IS THIS SESSION'S RULE TOO, and it is enforced here
-  // rather than left to the stage timeout (final re-review, finding 2 —
-  // MEDIUM). The comment that used to stand in this spot argued the
-  // opposite and had its arithmetic backwards: "20 seconds is longer than
-  // any `timeoutMs` this project passes, so the stage timeout always fires
-  // first". DEFAULT_PAIRING_STEP_TIMEOUT_MS is 30_000 and
-  // PROXY_SAR_TIMEOUT_MS is 20_000, and `driver.ts` passes no override, so
-  // the project's timeout is the LONGER one — the stage timeout fires ten
-  // seconds LATE, and the disconnect the specification requires never
-  // happened at all.
+  // THE SESSION'S ONE SUBSCRIPTION, and the two operations every exit path
+  // below goes through to be rid of it — see this function's own doc
+  // comment for what leaving it behind cost.
   //
-  // That this session is bound by the Proxy PDU CLIENT rules is not an
-  // inference. Section 5.2.2 "PB-GATT": "When PB-GATT is used, the
-  // Provisioner shall use the PB-GATT Client role and the unprovisioned
-  // device shall use the PB-GATT Server role." and "The PB-GATT Server
-  // shall use the Provisioning Server role (see Section 6.2.2) and the
-  // PB-GATT Client shall use the Provisioning Client role (see Section
-  // 6.2.2)."; Section 6.2.2 "Provisioning PB-GATT bearer roles": "The
-  // Provisioning Client is a node that supports the Proxy PDU Client and
-  // supports transporting Provisioning PDUs using the Proxy protocol." We
-  // are the Provisioner on the provisioning pair and the Proxy Client on
-  // the proxy pair, so both of this session's channels are Proxy PDU
-  // Client channels.
-  //
-  // WHAT IS ENFORCED, both from Section 6.3.2.2: "Upon receiving a message
-  // with an unexpected value of the SAR field, the Proxy PDU Client shall
-  // disconnect." and "The timeout for the SAR transfer is 20 seconds. When
-  // the timeout expires, the Proxy PDU Client shall disconnect." The first
-  // `acceptProxyPdu` already detects on arrival; the second it cannot,
-  // because a transfer that simply STOPS arriving produces no arrival to
-  // check — hence a timer, armed exactly as `lib/adapter/connection.ts`
-  // arms its own, from the current segment rather than the first (the
-  // on-arrival check in `acceptProxyPdu` measures the real deadline from
-  // `startedAtMs` regardless, so this timer only has to guarantee a
-  // stalled transfer is eventually noticed; it never shortens the window).
-  //
-  // 'ignored' (an unsupported MessageType, Section 6.3.2) still ends with
-  // nothing pushed and nothing dropped — that one the specification really
-  // does say to ignore, and any reassembly in progress survives it.
-  // ---------------------------------------------------------------------
-  let sarTimer: TimerHandle | null = null;
-  const clearSarTimer = (): void => {
-    if (sarTimer !== null) {
-      clock.clearTimeout(sarTimer);
-      sarTimer = null;
+  // `adoptSubscription` is not ceremony: `bounded` can give up on
+  // `bluetooth.subscribe` while the platform is still working on it, and
+  // `withTimeout`'s own note is explicit that it "cannot cancel the
+  // underlying operation" — so a subscription can still arrive AFTER this
+  // session has been abandoned, and must be released on arrival rather than
+  // becoming exactly the orphan this fix is about.
+  let subscription: Subscription | null = null;
+  let released = false;
+  const releaseSubscription = (): void => {
+    released = true;
+    const current = subscription;
+    subscription = null;
+    if (current !== null) current.unsubscribe();
+  };
+  const adoptSubscription = (incoming: Subscription): void => {
+    if (released) {
+      incoming.unsubscribe();
+      return;
+    }
+    subscription = incoming;
+  };
+  /** Abandons everything this function has opened so far, for a failure
+   *  between `connect` and the session being handed to a caller — there is
+   *  no session yet for `disconnectQuietly` to be called on, so nothing
+   *  else would ever close either half. The disconnect is deliberately
+   *  fire-and-forget: this path is already failing, and awaiting a close
+   *  that may itself hang would only turn one failure into a hang. */
+  const abandon = (): void => {
+    releaseSubscription();
+    try {
+      void Promise.resolve(bluetooth.disconnect(connection)).catch(() => {});
+    } catch {
+      // A port that throws synchronously rather than rejecting must not
+      // replace the failure this cleanup is running for.
     }
   };
-  const disconnectOnProxyProtocolViolation = (reason: string): void => {
-    clearSarTimer();
-    reassembly = undefined;
-    // Whoever is waiting learns the real reason now, instead of the stage
-    // timeout's generic one later — and every later `next()` on this dead
-    // session learns it too (see `NotificationChannel.fail`).
-    channel.fail(new Error(`${stage}: ${reason}`));
-    bluetooth.disconnect(connection).catch(() => {
-      // The link is being abandoned either way; a close that itself fails
-      // changes nothing this session can act on, and there is no caller
-      // left to tell.
-    });
-  };
-  const armSarTimer = (): void => {
-    clearSarTimer();
-    sarTimer = clock.setTimeout(() => {
-      sarTimer = null;
-      if (reassembly === undefined) return;
-      disconnectOnProxyProtocolViolation(
-        'SAR transfer timed out (Section 6.3.2.2: the timeout for the SAR transfer is 20 seconds)',
-      );
-    }, PROXY_SAR_TIMEOUT_MS);
-  };
 
-  await bounded(
-    bluetooth.subscribe(dataOut.handle, (pdu) => {
+  try {
+    const characteristics = await bounded(bluetooth.discover(connection), `${stage}: discovering services`);
+    const dataIn = characteristics.find((c) => c.serviceUuid === serviceUuid && c.characteristicUuid === dataInUuid);
+    const dataOut = characteristics.find((c) => c.serviceUuid === serviceUuid && c.characteristicUuid === dataOutUuid);
+    if (!dataIn || !dataOut) {
+      throw new Error(
+        `peripheral "${peripheralId}" does not expose both required characteristics for service 0x${serviceUuid.toString(16)} (0x${dataInUuid.toString(16)}/0x${dataOutUuid.toString(16)})`,
+      );
+    }
+    const channel = new NotificationChannel();
+    // THE PROXY PDU ENVELOPE, on both characteristic pairs — see the module
+    // header's own note. `reassembly` is this session's single in-flight
+    // reassembly (`proxyPdu.ts`'s `undefined` convention); it lives for the
+    // life of the connection and dies with it, because `openSession` is
+    // called once per connection and nothing here outlives that.
+    let reassembly: ProxyReassemblyState | undefined;
+
+    // ---------------------------------------------------------------------
+    // SECTION 6.3.2.2 IS THIS SESSION'S RULE TOO, and it is enforced here
+    // rather than left to the stage timeout (final re-review, finding 2 —
+    // MEDIUM). The comment that used to stand in this spot argued the
+    // opposite and had its arithmetic backwards: "20 seconds is longer than
+    // any `timeoutMs` this project passes, so the stage timeout always fires
+    // first". DEFAULT_PAIRING_STEP_TIMEOUT_MS is 30_000 and
+    // PROXY_SAR_TIMEOUT_MS is 20_000, and `driver.ts` passes no override, so
+    // the project's timeout is the LONGER one — the stage timeout fires ten
+    // seconds LATE, and the disconnect the specification requires never
+    // happened at all.
+    //
+    // That this session is bound by the Proxy PDU CLIENT rules is not an
+    // inference. Section 5.2.2 "PB-GATT": "When PB-GATT is used, the
+    // Provisioner shall use the PB-GATT Client role and the unprovisioned
+    // device shall use the PB-GATT Server role." and "The PB-GATT Server
+    // shall use the Provisioning Server role (see Section 6.2.2) and the
+    // PB-GATT Client shall use the Provisioning Client role (see Section
+    // 6.2.2)."; Section 6.2.2 "Provisioning PB-GATT bearer roles": "The
+    // Provisioning Client is a node that supports the Proxy PDU Client and
+    // supports transporting Provisioning PDUs using the Proxy protocol." We
+    // are the Provisioner on the provisioning pair and the Proxy Client on
+    // the proxy pair, so both of this session's channels are Proxy PDU
+    // Client channels.
+    //
+    // WHAT IS ENFORCED, both from Section 6.3.2.2: "Upon receiving a message
+    // with an unexpected value of the SAR field, the Proxy PDU Client shall
+    // disconnect." and "The timeout for the SAR transfer is 20 seconds. When
+    // the timeout expires, the Proxy PDU Client shall disconnect." The first
+    // `acceptProxyPdu` already detects on arrival; the second it cannot,
+    // because a transfer that simply STOPS arriving produces no arrival to
+    // check — hence a timer, armed exactly as `lib/adapter/connection.ts`
+    // arms its own, from the current segment rather than the first (the
+    // on-arrival check in `acceptProxyPdu` measures the real deadline from
+    // `startedAtMs` regardless, so this timer only has to guarantee a
+    // stalled transfer is eventually noticed; it never shortens the window).
+    //
+    // 'ignored' (an unsupported MessageType, Section 6.3.2) still ends with
+    // nothing pushed and nothing dropped — that one the specification really
+    // does say to ignore, and any reassembly in progress survives it.
+    // ---------------------------------------------------------------------
+    let sarTimer: TimerHandle | null = null;
+    const clearSarTimer = (): void => {
+      if (sarTimer !== null) {
+        clock.clearTimeout(sarTimer);
+        sarTimer = null;
+      }
+    };
+    const disconnectOnProxyProtocolViolation = (reason: string): void => {
+      clearSarTimer();
+      reassembly = undefined;
+      // Whoever is waiting learns the real reason now, instead of the stage
+      // timeout's generic one later — and every later `next()` on this dead
+      // session learns it too (see `NotificationChannel.fail`).
+      channel.fail(new Error(`${stage}: ${reason}`));
+      // This session is over whether or not its caller ever calls
+      // `disconnect()` on it, so the subscription goes here too — the one
+      // exit path a `disconnect()`-only release would miss entirely.
+      releaseSubscription();
+      bluetooth.disconnect(connection).catch(() => {
+        // The link is being abandoned either way; a close that itself fails
+        // changes nothing this session can act on, and there is no caller
+        // left to tell.
+      });
+    };
+    const armSarTimer = (): void => {
+      clearSarTimer();
+      sarTimer = clock.setTimeout(() => {
+        sarTimer = null;
+        if (reassembly === undefined) return;
+        disconnectOnProxyProtocolViolation(
+          'SAR transfer timed out (Section 6.3.2.2: the timeout for the SAR transfer is 20 seconds)',
+        );
+      }, PROXY_SAR_TIMEOUT_MS);
+    };
+
+    const subscribing = bluetooth.subscribe(dataOut.handle, (pdu) => {
       const result = acceptProxyPdu(reassembly, pdu, clock.now());
       switch (result.kind) {
         case 'ignored':
@@ -751,30 +816,53 @@ async function openSession(
           if (result.messageType === messageType) channel.push(result.message);
           return;
       }
-    }),
-    `${stage}: subscribing to notifications`,
-  );
-  return {
-    write: async (data: Buffer): Promise<void> => {
-      // Section 6.3.2.1 "Segmentation": the segments of one message are
-      // written in order, and nothing else goes out in between. This
-      // session is strictly request/response (`runProvisioningExchange`
-      // and `sendConfigRequest` both await each write), so there is no
-      // concurrent writer to interleave with.
-      for (const pdu of encodeProxyPdus(messageType, data, MAX_PROXY_PDU_LENGTH)) {
-        await bounded(bluetooth.write(dataIn.handle, pdu), `${stage}: writing to the node`);
-      }
-    },
-    next: (): Promise<Buffer> => bounded(channel.next(), `${stage} stalled`),
-    nextWithin: (timeoutMs: number): Promise<Buffer | null> => channel.nextWithin(clock, timeoutMs),
-    disconnect: (): Promise<void> => {
-      // Nothing of this session's own may outlive it: an un-cleared SAR
-      // timer would keep a real event loop alive, and would fire against a
-      // connection the caller has already closed.
-      clearSarTimer();
-      return bounded(bluetooth.disconnect(connection), `${stage}: disconnecting`);
-    },
-  };
+    });
+    // Taken hold of on a branch of its own rather than by chaining the
+    // awaited one: `adoptSubscription` must still run for a subscription
+    // that arrives AFTER `bounded` below has given up on it (that is the
+    // whole reason it exists), and chaining would also put an extra
+    // microtask between the platform's answer and this wait's own
+    // `clearTimeout` — which is enough to lose a race against a test clock.
+    void subscribing.then(adoptSubscription, () => {
+      // A rejected subscribe has nothing to adopt; `bounded` below is what
+      // reports it, and reporting it twice would be an unhandled rejection.
+    });
+    await bounded(subscribing, `${stage}: subscribing to notifications`);
+    return {
+      write: async (data: Buffer): Promise<void> => {
+        // Section 6.3.2.1 "Segmentation": the segments of one message are
+        // written in order, and nothing else goes out in between. This
+        // session is strictly request/response (`runProvisioningExchange`
+        // and `sendConfigRequest` both await each write), so there is no
+        // concurrent writer to interleave with.
+        for (const pdu of encodeProxyPdus(messageType, data, MAX_PROXY_PDU_LENGTH)) {
+          await bounded(bluetooth.write(dataIn.handle, pdu), `${stage}: writing to the node`);
+        }
+      },
+      next: (): Promise<Buffer> => bounded(channel.next(), `${stage} stalled`),
+      nextWithin: (timeoutMs: number): Promise<Buffer | null> => channel.nextWithin(clock, timeoutMs),
+      disconnect: (): Promise<void> => {
+        // Nothing of this session's own may outlive it: an un-cleared SAR
+        // timer would keep a real event loop alive, and would fire against a
+        // connection the caller has already closed, and an un-released
+        // notification subscription would have the platform deliver a LATER
+        // session's PDUs to this dead one's callback as well as to its own —
+        // the duplication that cost three bulbs (see `openSession`'s own
+        // "WHAT IT SUBSCRIBES, IT RELEASES" note).
+        //
+        // Both happen BEFORE the close is even attempted, and neither is
+        // conditional on it succeeding: `disconnectQuietly` swallows a failed
+        // or hung disconnect, so anything left to the success path would be
+        // left undone exactly when a link is misbehaving.
+        clearSarTimer();
+        releaseSubscription();
+        return bounded(bluetooth.disconnect(connection), `${stage}: disconnecting`);
+      },
+    };
+  } catch (err) {
+    abandon();
+    throw err;
+  }
 }
 
 /** Connects for the PROVISIONING phase (Mesh Provisioning Service). Every
@@ -925,41 +1013,139 @@ export type ConfigExchangeResult =
       readonly nodeWasReset: boolean;
     };
 
-/** Sends one device-key-secured Config message and waits for the (possibly
- *  segmented) reply, decoded all the way to an `AccessMessage`.
- *  `input.session` is already bounded end-to-end (see the module header's
- *  "The clock" note) — this function adds no bounding of its own. */
-async function sendConfigRequest(input: ConfigExchangeInput, accessPayload: Buffer): Promise<AccessMessage> {
-  const pdus = encodeMeshMessage({
-    accessPayload,
-    key: input.deviceKey,
-    keyKind: 'device',
-    src: input.ourAddress,
-    dst: input.nodeAddress,
-    netKey: input.netKey,
-    ivIndex: input.ivIndex,
-    // The one exchange in this app that genuinely IS point-to-point: this
-    // session holds its own GATT connection to the very node it is
-    // configuring, so there is nothing for a relay to do. See `message.ts`'s
-    // own TTL note for why this is now spelled out rather than defaulted.
-    ttl: POINT_TO_POINT_TTL,
-    allocateSeq: input.allocateSeq,
-  });
-  for (const pdu of pdus) await input.session.write(pdu);
+/**
+ * What one Config request came back with: the node's own answer TO THAT
+ * REQUEST, or a sentence saying why there was none.
+ *
+ * A failure is words rather than an exception because every caller below
+ * treats it identically — it is an ordinary configuration failure, the kind
+ * `failWithReset` already exists to report — and because the sentence can
+ * only be written here, where it is known what was asked, what was expected
+ * back, and what (if anything) arrived instead.
+ */
+type ConfigRequestOutcome =
+  | { readonly kind: 'replied'; readonly message: AccessMessage }
+  | { readonly kind: 'failed'; readonly message: string };
 
-  const receiveContext: MeshReceiveContext = {
-    key: input.deviceKey,
-    keyKind: 'device',
-    netKey: input.netKey,
-    ivIndex: input.ivIndex,
-    expectedSrc: input.nodeAddress,
-  };
-  let state: MeshReceiveState | undefined;
-  for (;;) {
-    const incoming = await input.session.next();
-    const result = acceptIncomingPdu(state, receiveContext, incoming);
-    if (result.kind === 'complete') return result.message;
-    state = result.state;
+/** Names one message that arrived while a different one was being waited
+ *  for — by its specification name where this project knows it, and by its
+ *  opcode where it does not (a node may send anything its models define). */
+function describeUnexpectedMessage(opcode: number): string {
+  return describeConfigOpcode(opcode) ?? `an unrecognised message (opcode 0x${opcode.toString(16)})`;
+}
+
+/**
+ * Turns "the wait ended without the reply we were waiting for" into the
+ * sentence the user reads — and, specifically, tells SILENCE apart from THE
+ * WRONG MESSAGE. "Did not answer" means the node said nothing; a node that
+ * said something else is reported as having said it. The hardware round of
+ * 2026-10-08 cost hours to exactly this conflation: three bulbs reported as
+ * never answering Config Model App Bind had in fact answered, and what the
+ * app had consumed as their answer was a duplicate of the PREVIOUS reply.
+ *
+ * `cause` is the underlying error that ended the wait (a stage timeout, a
+ * dropped link) and is always carried, because "the node said nothing" and
+ * "the link died before it could" look the same from here and are not the
+ * same problem.
+ */
+function describeConfigRequestFailure(
+  requestLabel: string,
+  statusName: string,
+  unexpected: ReadonlyArray<number>,
+  cause: string,
+): string {
+  if (unexpected.length === 0) {
+    return `node did not answer ${requestLabel} with a ${statusName} message (${cause})`;
+  }
+  const counts = new Map<number, number>();
+  for (const opcode of unexpected) counts.set(opcode, (counts.get(opcode) ?? 0) + 1);
+  const listed = [...counts.entries()]
+    .map(([opcode, count]) => (count === 1 ? describeUnexpectedMessage(opcode) : `${describeUnexpectedMessage(opcode)} (${count} times)`))
+    .join(', ');
+  return `node answered ${requestLabel} with ${listed} instead of a ${statusName} message (${cause})`;
+}
+
+/**
+ * Sends one device-key-secured Config message and waits for THE REPLY TO
+ * THAT MESSAGE, decoded all the way to an `AccessMessage`.
+ *
+ * ONLY THE EXPECTED STATUS SATISFIES THE WAIT (hardware round, 2026-10-08).
+ * This used to return the first PDU that decoded, whatever it was, which is
+ * not matching a reply to a request at all — see
+ * `lib/mesh/config/client.ts`'s own "WHICH STATUS ANSWERS WHICH REQUEST"
+ * section for what that cost and for the matching rule itself, which lives
+ * there (in the specification stack, where the opcodes are) and not here.
+ * Anything else that decodes cleanly — a duplicate of the previous reply, a
+ * retransmission, an unsolicited status — is DISCARDED and the wait
+ * continues, within the same deadline `input.session` already enforces: the
+ * same stance `createProbeTransport` below already takes for the capability
+ * probe, for the same reason.
+ *
+ * `detail` distinguishes repetitions of one request within a single
+ * exchange (which element, which model) in the message a failure produces.
+ *
+ * `input.session` is already bounded end-to-end (see the module header's
+ * "The clock" note) — this function adds no bounding of its own, it only
+ * reports what the bound ran out on.
+ */
+async function sendConfigRequest(input: ConfigExchangeInput, accessPayload: Buffer, detail?: string): Promise<ConfigRequestOutcome> {
+  const exchange = describeConfigExchange(accessPayload);
+  if (exchange === null) {
+    // Not reachable from this module: every call below passes one of
+    // `client.ts`'s own four `encodeConfig*` results. Thrown rather than
+    // reported as a node failure because it would be OUR bug, not the
+    // node's, and must never be dressed up as one.
+    throw new Error(`sendConfigRequest: ${accessPayload.toString('hex')} is not a Config request with a known status reply`);
+  }
+  const requestLabel = detail === undefined ? exchange.requestName : `${exchange.requestName} (${detail})`;
+  const unexpected: number[] = [];
+
+  try {
+    const pdus = encodeMeshMessage({
+      accessPayload,
+      key: input.deviceKey,
+      keyKind: 'device',
+      src: input.ourAddress,
+      dst: input.nodeAddress,
+      netKey: input.netKey,
+      ivIndex: input.ivIndex,
+      // The one exchange in this app that genuinely IS point-to-point: this
+      // session holds its own GATT connection to the very node it is
+      // configuring, so there is nothing for a relay to do. See `message.ts`'s
+      // own TTL note for why this is now spelled out rather than defaulted.
+      ttl: POINT_TO_POINT_TTL,
+      allocateSeq: input.allocateSeq,
+    });
+    for (const pdu of pdus) await input.session.write(pdu);
+
+    const receiveContext: MeshReceiveContext = {
+      key: input.deviceKey,
+      keyKind: 'device',
+      netKey: input.netKey,
+      ivIndex: input.ivIndex,
+      expectedSrc: input.nodeAddress,
+    };
+    let state: MeshReceiveState | undefined;
+    for (;;) {
+      const incoming = await input.session.next();
+      const result = acceptIncomingPdu(state, receiveContext, incoming);
+      if (result.kind !== 'complete') {
+        state = result.state;
+        continue;
+      }
+      // A completed message ends its own reassembly: the next PDU starts a
+      // fresh one, whether or not this message was the one being waited for.
+      state = undefined;
+      if (result.message.opcode === exchange.statusOpcode) {
+        return { kind: 'replied', message: result.message };
+      }
+      unexpected.push(result.message.opcode);
+    }
+  } catch (err) {
+    return {
+      kind: 'failed',
+      message: describeConfigRequestFailure(requestLabel, exchange.statusName, unexpected, errorMessage(err)),
+    };
   }
 }
 
@@ -990,10 +1176,16 @@ function toConfigStatus(message: AccessMessage): ReturnType<typeof decodeConfigS
  */
 async function attemptNodeReset(input: ConfigExchangeInput): Promise<{ readonly ok: true } | { readonly ok: false; readonly error: string }> {
   try {
-    const message = await sendConfigRequest(input, encodeConfigNodeReset());
-    const status = toConfigStatus(message);
+    const outcome = await sendConfigRequest(input, encodeConfigNodeReset());
+    if (outcome.kind === 'failed') {
+      return { ok: false, error: outcome.message };
+    }
+    const status = toConfigStatus(outcome.message);
     if (status === null || status.type !== 'nodeReset') {
-      return { ok: false, error: 'node did not answer Config Node Reset with a Node Reset Status message' };
+      // The opcode already matched (`sendConfigRequest` accepts nothing
+      // else), so this is a Config Node Reset Status this project cannot
+      // read — carrying parameters, where Table 4.136 defines none.
+      return { ok: false, error: "the node's Config Node Reset Status reply could not be decoded (Table 4.136 defines no parameters at all)" };
     }
     return { ok: true };
   } catch (err) {
@@ -1125,9 +1317,20 @@ async function runProbe(input: ConfigExchangeInput, composition: CompositionData
 export async function runConfigExchange(input: ConfigExchangeInput): Promise<ConfigExchangeResult> {
   let knownComposition: CompositionData | null = null;
   try {
-    const compositionReply = toConfigStatus(await sendConfigRequest(input, encodeConfigCompositionDataGet(0)));
+    const compositionOutcome = await sendConfigRequest(input, encodeConfigCompositionDataGet(0));
+    if (compositionOutcome.kind === 'failed') {
+      return await failWithReset(input, null, compositionOutcome.message);
+    }
+    const compositionReply = toConfigStatus(compositionOutcome.message);
     if (compositionReply === null || compositionReply.type !== 'compositionData') {
-      return await failWithReset(input, null, 'node did not answer Config Composition Data Get with a Composition Data Status message');
+      // The opcode matched, so this is a Composition Data Status whose own
+      // envelope is malformed — not a node that answered something else
+      // (`sendConfigRequest` never returns one) and not silence.
+      return await failWithReset(
+        input,
+        null,
+        "the node's Config Composition Data Status reply could not be decoded (its envelope is malformed or truncated)",
+      );
     }
     if (compositionReply.composition === null) {
       // See the module header's COMPOSITION DATA THAT DOES NOT PARSE note —
@@ -1148,14 +1351,20 @@ export async function runConfigExchange(input: ConfigExchangeInput): Promise<Con
     // header's "A NODE ENTRY IS WRITTEN THE MOMENT THE NODE IS OURS" note.
     input.onProvisioned(composition);
 
-    const appKeyReply = toConfigStatus(
-      await sendConfigRequest(
-        input,
-        encodeConfigAppKeyAdd({ netKeyIndex: input.netKeyIndex, appKeyIndex: input.appKeyIndex, appKey: input.appKey }),
-      ),
+    const appKeyOutcome = await sendConfigRequest(
+      input,
+      encodeConfigAppKeyAdd({ netKeyIndex: input.netKeyIndex, appKeyIndex: input.appKeyIndex, appKey: input.appKey }),
     );
+    if (appKeyOutcome.kind === 'failed') {
+      return await failWithReset(input, composition, appKeyOutcome.message);
+    }
+    const appKeyReply = toConfigStatus(appKeyOutcome.message);
     if (appKeyReply === null || appKeyReply.type !== 'appKey') {
-      return await failWithReset(input, composition, 'node did not answer Config AppKey Add with an AppKey Status message');
+      return await failWithReset(
+        input,
+        composition,
+        "the node's Config AppKey Status reply could not be decoded (Table 4.122's own fields are malformed or truncated)",
+      );
     }
     if (appKeyReply.status !== 0x00) {
       return await failWithReset(
@@ -1169,17 +1378,20 @@ export async function runConfigExchange(input: ConfigExchangeInput): Promise<Con
       for (const modelId of LIGHTING_SERVER_MODEL_IDS) {
         if (!element.sigModels.includes(modelId)) continue;
         const elementAddress = input.nodeAddress + elementIndex;
-        const bindReply = toConfigStatus(
-          await sendConfigRequest(
-            input,
-            encodeConfigModelAppBind({ elementAddress, appKeyIndex: input.appKeyIndex, modelIdentifier: modelId }),
-          ),
+        const bindOutcome = await sendConfigRequest(
+          input,
+          encodeConfigModelAppBind({ elementAddress, appKeyIndex: input.appKeyIndex, modelIdentifier: modelId }),
+          `element ${elementIndex}, model 0x${modelId.toString(16)}`,
         );
+        if (bindOutcome.kind === 'failed') {
+          return await failWithReset(input, composition, bindOutcome.message);
+        }
+        const bindReply = toConfigStatus(bindOutcome.message);
         if (bindReply === null || bindReply.type !== 'modelApp') {
           return await failWithReset(
             input,
             composition,
-            `node did not answer Config Model App Bind (element ${elementIndex}, model 0x${modelId.toString(16)}) with a Model App Status message`,
+            `the node's Config Model App Status reply for element ${elementIndex}, model 0x${modelId.toString(16)} could not be decoded (Table 4.130's own fields are malformed or truncated)`,
           );
         }
         if (bindReply.status !== 0x00) {

@@ -5,6 +5,8 @@ import {
   encodeConfigNodeReset,
   decodeConfigStatus,
   describeConfigStatus,
+  describeConfigExchange,
+  describeConfigOpcode,
 } from '../client';
 import {
   hex,
@@ -482,5 +484,96 @@ describe('opcode sanity (each message\'s own wire-level opcode octets)', () => {
   test('Config Node Reset Status: 0x804a -> wire `804a`', () => {
     expect(hex(CONFIG_NODE_RESET_STATUS_SAMPLE.message)).toEqual(hex('804a'));
     expect(CONFIG_OPCODES.nodeResetStatus).toBe(0x804a);
+  });
+});
+
+// ===========================================================================
+// WHICH STATUS ANSWERS WHICH REQUEST (hardware round, 2026-10-08). The one
+// table a Configuration Client needs in order to recognise its own reply
+// rather than accept whatever arrives first — see the module's own section
+// header for what accepting whatever arrives first cost.
+// ===========================================================================
+
+describe('describeConfigExchange', () => {
+  test('every one of this module\'s four requests names the status that answers it', () => {
+    expect(describeConfigExchange(encodeConfigCompositionDataGet(0))).toEqual({
+      requestOpcode: CONFIG_OPCODES.compositionDataGet,
+      requestName: 'Config Composition Data Get',
+      statusOpcode: CONFIG_OPCODES.compositionDataStatus,
+      statusName: 'Config Composition Data Status',
+    });
+    expect(
+      describeConfigExchange(
+        encodeConfigAppKeyAdd({ netKeyIndex: 0x456, appKeyIndex: 0x123, appKey: Buffer.alloc(16) }),
+      ),
+    ).toEqual({
+      requestOpcode: CONFIG_OPCODES.appKeyAdd,
+      requestName: 'Config AppKey Add',
+      statusOpcode: CONFIG_OPCODES.appKeyStatus,
+      statusName: 'Config AppKey Status',
+    });
+    expect(
+      describeConfigExchange(encodeConfigModelAppBind({ elementAddress: 0x0002, appKeyIndex: 0, modelIdentifier: 0x1000 })),
+    ).toEqual({
+      requestOpcode: CONFIG_OPCODES.modelAppBind,
+      requestName: 'Config Model App Bind',
+      statusOpcode: CONFIG_OPCODES.modelAppStatus,
+      statusName: 'Config Model App Status',
+    });
+    expect(describeConfigExchange(encodeConfigNodeReset())).toEqual({
+      requestOpcode: CONFIG_OPCODES.nodeReset,
+      requestName: 'Config Node Reset',
+      statusOpcode: CONFIG_OPCODES.nodeResetStatus,
+      statusName: 'Config Node Reset Status',
+    });
+  });
+
+  test('THE DISCRIMINATING ASSERTION: no request is mapped to another request\'s status', () => {
+    // A table with two entries swapped, or one entry pointing at its own
+    // request opcode, would pass "every request has an answer" and fail
+    // here: the four status opcodes must be four DIFFERENT values, none of
+    // them a request opcode.
+    const requests = [
+      encodeConfigCompositionDataGet(0),
+      encodeConfigAppKeyAdd({ netKeyIndex: 0, appKeyIndex: 0, appKey: Buffer.alloc(16) }),
+      encodeConfigModelAppBind({ elementAddress: 1, appKeyIndex: 0, modelIdentifier: 0x1000 }),
+      encodeConfigNodeReset(),
+    ].map((pdu) => describeConfigExchange(pdu));
+    const statusOpcodes = requests.map((r) => r?.statusOpcode);
+    const requestOpcodes = requests.map((r) => r?.requestOpcode);
+    expect(new Set(statusOpcodes).size).toBe(4);
+    expect(statusOpcodes.filter((opcode) => requestOpcodes.includes(opcode))).toEqual([]);
+  });
+
+  test('a STATUS message handed in where a request belongs is null, not matched against itself', () => {
+    // The caller error worth catching loudly: every status opcode below is
+    // one this module knows, and not one of them starts an exchange.
+    expect(describeConfigExchange(hex(CONFIG_APPKEY_STATUS_SAMPLE.message))).toBeNull();
+    expect(describeConfigExchange(hex(CONFIG_MODEL_APP_STATUS_SAMPLE.messageSigSuccess))).toBeNull();
+    expect(describeConfigExchange(hex(CONFIG_NODE_RESET_STATUS_SAMPLE.message))).toBeNull();
+  });
+
+  test('an opcode this module does not implement, and an undecodable PDU, are both null rather than a throw', () => {
+    expect(describeConfigExchange(Buffer.from([0x82, 0x02, 0x01, 0x00]))).toBeNull(); // Generic OnOff Set — a real opcode, not ours
+    expect(describeConfigExchange(Buffer.alloc(0))).toBeNull();
+    expect(describeConfigExchange(Buffer.from([0x7f]))).toBeNull(); // the reserved opcode decodeAccessMessage refuses
+  });
+});
+
+describe('describeConfigOpcode', () => {
+  test('names all eight of this module\'s messages', () => {
+    expect(describeConfigOpcode(CONFIG_OPCODES.compositionDataGet)).toBe('Config Composition Data Get');
+    expect(describeConfigOpcode(CONFIG_OPCODES.compositionDataStatus)).toBe('Config Composition Data Status');
+    expect(describeConfigOpcode(CONFIG_OPCODES.appKeyAdd)).toBe('Config AppKey Add');
+    expect(describeConfigOpcode(CONFIG_OPCODES.appKeyStatus)).toBe('Config AppKey Status');
+    expect(describeConfigOpcode(CONFIG_OPCODES.modelAppBind)).toBe('Config Model App Bind');
+    expect(describeConfigOpcode(CONFIG_OPCODES.modelAppStatus)).toBe('Config Model App Status');
+    expect(describeConfigOpcode(CONFIG_OPCODES.nodeReset)).toBe('Config Node Reset');
+    expect(describeConfigOpcode(CONFIG_OPCODES.nodeResetStatus)).toBe('Config Node Reset Status');
+  });
+
+  test('is null for an opcode this module does not implement — a node may send anything its models define', () => {
+    expect(describeConfigOpcode(0x8202)).toBeNull(); // Generic OnOff Set
+    expect(describeConfigOpcode(0x8201)).toBeNull(); // Generic OnOff Get
   });
 });

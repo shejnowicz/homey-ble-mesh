@@ -326,9 +326,36 @@ export class FakeBluetoothPort implements BluetoothPort {
    *  actually observed by anything. */
   readonly scanDurationsRequested: number[] = [];
   private scanCalls = 0;
+  private subscriptionsOpened = 0;
+  private subscriptionsReleased = 0;
 
   scanCallCount(): number {
     return this.scanCalls;
+  }
+
+  /**
+   * How many `Subscription`s this port has handed out whose `unsubscribe()`
+   * has never been called — the instrument for "what a caller subscribes, it
+   * releases", added for the hardware round of 2026-10-08 (three bulbs lost
+   * to notifications delivered once per leaked subscription; see
+   * `drivers/light/pairing.ts#openSession`).
+   *
+   * DELIBERATELY INDEPENDENT OF `disconnect()`. Dropping the link clears
+   * this fixture's notification callbacks, because a real link's
+   * notifications stop when it does — but that is the LINK letting go, not
+   * the caller, and counting it as a release would hide exactly the defect
+   * this counts: a `Subscription` the caller never released. So this number
+   * moves only when `unsubscribe()` is actually called.
+   */
+  liveSubscriptionCount(): number {
+    return this.subscriptionsOpened - this.subscriptionsReleased;
+  }
+
+  /** How many subscriptions were handed out in total — so a test asserting
+   *  `liveSubscriptionCount() === 0` can first prove there was something to
+   *  release, rather than passing because nothing ever subscribed. */
+  subscriptionCount(): number {
+    return this.subscriptionsOpened;
   }
 
   // --- Test configuration -------------------------------------------
@@ -755,8 +782,17 @@ export class FakeBluetoothPort implements BluetoothPort {
     }
     const key = notifyKey(handle.peripheralId, handle.characteristicUuid);
     this.notifyCallbacks.set(key, onNotify);
+    this.subscriptionsOpened += 1;
+    // Per SUBSCRIPTION, not per callback: a second `unsubscribe()` on the
+    // same object is a no-op in any sane implementation, and must not count
+    // as a second release (see `liveSubscriptionCount`).
+    let releasedThis = false;
     return {
       unsubscribe: (): void => {
+        if (!releasedThis) {
+          releasedThis = true;
+          this.subscriptionsReleased += 1;
+        }
         if (this.notifyCallbacks.get(key) === onNotify) {
           this.notifyCallbacks.delete(key);
         }

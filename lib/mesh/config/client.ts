@@ -109,6 +109,120 @@ const OPCODE_NODE_RESET = 0x8049;
 const OPCODE_NODE_RESET_STATUS = 0x804a;
 
 // ===========================================================================
+// WHICH STATUS ANSWERS WHICH REQUEST - the one place that mapping exists.
+//
+// WHY THIS TABLE EXISTS AT ALL (hardware round, 2026-10-08). A Configuration
+// Client that writes a request and then accepts the first thing that decodes
+// is not matching a reply to a request, it is guessing. Three bulbs were
+// lost to that guess: every notification was being delivered more than once
+// (a leaked GATT subscription, fixed in `drivers/light/pairing.ts`), so the
+// DUPLICATE of the previous request's Config AppKey Status was consumed as
+// the answer to Config Model App Bind, which then "did not answer" while its
+// real Model App Status was still in flight. Duplicates were this project's
+// own bug, but the guess was wrong independently of them: a mesh model may
+// publish a status message nobody asked for, and a node may retransmit one
+// it has already sent, so an unsolicited or repeated status is ORDINARY mesh
+// traffic rather than a malfunction. A client must be able to say "this is
+// not the message I am waiting for" and keep waiting.
+//
+// WHAT THE KEY IS, AND WHY. The opcode, and only the opcode. Each of this
+// module's four requests is answered by exactly one of its four status
+// messages - the four pairs this module's own header already names, each
+// with the field table it is defined by: Config Composition Data Get
+// (Section 4.3.2.4) -> Config Composition Data Status (4.3.2.5); Config
+// AppKey Add (4.3.2.37) -> Config AppKey Status (4.3.2.40); Config Model App
+// Bind (4.3.2.46) -> Config Model App Status (4.3.2.48); Config Node Reset
+// (4.3.2.53) -> Config Node Reset Status (4.3.2.54). The pairing exchange is
+// point-to-point over its own GATT link to the one node being configured,
+// and `packet/message.ts`'s own receive context already rejects anything not
+// sourced from that node and not secured under its device key - so opcode
+// equality is what remains to check.
+//
+// WHAT IT DELIBERATELY DOES NOT CHECK, so a reader does not assume it does.
+// The status messages echo fields of their request (Table 4.130's Model App
+// Status carries the ElementAddress and ModelIdentifier that were bound;
+// Table 4.122's AppKey Status carries the two key indexes), and this table
+// does NOT compare them. So a RETRANSMITTED Config Model App Status for
+// element 0 would still satisfy a pending bind for element 1 on a
+// multi-element node. Comparing the echoed fields would close that, and is
+// the obvious next step if it is ever observed - it is left out here only
+// because it would make this project reject a reply from any node that does
+// not echo faithfully, and nothing in this project has ever been run against
+// hardware that would prove it does. Config Composition Data Status's own
+// Page field is not compared either, and that one is not a judgement call at
+// all: a node that does not have the page it was asked for answers with a
+// page it does have, and says which in the Page field - which is precisely
+// why `ConfigCompositionDataStatus` reports `page` back to its caller rather
+// than asserting it. A Page that differs from the request is a correct
+// answer, so matching on it would reject correct answers.
+// ===========================================================================
+
+/** Every opcode this module knows, by its specification name - for messages
+ *  that name what actually arrived rather than a bare hex number. */
+const CONFIG_OPCODE_NAMES: ReadonlyMap<number, string> = new Map([
+  [OPCODE_COMPOSITION_DATA_GET, 'Config Composition Data Get'],
+  [OPCODE_COMPOSITION_DATA_STATUS, 'Config Composition Data Status'],
+  [OPCODE_APPKEY_ADD, 'Config AppKey Add'],
+  [OPCODE_APPKEY_STATUS, 'Config AppKey Status'],
+  [OPCODE_MODEL_APP_BIND, 'Config Model App Bind'],
+  [OPCODE_MODEL_APP_STATUS, 'Config Model App Status'],
+  [OPCODE_NODE_RESET, 'Config Node Reset'],
+  [OPCODE_NODE_RESET_STATUS, 'Config Node Reset Status'],
+]);
+
+/** The specification's own name for `opcode`, or `null` for an opcode this
+ *  module does not implement (a perfectly ordinary thing to be handed - a
+ *  node may send any message its models define). */
+export function describeConfigOpcode(opcode: number): string | null {
+  return CONFIG_OPCODE_NAMES.get(opcode) ?? null;
+}
+
+const STATUS_OPCODE_BY_REQUEST: ReadonlyMap<number, number> = new Map([
+  [OPCODE_COMPOSITION_DATA_GET, OPCODE_COMPOSITION_DATA_STATUS],
+  [OPCODE_APPKEY_ADD, OPCODE_APPKEY_STATUS],
+  [OPCODE_MODEL_APP_BIND, OPCODE_MODEL_APP_STATUS],
+  [OPCODE_NODE_RESET, OPCODE_NODE_RESET_STATUS],
+]);
+
+/** One request and the status message that answers it, both named - what a
+ *  caller needs to recognise its own reply and to say, in words, what it was
+ *  waiting for. */
+export interface ConfigExchangeDescription {
+  readonly requestOpcode: number;
+  readonly requestName: string;
+  readonly statusOpcode: number;
+  readonly statusName: string;
+}
+
+/**
+ * Describes the exchange a complete, encoded Config REQUEST PDU
+ * (Opcode||Parameters, as every `encodeConfig*` above returns) starts:
+ * which status opcode answers it, and both messages' names.
+ *
+ * `null` for anything that is not one of this module's four requests -
+ * including a status message passed in by mistake, which is the shape of
+ * caller error worth catching loudly rather than matching against itself.
+ * Only the opcode is read; the Parameters field is not inspected at all
+ * (see this section's own header for what is deliberately not compared).
+ */
+export function describeConfigExchange(requestPdu: Buffer): ConfigExchangeDescription | null {
+  const message = decodeAccessMessage(requestPdu);
+  if (message === null) {
+    return null;
+  }
+  const statusOpcode = STATUS_OPCODE_BY_REQUEST.get(message.opcode);
+  if (statusOpcode === undefined) {
+    return null;
+  }
+  return {
+    requestOpcode: message.opcode,
+    requestName: CONFIG_OPCODE_NAMES.get(message.opcode) as string,
+    statusOpcode,
+    statusName: CONFIG_OPCODE_NAMES.get(statusOpcode) as string,
+  };
+}
+
+// ===========================================================================
 // Field widths and protocol-constant values.
 // ===========================================================================
 
