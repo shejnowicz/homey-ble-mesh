@@ -80,7 +80,6 @@ sending true Kelvin values moves the colour barely at all.
 ## 4. Publication steps
 
 ```
-cd ~/projects/homey-ble-mesh
 npx homey app validate --level publish     # already green as of 2026-10-08
 npx homey app publish                      # prompts for version bump + changelog
 ```
@@ -115,10 +114,18 @@ explicit description is the mechanism.
    a real publish produces. The drafted Athom support ticket is no longer needed.
    **There is now no external blocker — only our own work in section 3.**
 
-## 6. Open for the owner
+## 6. Owner decisions, 2026-10-08
 
-- Publish under the current `0.1.0`, or bump to `0.2.0` to mark the first public build?
-- Does the app keep the name "BLE Mesh", or something that signals the narrow scope,
-  such as "BLE Mesh Lights"?
-- A support URL for the store listing: the GitHub repository is private. Publish it,
-  or point support at an email address?
+- **Version:** publish as `0.1.0`.
+- **Name:** stays "BLE Mesh".
+- **Support URL:** the repository is public — https://github.com/shejnowicz/homey-ble-mesh —
+  and serves as the support address for the store listing. Audited before publication:
+  no credentials, keys, tokens, e-mail addresses, LAN addresses or MAC addresses in the
+  working tree or in any of the 791 blobs of history; every 16-byte key in the codebase
+  is a published Bluetooth SIG sample transcribed into a `vectors.ts`, and the one other
+  long hex string is the SHA-256 of a public SIG PDF, recorded as provenance.
+
+## 7. Still open
+
+- The multi-node portability check (risk 3) — needs bulbs powered and paired.
+- Several days of stability evidence before submitting the Test release.
