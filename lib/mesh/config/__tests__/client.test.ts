@@ -8,6 +8,7 @@ import {
   describeConfigExchange,
   describeConfigOpcode,
 } from '../client';
+import type { AccessMessage } from '../../packet/access';
 import {
   hex,
   COMPOSITION_DATA_PAGE0_SAMPLE,
@@ -496,7 +497,7 @@ describe('opcode sanity (each message\'s own wire-level opcode octets)', () => {
 
 describe('describeConfigExchange', () => {
   test('every one of this module\'s four requests names the status that answers it', () => {
-    expect(describeConfigExchange(encodeConfigCompositionDataGet(0))).toEqual({
+    expect(describeConfigExchange(encodeConfigCompositionDataGet(0))).toMatchObject({
       requestOpcode: CONFIG_OPCODES.compositionDataGet,
       requestName: 'Config Composition Data Get',
       statusOpcode: CONFIG_OPCODES.compositionDataStatus,
@@ -506,7 +507,7 @@ describe('describeConfigExchange', () => {
       describeConfigExchange(
         encodeConfigAppKeyAdd({ netKeyIndex: 0x456, appKeyIndex: 0x123, appKey: Buffer.alloc(16) }),
       ),
-    ).toEqual({
+    ).toMatchObject({
       requestOpcode: CONFIG_OPCODES.appKeyAdd,
       requestName: 'Config AppKey Add',
       statusOpcode: CONFIG_OPCODES.appKeyStatus,
@@ -514,13 +515,13 @@ describe('describeConfigExchange', () => {
     });
     expect(
       describeConfigExchange(encodeConfigModelAppBind({ elementAddress: 0x0002, appKeyIndex: 0, modelIdentifier: 0x1000 })),
-    ).toEqual({
+    ).toMatchObject({
       requestOpcode: CONFIG_OPCODES.modelAppBind,
       requestName: 'Config Model App Bind',
       statusOpcode: CONFIG_OPCODES.modelAppStatus,
       statusName: 'Config Model App Status',
     });
-    expect(describeConfigExchange(encodeConfigNodeReset())).toEqual({
+    expect(describeConfigExchange(encodeConfigNodeReset())).toMatchObject({
       requestOpcode: CONFIG_OPCODES.nodeReset,
       requestName: 'Config Node Reset',
       statusOpcode: CONFIG_OPCODES.nodeResetStatus,
@@ -575,5 +576,123 @@ describe('describeConfigOpcode', () => {
   test('is null for an opcode this module does not implement — a node may send anything its models define', () => {
     expect(describeConfigOpcode(0x8202)).toBeNull(); // Generic OnOff Set
     expect(describeConfigOpcode(0x8201)).toBeNull(); // Generic OnOff Get
+  });
+});
+
+// ===========================================================================
+// WHICH INSTANCE OF A REQUEST A STATUS ANSWERS (owner-approved, 2026-10-08).
+// The opcode says which KIND of message arrived; the fields the status
+// echoes back say which REQUEST it answers. See the module's own section
+// header for why the first key alone was not enough.
+// ===========================================================================
+
+/** Builds the incoming message `matchStatus` is handed, without going
+ *  through an encode/decode round trip that would hide a malformed one. */
+function status(opcode: number, parameters: number[]): AccessMessage {
+  return { opcode, parameters: Buffer.from(parameters) };
+}
+
+/** Table 4.130: Status (1) || ElementAddress (2) || AppKeyIndex (2) ||
+ *  ModelIdentifier (2 or 4), little-endian. */
+function modelAppStatus(elementAddress: number, modelIdOctets: number[], statusCode = 0x00): AccessMessage {
+  return status(CONFIG_OPCODES.modelAppStatus, [
+    statusCode,
+    elementAddress & 0xff,
+    (elementAddress >> 8) & 0xff,
+    0x00,
+    0x00,
+    ...modelIdOctets,
+  ]);
+}
+
+describe('ConfigExchangeDescription#matchStatus', () => {
+  const bindElement3 = describeConfigExchange(
+    encodeConfigModelAppBind({ elementAddress: 0x0003, appKeyIndex: 0, modelIdentifier: 0x1000 }),
+  ) as NonNullable<ReturnType<typeof describeConfigExchange>>;
+
+  test('a Config Model App Status echoing the element and model that were bound IS the answer', () => {
+    expect(bindElement3.matchStatus(modelAppStatus(0x0003, [0x00, 0x10]))).toEqual({ kind: 'answer' });
+  });
+
+  test('THE MOTIVATING CASE: a Config Model App Status for a DIFFERENT element is not the answer, and says so', () => {
+    // A retransmitted status for element 0 arriving while element 1's own
+    // bind is outstanding. Under opcode matching alone this satisfied the
+    // wait and the app recorded a binding the node never made.
+    const match = bindElement3.matchStatus(modelAppStatus(0x0002, [0x00, 0x10]));
+    expect(match.kind).toBe('other');
+    if (match.kind !== 'other') return;
+    expect(match.description).toBe(
+      'a Config Model App Status for element address 0x2, model 0x1000 - this request bound element address 0x3, model 0x1000',
+    );
+  });
+
+  test('a Config Model App Status for a different MODEL on the right element is not the answer either', () => {
+    const match = bindElement3.matchStatus(modelAppStatus(0x0003, [0x00, 0x13])); // 0x1300, Light Lightness Server
+    expect(match.kind).toBe('other');
+    if (match.kind !== 'other') return;
+    expect(match.description).toContain('model 0x1300');
+    expect(match.description).toContain('this request bound element address 0x3, model 0x1000');
+  });
+
+  test('a VENDOR model identifier is not mistaken for the SIG model of the same low octets', () => {
+    // 4 octets (Company 0x0000, Vendor Model 0x1000) against a request that
+    // bound the 2-octet SIG model 0x1000 — different fields, different
+    // widths, and a raw-octet comparison is what keeps them apart.
+    const match = bindElement3.matchStatus(modelAppStatus(0x0003, [0x00, 0x00, 0x00, 0x10]));
+    expect(match.kind).toBe('other');
+    if (match.kind !== 'other') return;
+    expect(match.description).toContain('model 0x0:0x1000');
+  });
+
+  test('a Config Model App Status whose Parameters are the wrong length is PASSED THROUGH as the answer, not discarded', () => {
+    // It cannot be shown to belong to another request, and the caller's own
+    // "this reply could not be decoded" is a better answer now than a
+    // thirty-second wait for a reply that already arrived.
+    expect(bindElement3.matchStatus(status(CONFIG_OPCODES.modelAppStatus, [0x00, 0x03]))).toEqual({ kind: 'answer' });
+  });
+
+  const appKeyAdd = describeConfigExchange(
+    encodeConfigAppKeyAdd({ netKeyIndex: 0x456, appKeyIndex: 0x123, appKey: Buffer.alloc(16) }),
+  ) as NonNullable<ReturnType<typeof describeConfigExchange>>;
+
+  test('a Config AppKey Status echoing the key indexes that were added IS the answer', () => {
+    // Figure 4.4 packing of NetKeyIndex=0x456, AppKeyIndex=0x123 — the
+    // specification's own Section 8.3.6 bytes, `56 34 12`.
+    expect(appKeyAdd.matchStatus(status(CONFIG_OPCODES.appKeyStatus, [0x00, 0x56, 0x34, 0x12]))).toEqual({ kind: 'answer' });
+  });
+
+  test('a Config AppKey Status echoing DIFFERENT key indexes is not the answer, and says which', () => {
+    const match = appKeyAdd.matchStatus(status(CONFIG_OPCODES.appKeyStatus, [0x00, 0x00, 0x00, 0x00]));
+    expect(match.kind).toBe('other');
+    if (match.kind !== 'other') return;
+    expect(match.description).toBe(
+      'a Config AppKey Status for NetKey index 0x0, AppKey index 0x0 - this request added AppKey index 0x123 under NetKey index 0x456',
+    );
+  });
+
+  const compositionGet = describeConfigExchange(encodeConfigCompositionDataGet(0)) as NonNullable<
+    ReturnType<typeof describeConfigExchange>
+  >;
+
+  test('a Config Composition Data Status for a DIFFERENT PAGE is still the answer — Page is deliberately not matched', () => {
+    // A node that does not have the page it was asked for answers with one
+    // it does have and says which; matching on Page would reject it.
+    expect(compositionGet.matchStatus(status(CONFIG_OPCODES.compositionDataStatus, [0x07, 0x00]))).toEqual({ kind: 'answer' });
+  });
+
+  const nodeReset = describeConfigExchange(encodeConfigNodeReset()) as NonNullable<ReturnType<typeof describeConfigExchange>>;
+
+  test('a Config Node Reset Status is the answer on its opcode alone — neither message has a field to echo', () => {
+    expect(nodeReset.matchStatus(status(CONFIG_OPCODES.nodeResetStatus, []))).toEqual({ kind: 'answer' });
+  });
+
+  test('a message of another KIND is named by its own name, whichever request is waiting', () => {
+    const match = bindElement3.matchStatus(status(CONFIG_OPCODES.appKeyStatus, [0x00, 0x00, 0x00, 0x00]));
+    expect(match).toEqual({ kind: 'other', description: 'Config AppKey Status' });
+  });
+
+  test('a message this module does not implement is named by its opcode, never silently accepted', () => {
+    const match = nodeReset.matchStatus(status(0x8204, [0x01])); // Generic OnOff Status
+    expect(match).toEqual({ kind: 'other', description: 'an unrecognised message (opcode 0x8204)' });
   });
 });

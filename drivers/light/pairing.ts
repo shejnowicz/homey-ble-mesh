@@ -49,7 +49,6 @@ import {
   encodeConfigNodeReset,
   decodeConfigStatus,
   describeConfigExchange,
-  describeConfigOpcode,
 } from '../../lib/mesh/config/client';
 import { encodeAccessMessage, type AccessMessage } from '../../lib/mesh/packet/access';
 import { k4 } from '../../lib/mesh/crypto/derive';
@@ -1027,13 +1026,6 @@ type ConfigRequestOutcome =
   | { readonly kind: 'replied'; readonly message: AccessMessage }
   | { readonly kind: 'failed'; readonly message: string };
 
-/** Names one message that arrived while a different one was being waited
- *  for — by its specification name where this project knows it, and by its
- *  opcode where it does not (a node may send anything its models define). */
-function describeUnexpectedMessage(opcode: number): string {
-  return describeConfigOpcode(opcode) ?? `an unrecognised message (opcode 0x${opcode.toString(16)})`;
-}
-
 /**
  * Turns "the wait ended without the reply we were waiting for" into the
  * sentence the user reads — and, specifically, tells SILENCE apart from THE
@@ -1047,20 +1039,26 @@ function describeUnexpectedMessage(opcode: number): string {
  * dropped link) and is always carried, because "the node said nothing" and
  * "the link died before it could" look the same from here and are not the
  * same problem.
+ *
+ * `unexpected` holds what `client.ts`'s own matcher called each discarded
+ * message — already in words, because only that module knows why a message
+ * failed to match (a different kind of message, or the right kind answering
+ * a different element or key index). Repeats are counted rather than
+ * repeated: a status arriving three times is the symptom worth seeing.
  */
 function describeConfigRequestFailure(
   requestLabel: string,
   statusName: string,
-  unexpected: ReadonlyArray<number>,
+  unexpected: ReadonlyArray<string>,
   cause: string,
 ): string {
   if (unexpected.length === 0) {
     return `node did not answer ${requestLabel} with a ${statusName} message (${cause})`;
   }
-  const counts = new Map<number, number>();
-  for (const opcode of unexpected) counts.set(opcode, (counts.get(opcode) ?? 0) + 1);
+  const counts = new Map<string, number>();
+  for (const description of unexpected) counts.set(description, (counts.get(description) ?? 0) + 1);
   const listed = [...counts.entries()]
-    .map(([opcode, count]) => (count === 1 ? describeUnexpectedMessage(opcode) : `${describeUnexpectedMessage(opcode)} (${count} times)`))
+    .map(([description, count]) => (count === 1 ? description : `${description} (${count} times)`))
     .join(', ');
   return `node answered ${requestLabel} with ${listed} instead of a ${statusName} message (${cause})`;
 }
@@ -1098,7 +1096,7 @@ async function sendConfigRequest(input: ConfigExchangeInput, accessPayload: Buff
     throw new Error(`sendConfigRequest: ${accessPayload.toString('hex')} is not a Config request with a known status reply`);
   }
   const requestLabel = detail === undefined ? exchange.requestName : `${exchange.requestName} (${detail})`;
-  const unexpected: number[] = [];
+  const unexpected: string[] = [];
 
   try {
     const pdus = encodeMeshMessage({
@@ -1136,10 +1134,11 @@ async function sendConfigRequest(input: ConfigExchangeInput, accessPayload: Buff
       // A completed message ends its own reassembly: the next PDU starts a
       // fresh one, whether or not this message was the one being waited for.
       state = undefined;
-      if (result.message.opcode === exchange.statusOpcode) {
+      const match = exchange.matchStatus(result.message);
+      if (match.kind === 'answer') {
         return { kind: 'replied', message: result.message };
       }
-      unexpected.push(result.message.opcode);
+      unexpected.push(match.description);
     }
   } catch (err) {
     return {

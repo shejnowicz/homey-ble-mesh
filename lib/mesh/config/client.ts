@@ -1,5 +1,5 @@
 import { assertRange } from '../packet/ranges';
-import { encodeAccessMessage, decodeAccessMessage } from '../packet/access';
+import { encodeAccessMessage, decodeAccessMessage, type AccessMessage } from '../packet/access';
 import { parseCompositionData, CompositionData, VendorModelId } from './composition';
 
 /**
@@ -109,7 +109,7 @@ const OPCODE_NODE_RESET = 0x8049;
 const OPCODE_NODE_RESET_STATUS = 0x804a;
 
 // ===========================================================================
-// WHICH STATUS ANSWERS WHICH REQUEST - the one place that mapping exists.
+// WHICH STATUS ANSWERS WHICH REQUEST - the one place that rule exists.
 //
 // WHY THIS TABLE EXISTS AT ALL (hardware round, 2026-10-08). A Configuration
 // Client that writes a request and then accepts the first thing that decodes
@@ -125,38 +125,51 @@ const OPCODE_NODE_RESET_STATUS = 0x804a;
 // traffic rather than a malfunction. A client must be able to say "this is
 // not the message I am waiting for" and keep waiting.
 //
-// WHAT THE KEY IS, AND WHY. The opcode, and only the opcode. Each of this
-// module's four requests is answered by exactly one of its four status
-// messages - the four pairs this module's own header already names, each
-// with the field table it is defined by: Config Composition Data Get
-// (Section 4.3.2.4) -> Config Composition Data Status (4.3.2.5); Config
-// AppKey Add (4.3.2.37) -> Config AppKey Status (4.3.2.40); Config Model App
-// Bind (4.3.2.46) -> Config Model App Status (4.3.2.48); Config Node Reset
-// (4.3.2.53) -> Config Node Reset Status (4.3.2.54). The pairing exchange is
-// point-to-point over its own GATT link to the one node being configured,
-// and `packet/message.ts`'s own receive context already rejects anything not
-// sourced from that node and not secured under its device key - so opcode
-// equality is what remains to check.
+// THE FIRST KEY IS THE OPCODE. Each of this module's four requests is
+// answered by exactly one of its four status messages - the four pairs this
+// module's own header already names, each with the field table it is defined
+// by: Config Composition Data Get (Section 4.3.2.4) -> Config Composition
+// Data Status (4.3.2.5); Config AppKey Add (4.3.2.37) -> Config AppKey
+// Status (4.3.2.40); Config Model App Bind (4.3.2.46) -> Config Model App
+// Status (4.3.2.48); Config Node Reset (4.3.2.53) -> Config Node Reset
+// Status (4.3.2.54). The pairing exchange is point-to-point over its own
+// GATT link to the one node being configured, and `packet/message.ts`'s own
+// receive context already rejects anything not sourced from that node and
+// not secured under its device key.
 //
-// WHAT IT DELIBERATELY DOES NOT CHECK, so a reader does not assume it does.
-// The status messages echo fields of their request (Table 4.130's Model App
-// Status carries the ElementAddress and ModelIdentifier that were bound;
-// Table 4.122's AppKey Status carries the two key indexes), and this table
-// does NOT compare them. So a RETRANSMITTED Config Model App Status for
-// element 0 would still satisfy a pending bind for element 1 on a
-// multi-element node. Comparing the echoed fields would close that, and is
-// the obvious next step if it is ever observed - it is left out here only
-// because it would make this project reject a reply from any node that does
-// not echo faithfully, and nothing in this project has ever been run against
-// hardware that would prove it does. Config Composition Data Status's own
-// Page field is not compared either, and that one is not a judgement call at
-// all: a node that does not have the page it was asked for answers with a
-// page it does have, and says which in the Page field - which is precisely
-// why `ConfigCompositionDataStatus` reports `page` back to its caller rather
-// than asserting it. A Page that differs from the request is a correct
-// answer, so matching on it would reject correct answers.
+// THE SECOND KEY IS WHAT THE STATUS ECHOES BACK (owner-approved, 2026-10-08,
+// after the first version of this table shipped with opcode matching alone
+// and disclosed this as its own residual risk). The opcode says WHICH KIND
+// of message arrived; it cannot say which INSTANCE of a repeated request it
+// answers. This project binds one model per element and walks a node's
+// elements in a loop, so under opcode matching alone a retransmitted Config
+// Model App Status for element 0 still satisfies the pending bind for
+// element 1 - and the app records a binding that was never made. That is the
+// same defect as the one above, one step removed, and a silently wrong bind
+// is worse than a visible timeout. So each rule below may also compare the
+// fields the specification has the status carry back from its request:
+//
+//   - Config Model App Status: ElementAddress and ModelIdentifier
+//     (Table 4.130, echoed from Table 4.128). AppKeyIndex is echoed too and
+//     is deliberately not compared - see `matchModelAppEcho`.
+//   - Config AppKey Status: NetKeyIndex and AppKeyIndex (Table 4.122,
+//     echoed from Table 4.119).
+//   - Config Composition Data Status: NOTHING, and its Page field in
+//     particular must not be compared - see the rule's own comment.
+//   - Config Node Reset Status: nothing exists to compare.
+//
+// THE COST, ACCEPTED KNOWINGLY: a node that does not echo faithfully is no
+// longer pairable - its reply is discarded and the request waits out its
+// deadline. The owner chose that outcome over a bind this app believes in
+// and the node never made; the failure names the mismatch, so a node that
+// behaves this way says so in one sentence rather than being diagnosed.
+//
+// WHAT A RULE NEVER DOES is reject a status it merely cannot READ. A status
+// whose Parameters are the wrong length cannot be shown to belong to another
+// request either, so it is passed through as this request's answer and the
+// caller reports it as a reply that could not be decoded - immediately,
+// rather than after a thirty-second wait for a reply that already arrived.
 // ===========================================================================
-
 /** Every opcode this module knows, by its specification name - for messages
  *  that name what actually arrived rather than a bare hex number. */
 const CONFIG_OPCODE_NAMES: ReadonlyMap<number, string> = new Map([
@@ -177,48 +190,175 @@ export function describeConfigOpcode(opcode: number): string | null {
   return CONFIG_OPCODE_NAMES.get(opcode) ?? null;
 }
 
-const STATUS_OPCODE_BY_REQUEST: ReadonlyMap<number, number> = new Map([
-  [OPCODE_COMPOSITION_DATA_GET, OPCODE_COMPOSITION_DATA_STATUS],
-  [OPCODE_APPKEY_ADD, OPCODE_APPKEY_STATUS],
-  [OPCODE_MODEL_APP_BIND, OPCODE_MODEL_APP_STATUS],
-  [OPCODE_NODE_RESET, OPCODE_NODE_RESET_STATUS],
+/**
+ * How one request's status is told from any other message that arrives
+ * while it is being waited for.
+ *
+ * `'answer'` means: this IS the reply to the request it was matched
+ * against. `'other'` means it provably is not, and `description` says what
+ * it was instead, in the words a failure message uses.
+ */
+export type ConfigStatusMatch =
+  | { readonly kind: 'answer' }
+  | { readonly kind: 'other'; readonly description: string };
+
+/**
+ * One request, the status that answers it, and - where the specification
+ * gives one - the ECHOED FIELDS that say WHICH instance of that request a
+ * status answers. `matchEcho` returns `null` when the status belongs to this
+ * request (or when nothing can be told either way, see below), and a reason
+ * phrase when it provably belongs to a different one.
+ */
+interface ConfigExchangeRule {
+  readonly statusOpcode: number;
+  readonly matchEcho?: (requestParameters: Buffer, statusParameters: Buffer) => string | null;
+}
+
+/**
+ * Table 4.130's Config Model App Status echoes the ElementAddress and
+ * ModelIdentifier of the Table 4.128 Config Model App Bind it answers. This
+ * project binds one model per element and walks the node's elements in a
+ * loop, so without this comparison a RETRANSMITTED status for element 0
+ * satisfies the pending bind for element 1 and the app records a binding
+ * that was never made - the same class of defect as the one that cost three
+ * bulbs on 2026-10-08, one step removed.
+ *
+ * APPKEYINDEX IS ECHOED TOO AND IS DELIBERATELY NOT COMPARED. It would
+ * discriminate nothing here (this project has exactly one application key,
+ * at index 0, so every bind in every exchange carries the same value) while
+ * adding one more field a node has to echo faithfully to be paired at all.
+ * The two compared below are the two that actually tell one bind from
+ * another.
+ *
+ * `null` WHEN THE FIELDS CANNOT BE READ, not `'this is not it'`: a status
+ * whose Parameters are the wrong length cannot be shown to belong to
+ * another request either, and turning "the reply is malformed" into a
+ * thirty-second wait for a reply that already arrived would be a worse
+ * answer than the immediate, accurate "this reply could not be decoded" the
+ * caller already reports. Lengths: Table 4.128's Parameters are
+ * ElementAddress (2) || AppKeyIndex (2) || ModelIdentifier (2 or 4), and
+ * Table 4.130's are those three behind a Status (1).
+ */
+function matchModelAppEcho(request: Buffer, status: Buffer): string | null {
+  if (request.length !== 6 && request.length !== 8) return null;
+  if (status.length !== 7 && status.length !== 9) return null;
+
+  const requestElement = request.readUInt16LE(0);
+  const statusElement = status.readUInt16LE(1);
+  const requestModel = request.subarray(4);
+  const statusModel = status.subarray(5);
+  // Compared as raw octets rather than as decoded numbers so the SIG (2
+  // octets) and Vendor (4 octets) forms are compared with each other
+  // correctly: a status carrying the other form is a different model, and a
+  // length difference alone already says so.
+  if (requestElement === statusElement && requestModel.equals(statusModel)) return null;
+
+  return `for element address 0x${statusElement.toString(16)}, model ${formatModelIdentifierOctets(statusModel)} - this request bound element address 0x${requestElement.toString(16)}, model ${formatModelIdentifierOctets(requestModel)}`;
+}
+
+/** The ModelIdentifier field as it appears on the wire, for a message that
+ *  has to name it without assuming it is well-formed. */
+function formatModelIdentifierOctets(octets: Buffer): string {
+  const decoded = decodeModelIdentifier(octets);
+  if (decoded === null) return `0x${octets.toString('hex')}`;
+  if (isVendorModelId(decoded)) {
+    return `0x${decoded.companyId.toString(16)}:0x${decoded.modelId.toString(16)}`;
+  }
+  return `0x${decoded.toString(16)}`;
+}
+
+/**
+ * Table 4.122's Config AppKey Status echoes the NetKeyIndex and AppKeyIndex
+ * of the Table 4.119 Config AppKey Add it answers, in the same Figure 4.4
+ * packing. Compared by unpacking both rather than by comparing the three
+ * octets, so the message can name the indexes the way the rest of this
+ * module does.
+ *
+ * Lengths: Table 4.119's Parameters are NetKeyIndexAndAppKeyIndex (3) ||
+ * AppKey (16); Table 4.122's are Status (1) || NetKeyIndexAndAppKeyIndex
+ * (3). Unreadable means `null`, for the reason `matchModelAppEcho` gives.
+ */
+function matchAppKeyEcho(request: Buffer, status: Buffer): string | null {
+  if (request.length !== 3 + APP_KEY_LENGTH) return null;
+  if (status.length !== 4) return null;
+
+  const asked = unpackTwoKeyIndexes(request, 0);
+  const answered = unpackTwoKeyIndexes(status, 1);
+  if (asked.first === answered.first && asked.second === answered.second) return null;
+
+  return `for NetKey index 0x${answered.first.toString(16)}, AppKey index 0x${answered.second.toString(16)} - this request added AppKey index 0x${asked.second.toString(16)} under NetKey index 0x${asked.first.toString(16)}`;
+}
+
+const EXCHANGE_RULES: ReadonlyMap<number, ConfigExchangeRule> = new Map([
+  // Config Composition Data Get -> Config Composition Data Status: OPCODE
+  // ONLY, and the Page field must NOT be compared. A node that does not have
+  // the page it was asked for answers with a page it does have, and says
+  // which in the Page field - which is why `ConfigCompositionDataStatus`
+  // reports `page` back to its caller rather than asserting it. Matching on
+  // Page would reject correct answers. Nothing else in Table 4.87 is echoed
+  // from Table 4.86 at all.
+  [OPCODE_COMPOSITION_DATA_GET, { statusOpcode: OPCODE_COMPOSITION_DATA_STATUS }],
+  [OPCODE_APPKEY_ADD, { statusOpcode: OPCODE_APPKEY_STATUS, matchEcho: matchAppKeyEcho }],
+  [OPCODE_MODEL_APP_BIND, { statusOpcode: OPCODE_MODEL_APP_STATUS, matchEcho: matchModelAppEcho }],
+  // Config Node Reset -> Config Node Reset Status: nothing to compare.
+  // Table 4.135 gives the request no parameters and Table 4.136 gives the
+  // status none either, so the opcode is the whole of what there is.
+  [OPCODE_NODE_RESET, { statusOpcode: OPCODE_NODE_RESET_STATUS }],
 ]);
 
-/** One request and the status message that answers it, both named - what a
- *  caller needs to recognise its own reply and to say, in words, what it was
- *  waiting for. */
+/** One request and the status message that answers it, both named, plus the
+ *  test for whether a given incoming message IS that answer - what a caller
+ *  needs to recognise its own reply and to say, in words, what it was
+ *  waiting for and what turned up instead. */
 export interface ConfigExchangeDescription {
   readonly requestOpcode: number;
   readonly requestName: string;
   readonly statusOpcode: number;
   readonly statusName: string;
+  /** Whether `status` is the answer to THE REQUEST THIS DESCRIPTION WAS
+   *  BUILT FROM - opcode first, then that request's own echoed fields. */
+  matchStatus(status: AccessMessage): ConfigStatusMatch;
 }
 
 /**
  * Describes the exchange a complete, encoded Config REQUEST PDU
- * (Opcode||Parameters, as every `encodeConfig*` above returns) starts:
- * which status opcode answers it, and both messages' names.
+ * (Opcode||Parameters, as every `encodeConfig*` above returns) starts: which
+ * status opcode answers it, both messages' names, and `matchStatus`, which
+ * recognises that request's own reply.
  *
  * `null` for anything that is not one of this module's four requests -
  * including a status message passed in by mistake, which is the shape of
  * caller error worth catching loudly rather than matching against itself.
- * Only the opcode is read; the Parameters field is not inspected at all
- * (see this section's own header for what is deliberately not compared).
  */
 export function describeConfigExchange(requestPdu: Buffer): ConfigExchangeDescription | null {
-  const message = decodeAccessMessage(requestPdu);
-  if (message === null) {
+  const request = decodeAccessMessage(requestPdu);
+  if (request === null) {
     return null;
   }
-  const statusOpcode = STATUS_OPCODE_BY_REQUEST.get(message.opcode);
-  if (statusOpcode === undefined) {
+  const rule = EXCHANGE_RULES.get(request.opcode);
+  if (rule === undefined) {
     return null;
   }
+  const statusName = CONFIG_OPCODE_NAMES.get(rule.statusOpcode) as string;
   return {
-    requestOpcode: message.opcode,
-    requestName: CONFIG_OPCODE_NAMES.get(message.opcode) as string,
-    statusOpcode,
-    statusName: CONFIG_OPCODE_NAMES.get(statusOpcode) as string,
+    requestOpcode: request.opcode,
+    requestName: CONFIG_OPCODE_NAMES.get(request.opcode) as string,
+    statusOpcode: rule.statusOpcode,
+    statusName,
+    matchStatus: (status: AccessMessage): ConfigStatusMatch => {
+      if (status.opcode !== rule.statusOpcode) {
+        const name = CONFIG_OPCODE_NAMES.get(status.opcode);
+        return {
+          kind: 'other',
+          description: name ?? `an unrecognised message (opcode 0x${status.opcode.toString(16)})`,
+        };
+      }
+      const mismatch = rule.matchEcho?.(request.parameters, status.parameters) ?? null;
+      if (mismatch !== null) {
+        return { kind: 'other', description: `a ${statusName} ${mismatch}` };
+      }
+      return { kind: 'answer' };
+    },
   };
 }
 

@@ -279,6 +279,17 @@ interface ConfigResponderOptions {
    *  REFUSAL is an answer, and the bulb that was lost never answered at
    *  all. Default false (answers with `modelAppStatus`). */
   readonly silentModelAppBind?: boolean;
+  /** When true, EVERY Config Model App Status echoes element 0's own address
+   *  (the node's base unicast address), whatever element was actually bound —
+   *  a node whose status for one element answers the bind of another, which
+   *  is what a retransmission of the previous element's status looks like on
+   *  a multi-element node. Table 4.130 says a conformant node echoes the
+   *  ElementAddress it was given; this models one that does not. */
+  readonly bindStatusEchoesFirstElement?: boolean;
+  /** When true, every Config AppKey Status echoes NetKey index 7 / AppKey
+   *  index 9 instead of the indexes the Config AppKey Add actually carried —
+   *  Table 4.122's own echoed field, answered wrongly. */
+  readonly appKeyStatusWrongIndexes?: boolean;
   /** When true, a Config Node Reset request gets NO reply at all (modelling
    *  a node that is unreachable for the reset too) — default false
    *  (replies with Node Reset Status and returns to the unowned state). */
@@ -529,18 +540,31 @@ function installConfigResponder(
         // (packed bytes are all-zero regardless of packing scheme when both
         // indexes are zero).
         const status = options.appKeyStatus ?? 0x00;
+        if (options.appKeyStatusWrongIndexes) {
+          // Figure 4.4's packing of NetKeyIndex=0x007, AppKeyIndex=0x009:
+          // octet0 = 0x07, octet1 = 0x00 | (0x9 << 4) = 0x90, octet2 = 0x00.
+          return sendAsNode(Buffer.from([0x80, 0x03, status, 0x07, 0x90, 0x00]));
+        }
         return sendAsNode(Buffer.from([0x80, 0x03, status, 0x00, 0x00, 0x00]));
       }
       if (result.message.opcode === 0x803d) {
-        // Config Model App Bind (Generic OnOff Server, element 0) -> Config
-        // Model App Status.
+        // Config Model App Bind -> Config Model App Status.
+        //
+        // ECHOES THE REQUEST'S OWN FIELDS, which is what Table 4.130 has a
+        // node do: its Parameters are a Status octet followed by exactly the
+        // ElementAddress || AppKeyIndex || ModelIdentifier of the Table 4.128
+        // bind being answered, so the request's whole Parameters field is the
+        // reply's tail verbatim. This fixture used to answer every bind with
+        // a hardcoded element 0 and model 0x1000 regardless of what was
+        // asked, which no real node does and which the pairing flow could not
+        // tell apart from a correct answer until it learned to compare the
+        // echo (owner-approved, 2026-10-08).
         if (options.silentModelAppBind) return undefined; // the owner's own lost bulb
         const status = options.modelAppStatus ?? 0x00;
-        const elementAddressLe = Buffer.alloc(2);
-        elementAddressLe.writeUInt16LE(nodeAddress, 0);
-        const modelIdLe = Buffer.alloc(2);
-        modelIdLe.writeUInt16LE(0x1000, 0);
-        return sendAsNode(Buffer.concat([Buffer.from([0x80, 0x3e, status]), elementAddressLe, Buffer.from([0x00, 0x00]), modelIdLe]));
+        const echoed = options.bindStatusEchoesFirstElement
+          ? Buffer.concat([u16le(nodeAddress), result.message.parameters.subarray(2)])
+          : result.message.parameters;
+        return sendAsNode(Buffer.concat([Buffer.from([0x80, 0x3e, status]), echoed]));
       }
       if (result.message.opcode === 0x8049) {
         // Config Node Reset — review finding (HIGH): pairing.ts now sends one
@@ -1668,6 +1692,134 @@ describe('a reply must answer the request that is waiting for it', () => {
     // The underlying reason the wait ended is carried too, never swallowed:
     // "the node said nothing" and "the link died" are not the same problem.
     expect(outcome.message).toContain('configuration exchange stalled');
+  });
+});
+
+// ===========================================================================
+// WHICH INSTANCE OF A REQUEST A STATUS ANSWERS (owner-approved, 2026-10-08).
+//
+// The first round of this fix matched a reply to its request by opcode and
+// disclosed what that could not catch: on a node with several elements, this
+// module binds one model per element in a loop, so every bind in that loop
+// expects the SAME opcode back. A retransmitted Config Model App Status for
+// element 0 therefore satisfied the pending bind for element 1, and the app
+// recorded a binding the node had never made — silently, since nothing
+// downstream can tell a real bind from an imagined one until a lamp does not
+// respond.
+//
+// The matching now also compares the fields the specification has each
+// status carry back from its request (Table 4.130's ElementAddress and
+// ModelIdentifier; Table 4.122's two key indexes). The cost, chosen
+// knowingly: a node that does not echo faithfully is no longer pairable, and
+// says so in one sentence instead of being diagnosed.
+// ===========================================================================
+
+/** Two elements, each declaring Generic OnOff Server — so both binds in the
+ *  loop expect a Config Model App Status, and only the echoed fields tell
+ *  one bind's answer from the other's. Header fields all zero; this fixture
+ *  is about addressing, not about composition decoding. */
+const TWO_LIGHTING_ELEMENTS = Buffer.from([
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // header, all zero
+  0x00, 0x00, 0x01, 0x00, 0x00, 0x10, // element 0: sigModels=[0x1000]
+  0x00, 0x00, 0x01, 0x00, 0x00, 0x10, // element 1: sigModels=[0x1000]
+]);
+
+describe('a status must answer the right INSTANCE of a repeated request', () => {
+  test("THE MOTIVATING CASE: a node whose Model App Status always names element 0 cannot bind element 1, and the failure names the mismatch", async () => {
+    const { bluetooth, clock, deps } = setUp();
+    addUnprovisionedNode(bluetooth, 'mis-echoes', -50);
+    installSuccessfulNodeBehaviour(bluetooth, 'mis-echoes', 1, 2, {
+      compositionAccessPayload: Buffer.concat([Buffer.from([0x02, 0x00]), TWO_LIGHTING_ELEMENTS]),
+      bindStatusEchoesFirstElement: true,
+    });
+
+    const outcomePromise = pairNode(deps, 'mis-echoes');
+    let settled = false;
+    void outcomePromise.then(
+      () => {
+        settled = true;
+      },
+      () => {
+        settled = true;
+      },
+    );
+    // Element 0's bind is answered correctly and immediately; element 1's
+    // answer never comes, so that one request waits out its deadline.
+    for (let i = 0; i < 5 && !settled; i++) {
+      await waitUntil(() => clock.pendingCount() >= 1 || settled);
+      if (settled) break;
+      await clock.advance(DEFAULT_PAIRING_STEP_TIMEOUT_MS);
+    }
+    const outcome = await outcomePromise;
+
+    // THE DISCRIMINATING ASSERTION: matching on the opcode alone makes this
+    // a SUCCESSFUL pairing, with element 1 recorded as bound although the
+    // node only ever answered for element 0.
+    expect(outcome.kind).toBe('failed');
+    if (outcome.kind !== 'failed') return;
+    // Node address 2, so element 0 is 0x2 and element 1 is 0x3.
+    expect(outcome.message).toContain(
+      'node answered Config Model App Bind (element 1, model 0x1000) with a Config Model App Status for element address 0x2, model 0x1000 - this request bound element address 0x3, model 0x1000',
+    );
+    // It is not reported as silence: the node did answer, with the wrong
+    // element's status.
+    expect(outcome.message).not.toContain('did not answer Config Model App Bind');
+  });
+
+  test('a RETRANSMISSION of the previous element\'s status is discarded and the real one is still awaited — the node pairs', async () => {
+    const { bluetooth, store, deps } = setUp();
+    addUnprovisionedNode(bluetooth, 'retransmits', -50);
+    // Every Config reply is preceded by an exact repeat of the previous one,
+    // so element 1's bind sees element 0's own Model App Status — same
+    // opcode, same bytes — immediately before its own answer.
+    installSuccessfulNodeBehaviour(bluetooth, 'retransmits', 1, 2, {
+      compositionAccessPayload: Buffer.concat([Buffer.from([0x02, 0x00]), TWO_LIGHTING_ELEMENTS]),
+      repeatPreviousReplyFirst: true,
+    });
+
+    const outcome = await pairNode(deps, 'retransmits');
+
+    // The guard on the rule above: a comparison that was too strict (or
+    // compared the wrong field) would reject the genuine answer too and this
+    // two-element node would never pair at all.
+    expect(outcome.kind).toBe('paired');
+    if (outcome.kind !== 'paired') return;
+    expect(outcome.device.capabilities).toEqual(['onoff']);
+    expect(store.getState().nodes[0]?.composition.elements).toHaveLength(2);
+    expect(store.getState().nodes[0]?.incomplete).toBeUndefined();
+  });
+
+  test('a Config AppKey Status echoing key indexes nobody asked about is discarded too, and named', async () => {
+    const { bluetooth, clock, deps } = setUp();
+    addUnprovisionedNode(bluetooth, 'wrong-key-indexes', -50);
+    installSuccessfulNodeBehaviour(bluetooth, 'wrong-key-indexes', 1, 2, { appKeyStatusWrongIndexes: true });
+
+    const outcomePromise = pairNode(deps, 'wrong-key-indexes');
+    let settled = false;
+    void outcomePromise.then(
+      () => {
+        settled = true;
+      },
+      () => {
+        settled = true;
+      },
+    );
+    for (let i = 0; i < 5 && !settled; i++) {
+      await waitUntil(() => clock.pendingCount() >= 1 || settled);
+      if (settled) break;
+      await clock.advance(DEFAULT_PAIRING_STEP_TIMEOUT_MS);
+    }
+    const outcome = await outcomePromise;
+
+    // Matching on the opcode alone accepts this as the AppKey Add's answer —
+    // status 0x00, so the pairing goes on to succeed with an application key
+    // the node may have filed under a different index entirely.
+    expect(outcome.kind).toBe('failed');
+    if (outcome.kind !== 'failed') return;
+    expect(outcome.message).toContain(
+      'node answered Config AppKey Add with a Config AppKey Status for NetKey index 0x7, AppKey index 0x9 - this request added AppKey index 0x0 under NetKey index 0x0',
+    );
+    expect(outcome.message).toContain('instead of a Config AppKey Status message');
   });
 });
 
