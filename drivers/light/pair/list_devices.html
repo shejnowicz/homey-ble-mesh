@@ -22,6 +22,17 @@
       li .state { font-size: 12px; opacity: 0.75; white-space: nowrap; }
       li .state.ok { color: #0a7d2c; }
       li .state.bad { color: #b00020; }
+      .warning {
+        border: 1px solid #b00020;
+        border-left-width: 4px;
+        border-radius: 8px;
+        padding: 12px 14px;
+        margin-bottom: 16px;
+        background: #fff5f6;
+      }
+      .warning strong { display: block; margin-bottom: 4px; color: #b00020; }
+      .warning p { margin: 0 0 6px; font-size: 13px; line-height: 1.45; }
+      .warning p:last-child { margin-bottom: 0; }
       .controls { display: flex; align-items: center; gap: 12px; margin-bottom: 12px; }
       button { font: inherit; padding: 8px 14px; border-radius: 8px; border: 1px solid #0082fc; background: #0082fc; color: #fff; }
       button.secondary { background: transparent; color: #0082fc; }
@@ -33,6 +44,27 @@
   </head>
   <body>
     <h1 data-i18n="pair.list_devices.title">Select the bulbs to pair</h1>
+    <!--
+      THE ONE THING A USER MUST READ BEFORE SCANNING. Provisioning is not
+      additive: a Bluetooth mesh node belongs to exactly one network at a
+      time, so pairing here takes the bulb away from whatever app owns it
+      now, and only a factory reset brings it back. That consequence is
+      invisible from the outside — the bulb simply disappears from the other
+      app — so it is stated above the list rather than in a footnote, and
+      before the first scan result can tempt anyone to tap Pair.
+    -->
+    <div class="warning">
+      <strong>Pairing takes a bulb away from its current app</strong>
+      <p>
+        A Bluetooth mesh bulb belongs to one network at a time. Pairing it here
+        removes it from the network it is in now — the manufacturer's app will
+        lose it, and the only way back is a factory reset of the bulb.
+      </p>
+      <p>
+        Only unpaired or factory-reset bulbs appear below. This app is
+        experimental and is tested with SIG Mesh <em>lighting</em> only.
+      </p>
+    </div>
     <div class="controls">
       <button id="select-all" class="secondary" type="button">Select all</button>
       <button id="pair" type="button" disabled>Pair selected</button>

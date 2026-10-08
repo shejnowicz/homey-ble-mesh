@@ -1,0 +1,5 @@
+{
+  "0.1.0": {
+    "en": "First experimental test release. Provisions Bluetooth SIG Mesh lighting over PB-GATT and controls it with Generic OnOff, Light Lightness, Light CTL Temperature and Light HSL. Lighting only. Verified on Tuya-sold SIG Mesh bulbs."
+  }
+}

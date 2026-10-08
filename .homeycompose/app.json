@@ -7,7 +7,7 @@
     "en": "BLE Mesh"
   },
   "description": {
-    "en": "Provisions and controls Bluetooth SIG mesh lighting nodes directly, with no cloud and no relay app in between."
+    "en": "EXPERIMENTAL. Provisions and controls Bluetooth SIG Mesh LIGHTING directly from Homey — no cloud, no vendor gateway, no bridge app. Supports Generic OnOff, Light Lightness, Light CTL (colour temperature) and Light HSL. Lighting only: sensors, buttons and switches are not supported. WARNING: a mesh bulb belongs to one network at a time, so pairing it here removes it from the manufacturer's app and only a factory reset brings it back. The network keys live solely in this app's settings — there is no export, so a Homey backup is the only copy; losing it means resetting every bulb. Verified on Tuya-sold SIG Mesh bulbs; other vendors are untested, which is what this test release is for."
   },
   "category": [
     "lights"
