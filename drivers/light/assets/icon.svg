@@ -1,11 +1,23 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100" width="100" height="100">
-  <rect width="100" height="100" rx="16" fill="#0A0E14"/>
-  <g stroke="#3C6EA0" stroke-width="2">
-    <line x1="50" y1="24" x2="79" y2="66"/>
-    <line x1="50" y1="24" x2="21" y2="66"/>
-    <line x1="21" y1="66" x2="79" y2="66"/>
-  </g>
-  <circle cx="50" cy="24" r="8.5" fill="#0082FC"/>
-  <circle cx="79" cy="66" r="8.5" fill="#0082FC"/>
-  <circle cx="21" cy="66" r="8.5" fill="#0082FC"/>
+  <!--
+    A Homey device icon is a MONOCHROME MASK: Homey takes the rendered alpha
+    as a silhouette and tints it itself. A full-bleed background rect is
+    therefore a solid filled square on screen, which is what the previous
+    version of this file drew (owner: "teraz jest biały kwadrat"). Nothing
+    here paints a background, and the fill colour is irrelevant — only the
+    shape matters.
+
+    fill-rule="evenodd" is what makes the three dots read as holes: they are
+    nested one level inside the glass, so they come out unfilled, while the
+    bulb and its base stay solid. The glass circle ends at y=68 and the base
+    starts at y=68 — adjacent, never overlapping, because under evenodd an
+    overlap would punch a hole instead of joining the two shapes.
+  -->
+  <path fill="#000" fill-rule="evenodd" d="
+    M 22,40 a 28,28 0 1,0 56,0 a 28,28 0 1,0 -56,0 Z
+    M 40,68 h 20 a 4,4 0 0,1 4,4 v 10 a 4,4 0 0,1 -4,4 h -20 a 4,4 0 0,1 -4,-4 v -10 a 4,4 0 0,1 4,-4 Z
+    M 44.5,30 a 5.5,5.5 0 1,0 11,0 a 5.5,5.5 0 1,0 -11,0 Z
+    M 32.5,47 a 5.5,5.5 0 1,0 11,0 a 5.5,5.5 0 1,0 -11,0 Z
+    M 56.5,47 a 5.5,5.5 0 1,0 11,0 a 5.5,5.5 0 1,0 -11,0 Z
+  "/>
 </svg>
