@@ -93,6 +93,7 @@ import {
   type PairingOutcome,
   type UnprovisionedNodeCandidate,
 } from './pairing';
+import { withMeshPaused, type MeshPauseHost } from '../../lib/adapter/meshPause';
 import { HomeyBluetoothPort, type BleManager } from './homeyBluetooth';
 
 
@@ -103,20 +104,16 @@ import { HomeyBluetoothPort, type BleManager } from './homeyBluetooth';
  *  `drivers/automation/device.ts` already uses for its own, differently-
  *  shaped `AutomationHost`: each caller declares exactly what IT needs from
  *  the app, rather than every caller sharing one grab-bag interface. */
-interface MeshBootstrapHost {
+interface MeshBootstrapHost extends MeshPauseHost {
   getNetworkStore(): NetworkStore;
   /** Starts the shared proxy connection manager the first time a network
    *  key exists; a no-op on every later call (including every call before
    *  the first network key exists). */
   ensureMeshStarted(): void;
-  /** See app.ts's own "PAIRING PAUSES THE SHARED CONNECTION" note — stops
-   *  the shared proxy connection for the duration of one pairing attempt so
-   *  this app never holds two simultaneous GATT connections. Returns
-   *  whether anything was actually running (and so actually paused). */
-  pauseMeshForPairing(): boolean;
-  /** The inverse of `pauseMeshForPairing` — call only when that call
-   *  returned `true`. */
-  resumeMeshAfterPairing(): void;
+  // `pauseMeshForPairing`/`resumeMeshAfterPairing` come from `MeshPauseHost`
+  // — the same two methods this interface used to declare itself, now
+  // declared where the function that calls them lives, so the pause's
+  // asynchrony cannot drift apart between the two files.
 }
 
 class LightDriver extends Homey.Driver {
@@ -142,23 +139,20 @@ class LightDriver extends Homey.Driver {
     // second bulb onward this app would otherwise hold two simultaneous
     // GATT connections (the proxy, plus this attempt's own) from the same
     // Homey radio. A no-op, returning `false`, on the FIRST-ever pairing
-    // (nothing running yet to pause) — `wasRunning` is what tells this
-    // handler not to call `resumeMeshAfterPairing` in that case, leaving
+    // (nothing running yet to pause) — that `false` is what stops
+    // `resumeMeshAfterPairing` being called in that case, leaving
     // `ensureMeshStarted` as the only thing that starts the connection the
     // very first time. Wrapping the WHOLE multi-bulb run rather than each
     // bulb also avoids restarting the shared connection between bulbs only
     // to stop it again a moment later.
-    const withMeshPaused = async <T>(run: () => Promise<T>): Promise<T> => {
-      const wasRunning = host.pauseMeshForPairing();
-      try {
-        return await run();
-      } finally {
-        if (wasRunning) host.resumeMeshAfterPairing();
-      }
-    };
+    //
+    // `withMeshPaused` itself is `lib/adapter/meshPause.ts`'s, not this
+    // file's: it used to be four lines here, and one of them (awaiting the
+    // pause) is the whole 2026-10-09 hardware fix — a line this file, which
+    // imports `homey`, can never have a test of its own to hold in place.
 
     session.setHandler('pair_node', async (data: { peripheralId: string }): Promise<PairingOutcome> =>
-      withMeshPaused(async () => {
+      withMeshPaused(host, async () => {
         const outcome = await pairNode(deps, data.peripheralId);
         if (outcome.kind === 'paired') {
           // First-ever pairing is what creates the network (ensureNetworkInitialized,
@@ -177,7 +171,7 @@ class LightDriver extends Homey.Driver {
     // the keep-going-after-a-failure rule; this handler only relays progress
     // to the view and tells app.ts to start the mesh once anything succeeded.
     session.setHandler('pair_nodes', async (data: { peripheralIds: string[] }): Promise<MultiPairingResult> =>
-      withMeshPaused(async () => {
+      withMeshPaused(host, async () => {
         const result = await pairNodes(deps, data.peripheralIds ?? [], (progress: MultiPairingProgress) => {
           // Fire-and-forget: `emit` is how a Homey pairing session pushes to
           // its view, and a view that has already navigated away simply is

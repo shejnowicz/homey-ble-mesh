@@ -475,7 +475,10 @@ interface ActiveConnection {
  * a "disconnect" worth backing off from — this is a deliberate, caller-
  * initiated stop, not a lost node), and makes the manager inert: nothing it
  * was already in the middle of doing takes effect afterwards (see the
- * `epoch` field below).
+ * `epoch` field below). `stop()` returns as soon as it has ASKED the port
+ * to disconnect; `whenLinkReleased()` is how a caller waits for that
+ * teardown to actually finish — see its own doc comment, and the hardware
+ * defect in `lib/adapter/meshPause.ts`'s header that made it necessary.
  *
  * REENTRANCY: everything this class does happens serially — one scan, one
  * connect attempt, in flight at a time — except for one case a real
@@ -553,6 +556,21 @@ export class ProxyConnectionManager {
    * that violates every time escalates to BACKOFF_MAX_MS.
    */
   private proxyProtocolViolationStreak = 0;
+  /**
+   * The settlement of the MOST RECENT link teardown this module started —
+   * see `whenLinkReleased()`, which hands it out, and `releaseLink()`,
+   * which replaces it. Starts already-resolved: a manager that has never
+   * connected has no link to release, and a caller asking must not be made
+   * to wait for one.
+   *
+   * NEVER REJECTS. `releaseLink` attaches the rejection handler at the
+   * moment it starts the disconnect, so this promise is safe both to ignore
+   * (no unhandled rejection — which the `void this.bluetooth.disconnect(…)`
+   * it replaced could genuinely produce) and to await (a port whose
+   * `disconnect` rejects still releases the waiter rather than throwing
+   * into it).
+   */
+  private lastLinkRelease: Promise<void> = Promise.resolve();
 
   constructor(bluetooth: BluetoothPort, clock: ClockPort, netKey: Buffer, options: ProxyConnectionOptions = {}) {
     if (netKey.length !== NET_KEY_LENGTH) {
@@ -589,7 +607,16 @@ export class ProxyConnectionManager {
 
   /** Cancels any pending timer and tears down an active connection, if any,
    *  without treating it as a lost node (no backoff bump, no rescan
-   *  scheduled). Safe to call whether or not a connection is active. */
+   *  scheduled). Safe to call whether or not a connection is active.
+   *
+   *  SYNCHRONOUS ON PURPOSE, and it stays that way: it is called from two
+   *  of this module's own synchronous internal paths (`handleDisconnect`
+   *  is not one of them, but `onUninit` in app.ts is, and so is anything
+   *  that must make this manager inert *now*, before the next statement
+   *  runs). It returns once the port has been ASKED to disconnect, which is
+   *  not the same thing as the radio being free — `whenLinkReleased()`
+   *  below is the awaitable half, deliberately a separate call so no
+   *  existing caller has to become async to keep working. */
   stop(): void {
     this.epoch += 1;
     // A reassembly cannot survive the link it was arriving over.
@@ -603,10 +630,59 @@ export class ProxyConnectionManager {
     if (this.active !== null) {
       const { connection, subscription } = this.active;
       this.active = null;
+      // Release the subscription BEFORE asking for the disconnect: a
+      // notification arriving between the two belongs to a link this module
+      // has already let go of.
       subscription.unsubscribe();
-      void this.bluetooth.disconnect(connection);
+      this.releaseLink(connection);
     }
     this.state = { status: 'unavailable', peripheralId: null };
+  }
+
+  /**
+   * Resolves once the most recent link teardown this module started has
+   * actually finished — the awaitable half of `stop()`.
+   *
+   * WHY THIS EXISTS. `stop()` must stay synchronous (see its own note), so
+   * it can only START the disconnect; the port's own `disconnect()` promise
+   * was previously dropped with `void`. A caller that stops this manager
+   * precisely to get the radio to itself — `lib/adapter/meshPause.ts`, for
+   * pairing — then proceeded to scan and connect while the proxy link was
+   * still being torn down, and on real hardware that cost every pairing
+   * attempt from the second bulb onward (see that module's header).
+   *
+   * WHAT IT COVERS, exactly, so no caller reads more into it than is there:
+   * the LAST disconnect this module asked for, from any of its teardown
+   * paths (`stop`, the protocol-violation drop, and the stale-epoch
+   * abandons inside `runAttempt`). It does NOT cover a scan or a connect
+   * still in flight — `stop()` cannot cancel either, and waiting on them
+   * would delay the caller without freeing anything sooner. A teardown
+   * started AFTER this promise was handed out (a stale `runAttempt` that
+   * only reaches its own epoch check later) is likewise not in it.
+   *
+   * Never rejects (see `lastLinkRelease`), so a caller needs no catch of
+   * its own — only a bound, because nothing here can make a port that never
+   * settles settle.
+   */
+  whenLinkReleased(): Promise<void> {
+    return this.lastLinkRelease;
+  }
+
+  /**
+   * Asks the port to drop `connection` and records the settlement of that
+   * teardown in `lastLinkRelease` — the ONE place this module disconnects,
+   * so every teardown path is equally waitable and equally safe to ignore.
+   * A failure is logged rather than propagated: by the time this runs the
+   * caller has already dropped `this.active`, so there is nothing left to
+   * unwind and nobody to tell except the log.
+   */
+  private releaseLink(connection: ConnectionHandle): void {
+    this.lastLinkRelease = this.bluetooth.disconnect(connection).then(
+      (): void => {},
+      (err: unknown): void => {
+        this.log(`mesh proxy disconnect failed: ${err instanceof Error ? err.message : String(err)}`);
+      },
+    );
   }
 
   /** The state object itself is a frozen-shape literal of primitives only
@@ -848,7 +924,7 @@ export class ProxyConnectionManager {
     const peripheralId = this.state.peripheralId;
     this.active = null;
     active.subscription.unsubscribe();
-    void this.bluetooth.disconnect(active.connection);
+    this.releaseLink(active.connection);
     this.state = { status: 'unavailable', peripheralId: null };
     const delayMs = backoffDelayMs(this.proxyProtocolViolationStreak);
     this.log(
@@ -896,14 +972,14 @@ export class ProxyConnectionManager {
       return;
     }
     if (myEpoch !== this.epoch) {
-      void this.bluetooth.disconnect(connection);
+      this.releaseLink(connection);
       return;
     }
 
     try {
       const characteristics = await this.bluetooth.discover(connection);
       if (myEpoch !== this.epoch) {
-        void this.bluetooth.disconnect(connection);
+        this.releaseLink(connection);
         return;
       }
 
@@ -922,7 +998,7 @@ export class ProxyConnectionManager {
       const subscription = await this.bluetooth.subscribe(dataOut.handle, (data) => this.handleNotification(data));
       if (myEpoch !== this.epoch) {
         subscription.unsubscribe();
-        void this.bluetooth.disconnect(connection);
+        this.releaseLink(connection);
         return;
       }
 
@@ -934,7 +1010,7 @@ export class ProxyConnectionManager {
       this.state = { status: 'connected', peripheralId: candidate.peripheralId };
       this.onAttemptSettled(myEpoch, true);
     } catch {
-      void this.bluetooth.disconnect(connection);
+      this.releaseLink(connection);
       this.onAttemptSettled(myEpoch, false);
     }
   }

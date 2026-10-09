@@ -240,27 +240,19 @@ describe('device.ts leaves the backfill probe\'s TRIGGER to the controller (sour
   });
 });
 
-describe('driver.ts pauses the shared connection for the duration of pairing (source-text)', () => {
+/**
+ * The pause/resume half of this block moved to
+ * `./meshPauseWiring.test.ts` on 2026-10-09, when `withMeshPaused` itself
+ * moved out of `driver.ts` into `lib/adapter/meshPause.ts` (where jest can
+ * run it rather than only read it). What stays here is the part that is
+ * about this driver's own pairing handlers and nothing else.
+ */
+describe('driver.ts wires the pairing handlers to pairing.ts (source-text)', () => {
   const source = readFileSync(join(__dirname, '..', 'driver.ts'), 'utf8');
-  const pauseHelper = sliceBetween(source, 'const withMeshPaused =', "session.setHandler('pair_node'");
   const handlersBody = sliceBetween(source, "session.setHandler('pair_node'", '\n  }\n}\n\nmodule.exports');
 
-  test('the pause/resume pair brackets pairing in a finally', () => {
-    expect(pauseHelper).toMatch(/pauseMeshForPairing\(\)/);
-    expect(pauseHelper).toMatch(/resumeMeshAfterPairing\(\)/);
-    expect(pauseHelper).toMatch(/finally/);
-  });
-
-  test('BOTH pairing handlers go through it — the multi-bulb one is where two live GATT connections would actually happen', () => {
-    // The whole reason the pause exists is the second bulb onward, which is
-    // precisely what `pair_nodes` is for. A multi-bulb handler that skipped
-    // it would reintroduce the hazard the single-bulb one was fixed for.
-    expect(handlersBody).toMatch(/setHandler\('pair_nodes'/);
-    const withMeshPausedCalls = handlersBody.match(/withMeshPaused\(/g) ?? [];
-    expect(withMeshPausedCalls).toHaveLength(2);
-  });
-
   test('pair_nodes delegates the sequencing to pairing.ts and relays progress to the view', () => {
+    expect(handlersBody).toMatch(/setHandler\('pair_nodes'/);
     expect(handlersBody).toMatch(/await pairNodes\(deps/);
     expect(handlersBody).toMatch(/session\.emit\('pair_progress'/);
   });
