@@ -162,9 +162,11 @@ export interface MeshPauseHost {
  *
  * The `await` on the pause is the entire fix — see this module's header.
  * `run` must not be called until it resolves, which is what
- * `__tests__/meshPause.test.ts` pins: a mutation dropping that await
- * typechecks cleanly (`if (promise)` is a legal truthiness test on a
- * `Promise<boolean>`), so only a test can hold this line in place.
+ * `__tests__/meshPause.test.ts` pins. Deleting the `await` outright is one
+ * of the few regressions here the compiler catches on its own (TS2801, on
+ * the `if (wasRunning)` below); starting `run()` and awaiting the pause
+ * afterwards typechecks perfectly, produces exactly the overlap this whole
+ * module exists to prevent, and was mutation-checked against these tests.
  */
 export async function withMeshPaused<T>(host: MeshPauseHost, run: () => Promise<T>): Promise<T> {
   const wasRunning = await host.pauseMeshForPairing();
