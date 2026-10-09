@@ -17,7 +17,12 @@
  * write open until a test chooses to settle it (modelling a congested
  * transmit queue — see `setWriteBehavior`/`releaseWrite` below, added for
  * Task 5's traffic queue after an earlier, task-local stub for the same
- * need was judged better placed here, for Task 6 to reuse too); and
+ * need was judged better placed here, for Task 6 to reuse too); fail a
+ * DISCONNECT, or hold one open the same way (added 2026-10-09 for the
+ * pairing-contention defect — a teardown the stack has accepted but not
+ * yet finished is exactly the window that defect lived in; see
+ * `setDisconnectBehavior`/`releaseDisconnect` and
+ * `lib/adapter/meshPause.ts`); and
  * simulate both an inbound Data Out notification and an unexpected
  * disconnect. "Never answers at all" is simply a peripheral that is
  * registered but never advertising (or no peripheral registered at all) —
@@ -154,6 +159,22 @@ export type AttemptBehavior = 'succeed' | 'fail';
  *  rather than an instant accept-or-reject. */
 export type WriteBehavior = AttemptBehavior | 'hold';
 
+/** `disconnect()`'s own behaviour for a node, the same three-way shape
+ *  `WriteBehavior` already uses: 'succeed' resolves immediately, 'fail'
+ *  rejects immediately (naming the peripheral), and 'hold' returns a
+ *  promise that stays pending until a test settles it with
+ *  `releaseDisconnect` — a real GATT stack that has accepted the teardown
+ *  request but has not yet finished it, which is exactly the window the
+ *  2026-10-09 pairing defect lived in (see `lib/adapter/meshPause.ts`).
+ *
+ *  WHAT 'hold' DOES NOT DELAY: this fixture's own link bookkeeping. The
+ *  open connection and its notification callbacks are dropped the moment
+ *  `disconnect()` is CALLED, under every behaviour, exactly as before —
+ *  the caller has let the handle go either way, and delaying that would
+ *  silently change what every existing test observes. Only the returned
+ *  promise waits. */
+export type DisconnectBehavior = AttemptBehavior | 'hold';
+
 export interface FakeNodeConfig {
   readonly id: string;
   readonly rssi: number;
@@ -194,6 +215,7 @@ export interface FakeNodeConfig {
   readonly subscribeBehavior?: AttemptBehavior; // default 'succeed'
   readonly dropWrites?: boolean; // default false
   readonly writeBehavior?: WriteBehavior; // default 'succeed'; see setWriteBehavior
+  readonly disconnectBehavior?: DisconnectBehavior; // default 'succeed'; see setDisconnectBehavior
   /** Omit one data characteristic (of whichever pair `gattProfile`
    *  selects) from `discover()`'s result, modelling a node that advertises
    *  the service but does not fully implement it. `null` (default): expose
@@ -213,6 +235,7 @@ interface FakeNode {
   subscribeBehavior: AttemptBehavior;
   dropWrites: boolean;
   writeBehavior: WriteBehavior;
+  disconnectBehavior: DisconnectBehavior;
   missingCharacteristic: 'dataIn' | 'dataOut' | null;
   autoResponder: AutoResponder | null;
 }
@@ -236,6 +259,17 @@ interface FakeNode {
 interface HeldWrite {
   readonly resolve: () => void;
   readonly reject: (err: Error) => void;
+}
+
+/** A `disconnect()` call parked by `disconnectBehavior: 'hold'`. Carries
+ *  its own `settled` flag — unlike `HeldWrite`, whose "never pruned" gap is
+ *  recorded above — because `heldDisconnectCount` is an assertion
+ *  instrument ("is a teardown still outstanding right now?") and would be
+ *  useless if it counted ones already released. */
+interface HeldDisconnect {
+  readonly resolve: () => void;
+  readonly reject: (err: Error) => void;
+  settled: boolean;
 }
 
 interface OpenConnection {
@@ -289,6 +323,7 @@ export class FakeBluetoothPort implements BluetoothPort {
   private readonly notifyCallbacks = new Map<string, (data: Buffer) => void>();
   private readonly readValues = new Map<string, Buffer>();
   private readonly heldWrites = new Map<string, HeldWrite[]>();
+  private readonly heldDisconnects = new Map<string, HeldDisconnect[]>();
   /** One in-flight Proxy PDU reassembly per (peripheral, characteristic) —
    *  see the module header's "THIS FAKE SPEAKS THE PROXY PDU PROTOCOL"
    *  note. Cleared whenever the link to that peripheral goes away. */
@@ -381,6 +416,7 @@ export class FakeBluetoothPort implements BluetoothPort {
       subscribeBehavior: config.subscribeBehavior ?? 'succeed',
       dropWrites: config.dropWrites ?? false,
       writeBehavior: config.writeBehavior ?? 'succeed',
+      disconnectBehavior: config.disconnectBehavior ?? 'succeed',
       missingCharacteristic: config.missingCharacteristic ?? null,
       autoResponder: null,
     });
@@ -471,6 +507,38 @@ export class FakeBluetoothPort implements BluetoothPort {
 
   setWriteBehavior(id: string, behavior: WriteBehavior): void {
     this.node(id).writeBehavior = behavior;
+  }
+
+  setDisconnectBehavior(id: string, behavior: DisconnectBehavior): void {
+    this.node(id).disconnectBehavior = behavior;
+  }
+
+  /** Settles the `index`-th currently-held disconnect for `id` (in the
+   *  order `disconnect()` was called, 0-based), exactly as `releaseWrite`
+   *  does for a held write, and with the same stance on "nothing to act
+   *  on": throws rather than papering over a misconfigured test. Entries
+   *  are never pruned, for the same reason (and with the same consequences)
+   *  `HeldWrite`'s own doc comment records for held writes. */
+  releaseDisconnect(id: string, index: number, outcome: { ok: true } | { ok: false; err: Error }): void {
+    const held = this.heldDisconnects.get(id);
+    const entry = held?.[index];
+    if (!entry) {
+      throw new Error(`FakeBluetoothPort.releaseDisconnect: no held disconnect #${index} for "${id}"`);
+    }
+    entry.settled = true;
+    if (outcome.ok) {
+      entry.resolve();
+    } else {
+      entry.reject(outcome.err);
+    }
+  }
+
+  /** How many `disconnect()` calls for `id` are still waiting on
+   *  `releaseDisconnect` — so a test can prove there is something to
+   *  release before releasing it, rather than passing because the manager
+   *  never asked for a teardown at all. */
+  heldDisconnectCount(id: string): number {
+    return this.heldDisconnects.get(id)?.filter((entry) => !entry.settled).length ?? 0;
   }
 
   /** Settles the `index`-th currently-held write for `id` (in the order
@@ -804,7 +872,25 @@ export class FakeBluetoothPort implements BluetoothPort {
     const { peripheralId } = connection as FakeConnectionHandle;
     // A clean, caller-initiated close: deliberately does NOT invoke
     // onDisconnect (see BluetoothPort's own contract in connection.ts).
+    // Happens under every `disconnectBehavior` and BEFORE the behaviour is
+    // consulted — see `DisconnectBehavior`'s own "what 'hold' does not
+    // delay" note.
     this.openConnections.delete(peripheralId);
     this.clearNotifyCallbacksFor(peripheralId);
+
+    // An unknown peripheral keeps the old behaviour (resolve quietly): some
+    // tests disconnect handles belonging to nodes they have since removed,
+    // and `node()` would throw on those.
+    const behavior = this.nodes.get(peripheralId)?.disconnectBehavior ?? 'succeed';
+    if (behavior === 'fail') {
+      throw new Error(`FakeBluetoothPort.disconnect: configured to fail for "${peripheralId}"`);
+    }
+    if (behavior === 'hold') {
+      return new Promise<void>((resolve, reject) => {
+        const held = this.heldDisconnects.get(peripheralId) ?? [];
+        held.push({ resolve, reject, settled: false });
+        this.heldDisconnects.set(peripheralId, held);
+      });
+    }
   }
 }

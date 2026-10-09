@@ -47,14 +47,21 @@
 // trading a brief, whole-mesh "unavailable" for every ALREADY-paired bulb
 // during the new bulb's own pairing attempt against the alternative — two
 // live connections whose actual coexistence on real hardware is unverified.
-// UNVERIFIED ON HARDWARE, same disclosure driver.ts's own module header
-// already makes for its real-Bluetooth wiring: whether this is even
-// necessary (maybe two connections work fine) or sufficient (maybe pairing
-// and the proxy connection contend for the radio in some OTHER way this
-// does not address) is something only the owner's three bulbs can confirm.
+//
+// NO LONGER UNVERIFIED (2026-10-09). The paragraph that used to stand here
+// said whether this pause was "even necessary … or sufficient … is
+// something only the owner's three bulbs can confirm." They confirmed both
+// halves: it is necessary, and it was NOT sufficient. Pausing was
+// synchronous all the way down to `void this.bluetooth.disconnect(…)`, so
+// pairing began while the proxy link was still being torn down, and every
+// attempt from the second bulb onward died with "could not connect … timed
+// out after 30000ms". `pauseMeshForPairing` below now AWAITS the teardown,
+// boundedly — see `lib/adapter/meshPause.ts`, which carries the full
+// account of the defect, the experiment that proved it and the bound.
 import Homey from 'homey';
 import { NetworkStore, type SettingsPort } from './lib/adapter/store';
-import { ProxyConnectionManager, type ProxyConnectionState } from './lib/adapter/connection';
+import { ProxyConnectionManager, type ClockPort, type ProxyConnectionState } from './lib/adapter/connection';
+import { pauseProxyForPairing } from './lib/adapter/meshPause';
 import { TrafficQueue } from './lib/adapter/queue';
 import {
   createSerialProbeRunner,
@@ -104,8 +111,15 @@ class BleMeshApp extends Homey.App {
   private queue: TrafficQueue | null = null;
   /** The ONE real clock this app owns — handed to the connection manager,
    *  the traffic queue and every device controller, so "now" means the same
-   *  thing everywhere. Constructed lazily with the mesh itself. */
-  private clock: MeshClockPort | null = null;
+   *  thing everywhere. Constructed lazily with the mesh itself.
+   *
+   *  Typed as the full `ClockPort` (timers included), not the `MeshClockPort`
+   *  (`now()` only) the device controllers take: `pauseMeshForPairing` needs
+   *  a clock it can set a bounded wait on. `createRealClock()` has always
+   *  returned a full `ClockPort`; this only stops the field from narrowing
+   *  it away. A `ClockPort` still satisfies `MeshClockPort` structurally, so
+   *  `getMeshContext()` hands out exactly what it always did. */
+  private clock: ClockPort | null = null;
   /** The ONE backfill-probe runner for the whole app, for the same reason
    *  the queue and the store are singletons: the mesh carries one command at
    *  a time, and Homey initialises every device at roughly the same moment,
@@ -215,11 +229,20 @@ class BleMeshApp extends Homey.App {
    * one that was never running (which `ensureMeshStarted` — the FIRST-ever-
    * pairing path — is already responsible for). A no-op, returning `false`,
    * when the mesh has not been started yet.
+   *
+   * ASYNC SINCE THE 2026-10-09 HARDWARE ROUND, and that is the whole fix:
+   * stopping the manager only ASKS the radio to drop the proxy link, so
+   * this now waits (boundedly) for that teardown to finish before pairing
+   * is allowed to scan and connect. All of the ordering, the bound and the
+   * never-throws contract live in `lib/adapter/meshPause.ts`, which — unlike
+   * this file — jest can actually import and test.
    */
-  pauseMeshForPairing(): boolean {
-    if (this.manager === null) return false;
-    this.manager.stop();
-    return true;
+  async pauseMeshForPairing(): Promise<boolean> {
+    const clock = this.clock;
+    // `manager` and `clock` are set together in `ensureMeshStarted`, so a
+    // null clock means no manager either; the check keeps the types honest.
+    if (clock === null) return false;
+    return pauseProxyForPairing(this.manager, clock, { log: (message: string) => this.log(message) });
   }
 
   /** The inverse of `pauseMeshForPairing` — only ever called by

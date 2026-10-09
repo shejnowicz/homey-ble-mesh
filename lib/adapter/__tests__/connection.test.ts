@@ -1331,6 +1331,89 @@ describe('stop', () => {
 });
 
 /**
+ * The awaitable half of `stop()`, added for the 2026-10-09 hardware defect
+ * (pairing began while the proxy link was still being torn down — see
+ * `../meshPause.ts`'s module header for the experiment that proved it).
+ * `meshPause.test.ts` pins what the PAIRING path does with this promise;
+ * these pin the promise itself.
+ */
+describe('whenLinkReleased', () => {
+  test('is already resolved on a manager that has never connected', async () => {
+    const { manager } = setUp(randomBytes(16));
+    await expect(manager.whenLinkReleased()).resolves.toBeUndefined();
+  });
+
+  test('does not resolve until the port has finished the teardown stop() asked for', async () => {
+    const netKey = randomBytes(16);
+    const { bluetooth, clock, manager } = setUp(netKey);
+    bluetooth.addNode({ id: 'A', rssi: -50, networkKey: netKey, disconnectBehavior: 'hold' });
+    manager.start();
+    await clock.advance(0);
+    expect(manager.getState().status).toBe('connected');
+
+    manager.stop();
+    let released = false;
+    const waiting = manager.whenLinkReleased().then(() => {
+      released = true;
+    });
+
+    // `stop()` has already returned and the manager is already inert — but
+    // the radio has not finished with the link, which is the whole point.
+    expect(bluetooth.heldDisconnectCount('A')).toBe(1);
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(released).toBe(false);
+
+    bluetooth.releaseDisconnect('A', 0, { ok: true });
+    await waiting;
+    expect(released).toBe(true);
+  });
+
+  test('resolves rather than rejects when the port refuses the disconnect, and logs why', async () => {
+    const netKey = randomBytes(16);
+    const bluetooth = new FakeBluetoothPort();
+    const clock = createFakeClock();
+    const logged: string[] = [];
+    const manager = new ProxyConnectionManager(bluetooth, clock, netKey, {
+      log: (message: string): void => {
+        logged.push(message);
+      },
+    });
+    bluetooth.addNode({ id: 'A', rssi: -50, networkKey: netKey, disconnectBehavior: 'fail' });
+    manager.start();
+    await clock.advance(0);
+
+    manager.stop();
+
+    await expect(manager.whenLinkReleased()).resolves.toBeUndefined();
+    expect(logged).toContain('mesh proxy disconnect failed: FakeBluetoothPort.disconnect: configured to fail for "A"');
+  });
+
+  test('covers the protocol-violation teardown too, not only stop()', async () => {
+    const netKey = randomBytes(16);
+    const { bluetooth, clock, manager } = setUp(netKey);
+    bluetooth.addNode({ id: 'A', rssi: -50, networkKey: netKey, disconnectBehavior: 'hold' });
+    manager.start();
+    await clock.advance(0);
+
+    // A stray continuation segment with no reassembly in progress is the
+    // "unexpected SAR value" Section 6.3.2.2 requires a disconnect over.
+    bluetooth.simulateRawNotification('A', Buffer.from([0x80, 0x01, 0x02]));
+
+    let released = false;
+    const waiting = manager.whenLinkReleased().then(() => {
+      released = true;
+    });
+    expect(bluetooth.heldDisconnectCount('A')).toBe(1);
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(released).toBe(false);
+
+    bluetooth.releaseDisconnect('A', 0, { ok: true });
+    await waiting;
+    expect(released).toBe(true);
+  });
+});
+
+/**
  * Review finding: `FakeBluetoothPort` has configuration surface this
  * task's own manager never exercises on its own (it never calls `read`,
  * never calls `removeNode`/`setRssi` through any behaviour the manager
